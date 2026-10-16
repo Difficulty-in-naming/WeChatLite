@@ -107,6 +107,8 @@ class Window : public QMainWindow
     void restoreDraft();
     void notify(const QString &text, bool error = false);
     void fetchMedia(const QJsonObject &media, bool saveOnly = false, bool thumbnail = false, bool resumed = false);
+    void copyMedia(const QJsonObject &media);
+    void copyMediaToClipboard(const QJsonObject &media, const QString &path);
     void drainMediaQueue();
     void openMedia(const QJsonObject &media, const QString &path);
     void saveMediaAndMaybeOpen(const QJsonObject &media, const QString &path, bool open);
@@ -140,6 +142,7 @@ class Window : public QMainWindow
     QString requestedVoiceId, playingVoiceId, playingVoicePath, voiceGroup;
     quint64 voiceConversation = 0;
     QJsonObject quotedMessage;
+    QJsonObject pendingMediaCopy;
     QJsonObject p2pSettings;
     RecallDrafts recallDrafts;
     ChatPreferences chatPreferences;

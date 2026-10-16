@@ -27,6 +27,7 @@
 #include <QFormLayout>
 #include <QFrame>
 #include <QHBoxLayout>
+#include <QImageReader>
 #include <QJsonDocument>
 #include <QLabel>
 #include <QLineEdit>
@@ -310,6 +311,7 @@ Window::Window(bool demo, const QString &tunnelExecutable)
                     stopVoice();
                     openRequests.clear();
                     saveRequests.clear();
+                    pendingMediaCopy = {};
                     mediaQueue.clear();
                     queuedMediaIds.clear();
                     ++permissionsGeneration;
@@ -331,6 +333,9 @@ Window::Window(bool demo, const QString &tunnelExecutable)
             });
     connect(messages, &MessageView::mediaClicked, this,
             [this](const QJsonObject &media, bool save) { fetchMedia(media, save); });
+    connect(messages, &MessageView::mediaCopyRequested, this, &Window::copyMedia);
+    connect(QApplication::clipboard(), &QClipboard::dataChanged, this,
+            [this] { pendingMediaCopy = {}; });
     connect(messages, &MessageView::mentionRequested, this,
             [this](QJsonObject member)
             {
@@ -1388,6 +1393,7 @@ void Window::clearConversation()
     stopVoice();
     openRequests.clear();
     saveRequests.clear();
+    pendingMediaCopy = {};
     mediaQueue.clear();
     queuedMediaIds.clear();
     locatingId.clear();
@@ -1493,6 +1499,7 @@ void Window::loadPermissions()
                 stopVoice();
                 openRequests.clear();
                 saveRequests.clear();
+                pendingMediaCopy = {};
                 mediaQueue.clear();
                 queuedMediaIds.clear();
             }
@@ -1857,6 +1864,7 @@ void Window::selectGroup(const QString &id, const QString &name)
     stopVoice();
     openRequests.clear();
     saveRequests.clear();
+    pendingMediaCopy = {};
     mediaQueue.clear();
     queuedMediaIds.clear();
     locatingId.clear();
@@ -2235,7 +2243,8 @@ void Window::quoteMessage(const QJsonObject &requested)
     quotedMessage =
         message.isEmpty()
             ? QJsonObject{}
-            : QJsonObject{{"id", message["id"]}, {"sender", message["sender"]}, {"text", message["text"]}};
+            : QJsonObject{{"id", message["id"]}, {"sender", message["sender"]},
+                          {"text", messageQuoteText(message)}};
     pendingId.clear();
     refreshQuote();
     saveDraft();
@@ -2757,6 +2766,35 @@ void Window::notify(const QString &text, bool error)
     if (error)
         lastError = text.left(1200);
 }
+void Window::copyMedia(const QJsonObject &media)
+{
+    if (!canDownload || !hasCurrentMedia(media))
+        return;
+    pendingMediaCopy = media;
+    // Use the existing download/save queue and a durable file, keeping GIFs and other originals intact.
+    fetchMedia(media, true);
+}
+void Window::copyMediaToClipboard(const QJsonObject &media, const QString &path)
+{
+    if (!canDownload || !sameMediaDescriptor(pendingMediaCopy, media) || !hasCurrentMedia(media) ||
+        !QFileInfo(path).isFile())
+        return;
+    pendingMediaCopy = {};
+    auto *mime = new QMimeData;
+    mime->setUrls({QUrl::fromLocalFile(path)});
+    if (media["kind"] == "image")
+    {
+        QImageReader reader(path);
+        reader.setAutoTransform(true);
+        const auto size = reader.size();
+        if (size.isValid() && qint64(size.width()) * size.height() <= 4 * 1024 * 1024)
+        {
+            const auto image = reader.read();
+            if (!image.isNull()) mime->setImageData(image);
+        }
+    }
+    QApplication::clipboard()->setMimeData(mime);
+}
 void Window::fetchMedia(const QJsonObject &media, bool saveOnly, bool thumbnail, bool resumed)
 {
     if (!canDownload || !hasCurrentMedia(media))
@@ -2837,6 +2875,7 @@ void Window::fetchMedia(const QJsonObject &media, bool saveOnly, bool thumbnail,
                                lastError = error;
                                openRequests.remove(id);
                                saveRequests.remove(id);
+                               if (sameMediaDescriptor(pendingMediaCopy, media)) pendingMediaCopy = {};
                                if (requestedVoiceId == id)
                                {
                                    stopVoice();
@@ -2867,7 +2906,9 @@ void Window::saveMediaAndMaybeOpen(const QJsonObject &media, const QString &path
     if (!MediaStorage::isCachePath(path))
     {
         model->setLocalMedia(media["id"].toString(), path, media);
-        if (open || (media["kind"] == "voice" && requestedVoiceId == media["id"].toString())) openMedia(media, path);
+        copyMediaToClipboard(media, path);
+        if (open || (media["kind"] == "voice" && requestedVoiceId == media["id"].toString() &&
+                     playingVoiceId != requestedVoiceId)) openMedia(media, path);
         return;
     }
     const auto id = media["id"].toString();
@@ -2890,10 +2931,17 @@ void Window::saveMediaAndMaybeOpen(const QJsonObject &media, const QString &path
                 root != self->downloadRoot || !self->canDownload) return;
             const bool requestedOpen = self->openRequests.remove(id);
             self->saveRequests.remove(id);
-            if (!error.isEmpty()) { self->lastError = error; return; }
+            if (!error.isEmpty())
+            {
+                self->lastError = error;
+                if (sameMediaDescriptor(self->pendingMediaCopy, media)) self->pendingMediaCopy = {};
+                return;
+            }
             self->localFiles->remember(self->groupId, media, saved);
             self->model->setLocalMedia(id, saved, media);
-            if (open || requestedOpen || (media["kind"] == "voice" && self->requestedVoiceId == id))
+            self->copyMediaToClipboard(media, saved);
+            if (open || requestedOpen || (media["kind"] == "voice" && self->requestedVoiceId == id &&
+                                         self->playingVoiceId != id))
                 self->openMedia(media, saved);
         });
     });

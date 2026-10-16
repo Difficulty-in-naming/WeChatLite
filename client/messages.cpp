@@ -95,11 +95,27 @@ static bool nativeImageReference(const QString &text)
     }
     return !xml.hasError() && image;
 }
+QString messageQuoteText(const QJsonObject &message)
+{
+    const auto text = message["text"].toString();
+    if (!text.isEmpty())
+        return text;
+    QStringList labels;
+    for (const auto &entry : message["media"].toArray())
+    {
+        const auto media = entry.toObject();
+        const auto kind = media["kind"].toString();
+        const auto label = kind == "image" ? "图片" : kind == "gif" ? "GIF" : kind == "video" ? "视频" :
+                           kind == "voice" ? "语音" : "文件";
+        labels.append(QString("[%1] %2").arg(label, media["name"].toString()));
+    }
+    return labels.join(' ');
+}
 QString messageQuoteLabel(const QJsonObject &quote)
 {
     if (quote["unavailable"].toBool())
         return "原消息已撤回或不可用";
-    const auto text = quote["text"].toString();
+    const auto text = messageQuoteText(quote);
     // Older saved references contain native image XML instead of a display label.
     return quote["sender"].toString() + ": " +
            (nativeImageReference(text) ? QString("[图片]") : wechatDisplayText(QString(text).replace('\n', ' ')));
@@ -1715,7 +1731,7 @@ QMenu *MessageView::quoteContextMenuFor(const QModelIndex &index)
     locate->setEnabled(!quote["unavailable"].toBool());
     return menu;
 }
-QMenu *MessageView::contextMenuFor(const QModelIndex &index, bool avatar)
+QMenu *MessageView::contextMenuFor(const QModelIndex &index, bool avatar, int mediaIndex)
 {
     if (!index.isValid())
         return nullptr;
@@ -1737,26 +1753,34 @@ QMenu *MessageView::contextMenuFor(const QModelIndex &index, bool avatar)
         delete menu;
         return nullptr;
     }
-    if (!message["text"].toString().isEmpty())
+    const auto media = message["media"].toArray();
+    if (mediaIndex < 0 && message["text"].toString().isEmpty() && !media.isEmpty())
+        mediaIndex = 0;
+    const bool resource = mediaIndex >= 0 && mediaIndex < media.size();
+    if (resource || !message["text"].toString().isEmpty())
     {
         const auto selected = selectedTextIndex == index ? selectedText() : QString{};
         const auto copyText = selected.isEmpty() ? message["text"].toString() : selected;
-        auto *copy = menu->addAction("复制", this, [copyText]
-                                     { QApplication::clipboard()->setText(copyText); });
+        const auto item = resource ? media[mediaIndex].toObject() : QJsonObject{};
+        auto *copy = menu->addAction("复制", this, [this, resource, item, copyText]
+        {
+            if (resource)
+            {
+                const auto allowed = property("canDownload");
+                if (!allowed.isValid() || allowed.toBool()) emit mediaCopyRequested(item);
+            }
+            else QApplication::clipboard()->setText(copyText);
+        });
         copy->setObjectName("copyMessage");
         copy->setProperty("chatIcon", "copy");
+        const auto allowed = property("canDownload");
+        copy->setEnabled(!resource || !allowed.isValid() || allowed.toBool());
         auto *quote = menu->addAction("引用", this, [this, message] { emit quoteRequested(message); });
         quote->setObjectName("quoteMessage");
         quote->setProperty("chatIcon", "quote");
     }
-    for (const auto &entry : message["media"].toArray())
-    {
-        auto media = entry.toObject();
-        auto *save = menu->addAction("保存 " + media["name"].toString(), this,
-                                     [this, media] { emit mediaClicked(media, true); });
-        const auto allowed = property("canDownload");
-        save->setEnabled(!allowed.isValid() || allowed.toBool());
-    }
+    if (resource)
+        return menu;
     if (canRecallMessage(message, QDateTime::currentMSecsSinceEpoch()))
     {
         if (!menu->actions().isEmpty())
@@ -1818,7 +1842,14 @@ void MessageView::contextMenuEvent(QContextMenuEvent *event)
     const auto anchor = event->reason() == QContextMenuEvent::Keyboard
                             ? geometry.bubble.bottomRight() + QPoint(2, 2)
                             : event->pos();
-    showMenu(contextMenuFor(index, onAvatar), anchor);
+    int mediaIndex = -1;
+    for (int i = 0; i < geometry.media.size(); ++i)
+        if (geometry.media[i].translated(geometry.bubble.topLeft()).contains(event->pos()))
+        {
+            mediaIndex = i;
+            break;
+        }
+    showMenu(contextMenuFor(index, onAvatar, mediaIndex), anchor);
 }
 void GroupDelegate::paint(QPainter *p, const QStyleOptionViewItem &option, const QModelIndex &index) const
 {

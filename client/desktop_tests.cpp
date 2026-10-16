@@ -1724,14 +1724,12 @@ class DesktopTests : public QObject
         QVERIFY(!send->isEnabled());
         composer->sendRequested();
         view->mediaClicked(media, true);
-        auto *menu = view->contextMenuFor(model->index(0), false);
+        auto *menu = view->contextMenuFor(model->index(0), false, 0);
         QVERIFY(menu);
-        bool disabledSave = false;
-        for (auto *action : menu->actions())
-            if (action->text().startsWith("保存 "))
-                disabledSave = !action->isEnabled();
+        auto *copy = menu->findChild<QAction *>("copyMessage");
+        QVERIFY(copy && !copy->isEnabled());
+        view->mediaCopyRequested(media); // Recheck permissions even when a stale menu emits directly.
         delete menu;
-        QVERIFY(disabledSave);
         QTest::qWait(30);
         QCOMPARE(messagePosts, 0);
         QCOMPARE(mediaGets, 0);
@@ -1742,11 +1740,10 @@ class DesktopTests : public QObject
         transport->connectionChanged(true);
         transport->event({{"type", "status"}, {"ready", true}});
         QTRY_VERIFY(send->isEnabled() && view->property("canDownload").toBool());
-        menu = view->contextMenuFor(model->index(0), false);
+        menu = view->contextMenuFor(model->index(0), false, 0);
         QVERIFY(menu);
-        for (auto *action : menu->actions())
-            if (action->text().startsWith("保存 "))
-                QVERIFY(action->isEnabled());
+        copy = menu->findChild<QAction *>("copyMessage");
+        QVERIFY(copy && copy->isEnabled());
         delete menu;
         transport->disconnectService();
         isolated.close();
@@ -2836,6 +2833,82 @@ class DesktopTests : public QObject
             QCOMPARE(window->findChildren<QDialog *>().size(), dialogs);
         }
     }
+    void resourceCopyAndQuoteUseOriginalFilesWithoutOpeningApplications()
+    {
+        FileOpenHandler handler;
+        QDesktopServices::setUrlHandler("file", &handler, "open");
+        const auto reset = qScopeGuard([] { QDesktopServices::unsetUrlHandler("file"); });
+        auto *transport = window->findChild<Transport *>();
+        auto *view = window->findChild<MessageView *>();
+        auto *model = window->findChild<MessageModel *>();
+        auto *groups = window->findChild<QListWidget *>("groups");
+        auto *quoteText = window->findChild<QLabel *>("quoteText");
+        const auto group = groups->currentItem()->data(Qt::UserRole).toJsonObject()["id"].toString();
+        const QStringList kinds{"image", "gif", "video", "file", "voice"};
+        const QStringList names{"复制原图.png", "复制动画.gif", "复制视频.mp4", "复制文件.txt", "复制语音.wav"};
+        const QStringList labels{"图片", "GIF", "视频", "文件", "语音"};
+        QImage image(24, 24, QImage::Format_ARGB32);
+        image.fill(Qt::green);
+        for (int i = 0; i < kinds.size(); ++i)
+        {
+            QByteArray contents;
+            if (i == 0)
+            {
+                QBuffer buffer(&contents);
+                QVERIFY(buffer.open(QIODevice::WriteOnly));
+                QVERIFY(image.save(&buffer, "PNG"));
+            }
+            else if (i == 1)
+                contents = QByteArray::fromBase64("R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7");
+            else contents = "original resource " + kinds[i].toUtf8();
+            QFile source(files.filePath(names[i]));
+            QVERIFY(source.open(QIODevice::WriteOnly));
+            QCOMPARE(source.write(contents), contents.size());
+            source.close();
+            QJsonObject media;
+            bool uploaded = false;
+            QString failure;
+            transport->upload(group, source.fileName(), names[i], [&](const QJsonValue &value, const QString &error)
+                { media = value.toObject(); failure = error; uploaded = true; });
+            QTRY_VERIFY_WITH_TIMEOUT(uploaded, 8000);
+            QVERIFY2(failure.isEmpty(), qPrintable(failure));
+            media["kind"] = kinds[i];
+            const auto id = "resource-clipboard-" + kinds[i];
+            transport->event({{"type", "message"}, {"message", QJsonObject{
+                {"id", id}, {"group", group}, {"sender", "资源测试"}, {"status", "received"},
+                {"timestamp", QDateTime::currentMSecsSinceEpoch()}, {"media", QJsonArray{media}}}}});
+            QModelIndex index;
+            for (int row = 0; row < model->rows.size(); ++row)
+                if (model->rows[row]["id"] == id) index = model->index(row);
+            QVERIFY(index.isValid());
+            auto *menu = view->contextMenuFor(index, false);
+            QVERIFY(menu);
+            const auto cleanup = qScopeGuard([menu] { delete menu; });
+            QCOMPARE(menu->actions().size(), 2);
+            QApplication::clipboard()->setText("previous clipboard");
+            menu->actions()[0]->trigger();
+            QTRY_VERIFY_WITH_TIMEOUT(QApplication::clipboard()->mimeData()->hasUrls(), 8000);
+            const auto urls = QApplication::clipboard()->mimeData()->urls();
+            QCOMPARE(urls.size(), 1);
+            const auto path = urls.first().toLocalFile();
+            QVERIFY(!MediaStorage::isCachePath(path));
+            QCOMPARE(QFileInfo(path).fileName(), names[i]);
+            QFile copied(path);
+            QVERIFY(copied.open(QIODevice::ReadOnly));
+            QCOMPARE(copied.readAll(), contents);
+            QCOMPARE(QApplication::clipboard()->mimeData()->hasImage(), i == 0);
+            const auto modified = QFileInfo(path).lastModified();
+            QApplication::clipboard()->setText("new clipboard");
+            menu->actions()[0]->trigger();
+            QTRY_COMPARE(QApplication::clipboard()->mimeData()->urls(), urls);
+            QCOMPARE(QFileInfo(path).lastModified(), modified);
+            menu->actions()[1]->trigger();
+            QCOMPARE(quoteText->accessibleName(), QString("资源测试: [%1] %2").arg(labels[i], names[i]));
+            QTest::mouseClick(window->findChild<QToolButton *>("cancelQuote"), Qt::LeftButton);
+            QVERIFY(handler.urls.isEmpty());
+            QVERIFY(!window->findChild<VoicePlayer *>()->isPlaying());
+        }
+    }
     void cachedMediaCopiesMergeClicksAndRespectTheCurrentConversation()
     {
         FileOpenHandler handler;
@@ -2851,7 +2924,7 @@ class DesktopTests : public QObject
             if (groups->item(row)->data(Qt::UserRole).toJsonObject()["id"].toString() != group)
                 other = groups->item(row)->data(Qt::UserRole).toJsonObject()["id"].toString();
         QVERIFY(!other.isEmpty());
-        for (int phase = 0; phase < 2; ++phase)
+        for (int phase = 0; phase < 4; ++phase)
         {
             const auto name = QString("cache-copy-%1.png").arg(phase);
             const auto source = files.filePath(name);
@@ -2881,14 +2954,40 @@ class DesktopTests : public QObject
             };
             QTRY_VERIFY_WITH_TIMEOUT(!cached().isEmpty() && QFileInfo::exists(cached()), 5000);
             QVERIFY(MediaStorage::isCachePath(cached()));
-            view->mediaClicked(media, false);
-            view->mediaClicked(media, false); // One cached copy, including when both clicks precede completion.
-            if (phase) window->activateConversation(other);
+            if (phase < 2)
+            {
+                view->mediaClicked(media, false);
+                view->mediaClicked(media, false); // One saved copy, including two clicks before completion.
+                if (phase) window->activateConversation(other);
+            }
+            else
+            {
+                auto *pool = QThreadPool::globalInstance();
+                QVERIFY(pool->waitForDone(5000));
+                const auto threads = pool->maxThreadCount();
+                pool->setMaxThreadCount(1);
+                QSemaphore entered, release;
+                pool->start([&] { entered.release(); release.acquire(); });
+                const auto unblock = qScopeGuard([&]
+                {
+                    release.release(); pool->waitForDone(5000); pool->setMaxThreadCount(threads);
+                });
+                QVERIFY(entered.tryAcquire(1, 5000));
+                QApplication::clipboard()->setText("keep this clipboard");
+                view->mediaCopyRequested(media);
+                if (phase == 2) QApplication::clipboard()->setText("newer clipboard");
+                else window->activateConversation(other);
+                release.release();
+                QVERIFY(pool->waitForDone(5000));
+            }
             const auto folder = QDir(files.filePath("downloads/" + QDate::currentDate().toString("yyyy-MM-dd")));
             QTRY_VERIFY_WITH_TIMEOUT(QFileInfo::exists(folder.filePath(name)), 5000);
             QTest::qWait(80);
             QCOMPARE(handler.urls.size(), 1);
             QCOMPARE(folder.entryList({QString("cache-copy-%1*.png").arg(phase)}, QDir::Files).size(), 1);
+            if (phase >= 2)
+                QCOMPARE(QApplication::clipboard()->text(), phase == 2 ? "newer clipboard" : "keep this clipboard");
+            if (phase == 1) window->activateConversation(group);
         }
         window->activateConversation(group);
     }

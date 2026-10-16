@@ -20,6 +20,7 @@ void execChatContextMenu(QMenu *menu, const QPoint &anchor);
 QPixmap chatAvatar(const QJsonObject &entity, int size);
 void paintVideoPreview(QPainter *painter, const QRect &rect, const QJsonObject &media, const QFont &font);
 bool canRecallMessage(const QJsonObject &message, qint64 now);
+QString messageQuoteText(const QJsonObject &message);
 QString messageQuoteLabel(const QJsonObject &quote);
 bool sameMediaDescriptor(const QJsonObject &first, const QJsonObject &second);
 QJsonObject preserveLocalMediaState(QJsonObject message, const QJsonObject &previous);
@@ -100,7 +101,7 @@ class MessageView : public StableListView
     explicit MessageView(QWidget *parent = nullptr);
     ~MessageView() override;
     void setModel(QAbstractItemModel *model) override;
-    QMenu *contextMenuFor(const QModelIndex &index, bool avatar);
+    QMenu *contextMenuFor(const QModelIndex &index, bool avatar, int mediaIndex = -1);
     QMenu *quoteContextMenuFor(const QModelIndex &index);
     void stopScrollAnimation();
     bool scrollAnimationActive() const;
@@ -111,6 +112,7 @@ class MessageView : public StableListView
     bool recallSupported() const { return recallAvailable; }
   signals:
     void mediaClicked(const QJsonObject &media, bool saveOnly);
+    void mediaCopyRequested(const QJsonObject &media);
     void mentionRequested(const QJsonObject &member);
     void quoteRequested(const QJsonObject &message);
     void recallRequested(const QJsonObject &message);

@@ -1515,6 +1515,47 @@ class ClientTests : public QObject
         QVERIFY(!menu->findChild<QAction *>("recallMessage"));
         delete menu;
     }
+    void resourceMenusCopyTheChosenAttachmentAndQuoteTheMessage()
+    {
+        MessageModel model;
+        MessageView view;
+        view.setModel(&model);
+        QSignalSpy copies(&view, &MessageView::mediaCopyRequested), quotes(&view, &MessageView::quoteRequested);
+        const QStringList kinds{"image", "gif", "video", "file", "voice", "other"};
+        const QStringList labels{"图片", "GIF", "视频", "文件", "语音", "文件"};
+        for (int i = 0; i < kinds.size(); ++i)
+        {
+            const QJsonObject item{{"id", "resource-" + kinds[i]}, {"name", "original.bin"}, {"kind", kinds[i]}};
+            QJsonObject message{{"id", "resource-message"}, {"sender", "成员"}, {"text", "caption"},
+                {"error", "not a menu item"}, {"media", QJsonArray{QJsonObject{{"id", "first"}}, item}}};
+            model.replace({message});
+            auto *menu = view.contextMenuFor(model.index(0), false, 1);
+            QVERIFY(menu);
+            QCOMPARE(menu->actions().size(), 2);
+            auto *copy = menu->actions()[0], *quote = menu->actions()[1];
+            QCOMPARE(copy->text(), "复制");
+            QCOMPARE(quote->text(), "引用");
+            copy->trigger();
+            quote->trigger();
+            QCOMPARE(copies.last().first().toJsonObject(), item);
+            QCOMPARE(quotes.last().first().toJsonObject(), model.index(0).data(Qt::UserRole).toJsonObject());
+            view.setProperty("canDownload", false);
+            const auto count = copies.count();
+            copy->trigger();
+            QCOMPARE(copies.count(), count); // An already-open menu must obey revoked permissions.
+            delete menu;
+            message["text"] = "";
+            message["media"] = QJsonArray{item};
+            model.replace({message});
+            menu = view.contextMenuFor(model.index(0), false);
+            QCOMPARE(menu->actions().size(), 2);
+            QVERIFY(!menu->actions()[0]->isEnabled());
+            QVERIFY(menu->actions()[1]->isEnabled());
+            QCOMPARE(messageQuoteText(message), QString("[%1] original.bin").arg(labels[i]));
+            delete menu;
+            view.setProperty("canDownload", true);
+        }
+    }
     void unsupportedRecallDisablesMenuAndStaleActionsButKeepsCopyQuoteAndLegacyCompatibility()
     {
         MessageModel model;
