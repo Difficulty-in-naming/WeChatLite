@@ -30,8 +30,9 @@ class Composer : public QTextEdit
   private:
     void updatePopup();
     void choose(int row);
+    bool isComposing() const;
     QJsonArray members;
     QListWidget *popup;
     int mentionStart = -1;
-    bool choosing = false, composing = false;
+    bool choosing = false;
 };

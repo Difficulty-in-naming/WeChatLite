@@ -28,6 +28,7 @@ class ServerWindow : public QMainWindow
     bool ensureConfiguration(QString &error);
     void configureService(bool showAutomatic = false);
     void showSoftwareUpdate();
+    void showAutostart();
     void pollStatus();
     void appendLog(const QString &text);
     QString configPath;

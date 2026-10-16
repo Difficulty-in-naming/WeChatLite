@@ -1,4 +1,5 @@
 #include "server_window.h"
+#include "autostart.h"
 #include <QApplication>
 #include <QCommandLineParser>
 #include <QDir>
@@ -61,6 +62,11 @@ int main(int argc, char **argv)
         return 1;
     }
     ServerWindow window(path, parser.isSet("demo"));
+    if (!parser.isSet("demo"))
+    {
+        QString error;
+        ServerAutostart::currentUser(path).refreshIfEnabled(error);
+    }
     window.show();
     if (parser.isSet("start"))
         QTimer::singleShot(0, &window, &ServerWindow::startService);

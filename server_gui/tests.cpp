@@ -1,4 +1,5 @@
 #include "server_window.h"
+#include "autostart.h"
 #include "client_permissions.h"
 #include "server_settings.h"
 #include "connection_info.h"
@@ -20,6 +21,7 @@
 #include <QMenu>
 #include <QPushButton>
 #include <QSaveFile>
+#include <QSettings>
 #include <QSignalSpy>
 #include <QSslCertificate>
 #include <QSslKey>
@@ -30,6 +32,8 @@
 #include <QTest>
 #include <QTimer>
 #include <QUuid>
+#include <QXmlStreamReader>
+#include <QScopeGuard>
 #include <memory>
 #include <functional>
 #include <algorithm>
@@ -312,6 +316,192 @@ class ServerGuiTests : public QObject
 {
     Q_OBJECT
   private slots:
+    void autostartRegistrationIsScopedReversibleAndTracksCurrentProgram_data()
+    {
+        QTest::addColumn<bool>("windows");
+#ifdef Q_OS_WIN
+        QTest::newRow("temporary-registry-value") << true;
+#endif
+        QTest::newRow("temporary-launch-agent") << false;
+    }
+
+    void autostartRegistrationIsScopedReversibleAndTracksCurrentProgram()
+    {
+        QFETCH(bool, windows);
+        QTemporaryDir temporary;
+        QVERIFY(temporary.isValid());
+        const auto registry = "HKEY_CURRENT_USER\\Software\\WeChatLite\\AutostartTests\\" +
+            QUuid::createUuid().toString(QUuid::WithoutBraces);
+        auto cleanup = qScopeGuard([&]
+        {
+            if (windows) { QSettings settings(registry, QSettings::NativeFormat); settings.remove(""); settings.sync(); }
+        });
+        const auto location = windows ? registry : temporary.filePath("LaunchAgents/local.wechatlite.server.plist");
+        const auto platform = windows ? ServerAutostart::Platform::Windows : ServerAutostart::Platform::MacOS;
+        const auto name = windows ? "wechat-server.exe" : "wechat-server";
+        const auto oldProgram = temporary.filePath("旧版本 & app/" + QString(name));
+        const auto newProgram = temporary.filePath("新版本 & app/" + QString(name));
+        for (const auto &path : {oldProgram, newProgram})
+        {
+            QVERIFY(QDir().mkpath(QFileInfo(path).absolutePath()));
+            QFile file(path);
+            QVERIFY(file.open(QIODevice::WriteOnly));
+            QVERIFY(file.write("fixture executable") > 0);
+            file.close();
+        }
+        const auto configPath = temporary.filePath("配置 & server.json");
+        QFile config(configPath);
+        QVERIFY(config.open(QIODevice::WriteOnly));
+        QVERIFY(config.write("{\"token\":\"fixture-sensitive-value\"}") > 0);
+        config.close();
+        const auto neighbor = temporary.filePath("LaunchAgents/other.application.plist");
+        if (windows)
+        {
+            QSettings settings(registry, QSettings::NativeFormat);
+            settings.setValue("OtherApplication", "neighbor must survive");
+            settings.sync();
+        }
+        else
+        {
+            QVERIFY(QDir().mkpath(QFileInfo(neighbor).absolutePath()));
+            QFile file(neighbor);
+            QVERIFY(file.open(QIODevice::WriteOnly));
+            QVERIFY(file.write("neighbor must survive") > 0);
+        }
+        auto command = [&]() -> QStringList
+        {
+            if (windows)
+            {
+                QSettings settings(registry, QSettings::NativeFormat);
+                return QProcess::splitCommand(settings.value("WeChatLiteServer").toString());
+            }
+            QFile file(location);
+            if (!file.open(QIODevice::ReadOnly)) return {};
+            const auto content = file.readAll();
+            if (content.contains("fixture-sensitive-value")) return {};
+            QXmlStreamReader xml(content);
+            QStringList result;
+            while (!xml.atEnd())
+            {
+                xml.readNext();
+                if (xml.isStartElement() && xml.name() == u"array")
+                    while (xml.readNextStartElement()) result << xml.readElementText();
+            }
+            return xml.hasError() ? QStringList{} : result;
+        };
+        auto neighborIntact = [&]
+        {
+            if (windows)
+            {
+                QSettings settings(registry, QSettings::NativeFormat);
+                return settings.value("OtherApplication").toString() == "neighbor must survive";
+            }
+            QFile file(neighbor);
+            return file.open(QIODevice::ReadOnly) && file.readAll() == "neighbor must survive";
+        };
+        ServerAutostart old(platform, location, oldProgram, configPath);
+        QString error;
+        bool enabled = true;
+        QVERIFY2(old.read(enabled, error), qPrintable(error));
+        QVERIFY(!enabled);
+        QVERIFY2(old.refreshIfEnabled(error), qPrintable(error));
+        QVERIFY2(old.read(enabled, error), qPrintable(error));
+        QVERIFY(!enabled); // Merely starting a newer app never enables the option.
+        QVERIFY2(old.setEnabled(true, error), qPrintable(error));
+        QVERIFY2(old.read(enabled, error), qPrintable(error));
+        QVERIFY(enabled);
+        QCOMPARE(QDir::fromNativeSeparators(command().value(0)), oldProgram);
+        QCOMPARE(command().value(1), "--config");
+        QCOMPARE(QDir::fromNativeSeparators(command().value(2)), configPath);
+        QCOMPARE(command().value(3), "--start");
+        ServerAutostart current(platform, location, newProgram, configPath);
+        QVERIFY2(current.refreshIfEnabled(error), qPrintable(error));
+        QCOMPARE(QDir::fromNativeSeparators(command().value(0)), newProgram);
+        QVERIFY2(current.read(enabled, error), qPrintable(error));
+        QVERIFY(enabled && neighborIntact());
+        AutostartSettings widget(current);
+        widget.show();
+        auto *checkbox = widget.findChild<QCheckBox *>("serverAutostartEnabled");
+        QVERIFY(checkbox && checkbox->isChecked());
+        QVERIFY(checkbox->toolTip().isEmpty());
+        checkbox->click();
+        QVERIFY(!checkbox->isChecked());
+        QVERIFY2(current.read(enabled, error), qPrintable(error));
+        QVERIFY(!enabled && neighborIntact());
+        checkbox->click();
+        QVERIFY(checkbox->isChecked());
+        // Reopening reads the OS registration, rather than a stale application preference.
+        QVERIFY2(current.setEnabled(false, error), qPrintable(error));
+        AutostartSettings reopened(current);
+        auto *reopenedCheckbox = reopened.findChild<QCheckBox *>("serverAutostartEnabled");
+        QVERIFY(!reopenedCheckbox->isChecked());
+        QVERIFY(QFile::remove(newProgram));
+        reopenedCheckbox->click();
+        QVERIFY(!reopenedCheckbox->isChecked());
+        QVERIFY(reopened.findChild<QLabel *>("serverAutostartStatus")->text().contains("路径无效"));
+        QVERIFY2(current.read(enabled, error), qPrintable(error));
+        QVERIFY(!enabled);
+        QVERIFY(neighborIntact());
+    }
+
+    void autostartRejectsForeignOrDamagedRegistrationWithoutChangingIt_data()
+    {
+        autostartRegistrationIsScopedReversibleAndTracksCurrentProgram_data();
+    }
+
+    void autostartRejectsForeignOrDamagedRegistrationWithoutChangingIt()
+    {
+        QFETCH(bool, windows);
+        QTemporaryDir temporary;
+        QVERIFY(temporary.isValid());
+        const auto registry = "HKEY_CURRENT_USER\\Software\\WeChatLite\\AutostartTests\\" +
+            QUuid::createUuid().toString(QUuid::WithoutBraces);
+        auto cleanup = qScopeGuard([&]
+        {
+            if (windows) { QSettings settings(registry, QSettings::NativeFormat); settings.remove(""); settings.sync(); }
+        });
+        const auto location = windows ? registry : temporary.filePath("local.wechatlite.server.plist");
+        const QByteArray foreign = "<?xml version=\"1.0\"?><plist version=\"1.0\"><dict>"
+            "<key>Label</key><string>other.application</string></dict></plist>";
+        QFile file(location);
+        if (windows)
+        {
+            QSettings settings(registry, QSettings::NativeFormat);
+            settings.setValue("WeChatLiteServer", "other-application.exe --start");
+            settings.sync();
+        }
+        else
+        {
+            QVERIFY(file.open(QIODevice::WriteOnly));
+            QCOMPARE(file.write(foreign), foreign.size());
+            file.close();
+        }
+        ServerAutostart registration(windows ? ServerAutostart::Platform::Windows : ServerAutostart::Platform::MacOS, location,
+            temporary.filePath("wechat-server"), temporary.filePath("server.json"));
+        QString error;
+        bool enabled = true;
+        QVERIFY(!registration.read(enabled, error));
+        QVERIFY(!error.isEmpty() && !enabled);
+        QVERIFY(!registration.refreshIfEnabled(error));
+        QVERIFY(!registration.setEnabled(false, error));
+        AutostartSettings widget(registration);
+        auto *checkbox = widget.findChild<QCheckBox *>("serverAutostartEnabled");
+        checkbox->click();
+        QVERIFY(!checkbox->isChecked());
+        QVERIFY(!widget.findChild<QLabel *>("serverAutostartStatus")->text().isEmpty());
+        QVERIFY(widget.findChildren<QDialog *>().isEmpty());
+        if (windows)
+        {
+            QSettings settings(registry, QSettings::NativeFormat);
+            QCOMPARE(settings.value("WeChatLiteServer").toString(), "other-application.exe --start");
+        }
+        else
+        {
+            QVERIFY(file.open(QIODevice::ReadOnly));
+            QCOMPARE(file.readAll(), foreign);
+        }
+    }
+
     void separateGuiOwnsServiceAndManagesIndependentClientKey()
     {
         QTemporaryDir temporary;
@@ -344,6 +534,8 @@ class ServerGuiTests : public QObject
         auto updateAction = std::find_if(settingsActions.cbegin(), settingsActions.cend(),
             [](QAction *action) { return action->objectName() == "serverSoftwareUpdate"; });
         QVERIFY(updateAction != settingsActions.cend());
+        QVERIFY(std::any_of(settingsActions.cbegin(), settingsActions.cend(),
+            [](QAction *action) { return action->objectName() == "serverAutostart"; }));
         (*updateAction)->trigger();
         auto *updateDialog = window.findChild<QDialog *>("serverSoftwareUpdateDialog");
         QVERIFY(updateDialog && updateDialog->isVisible());

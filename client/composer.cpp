@@ -11,6 +11,7 @@
 #include <QPainter>
 #include <QRegularExpression>
 #include <QTextBlock>
+#include <QTextLayout>
 #include <QUrl>
 
 static constexpr int MEMBER_ID = QTextFormat::UserProperty + 1;
@@ -89,8 +90,13 @@ void Composer::dropEvent(QDropEvent *event)
 }
 void Composer::inputMethodEvent(QInputMethodEvent *event)
 {
-    composing = !event->preeditString().isEmpty();
     QTextEdit::inputMethodEvent(event);
+    updatePopup();
+}
+bool Composer::isComposing() const
+{
+    const auto *layout = textCursor().block().layout();
+    return layout && !layout->preeditAreaText().isEmpty();
 }
 void Composer::focusOutEvent(QFocusEvent *event)
 {
@@ -120,7 +126,7 @@ void Composer::keyPressEvent(QKeyEvent *event)
         }
     }
     if ((event->key() == Qt::Key_Return || event->key() == Qt::Key_Enter) &&
-        !event->modifiers().testFlag(Qt::ShiftModifier) && !composing)
+        !event->modifiers().testFlag(Qt::ShiftModifier) && !isComposing())
     {
         emit sendRequested();
         return;
@@ -158,8 +164,13 @@ void Composer::keyPressEvent(QKeyEvent *event)
 }
 void Composer::updatePopup()
 {
-    if (choosing || composing)
+    if (choosing)
         return;
+    if (isComposing())
+    {
+        popup->hide();
+        return;
+    }
     auto cursor = textCursor();
     QString prefix = toPlainText().left(cursor.position());
     auto match = QRegularExpression("(?:^|[\\s])@([^@\\s]{0,64})$").match(prefix);

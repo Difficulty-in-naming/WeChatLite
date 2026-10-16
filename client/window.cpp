@@ -255,9 +255,7 @@ Window::Window(bool demo, const QString &tunnelExecutable)
                     pendingId.clear();
                     draftTimer.start();
                 }
-                sendButton->setEnabled(
-                    canSend && !busy && !groupId.isEmpty() &&
-                    (!composer->toPlainText().trimmed().isEmpty() || !attachments.items.isEmpty()));
+                updateSendButton();
             });
     connect(composer, &Composer::sendRequested, this, &Window::send);
     connect(sendButton, &QPushButton::clicked, this, &Window::send);
@@ -651,7 +649,7 @@ void Window::makeUi()
     quoteArea->hide();
     composer = new Composer;
     composer->setPlaceholderText({});
-    composer->setMinimumHeight(50);
+    composer->setMinimumHeight(26);
     composeLayout->addWidget(composer, 1);
     auto *toolbar = new QHBoxLayout;
     toolbar->setContentsMargins(0, 0, 0, 0);
@@ -714,8 +712,8 @@ bool Window::eventFilter(QObject *watched, QEvent *event)
         }
         if (event->type() == QEvent::MouseMove && composeDragging)
         {
-            composeHeightPreference = composeDragHeight + composeDragStart.y() -
-                static_cast<QMouseEvent *>(event)->globalPosition().toPoint().y();
+            composeHeightPreference = qMax(1, composeDragHeight + composeDragStart.y() -
+                static_cast<QMouseEvent *>(event)->globalPosition().toPoint().y());
             updateComposeHeight();
             return true;
         }
@@ -2020,6 +2018,7 @@ void Window::handleEvent(const QJsonObject &event)
             loadMembers();
         }
         subtitle->setText(event["text"].toString());
+        updateSendButton();
         if (event["demo"].toBool())
             notify("演示模式 · 此处发送的消息不会进入真实微信");
     }
@@ -2168,9 +2167,13 @@ void Window::refreshAttachments()
         row->addWidget(remove);
         attachmentLayout->addWidget(card);
     }
-    sendButton->setEnabled(canSend && !busy && !groupId.isEmpty() &&
-                           (!composer->toPlainText().trimmed().isEmpty() || !attachments.items.isEmpty()));
+    updateSendButton();
     updateComposeHeight();
+}
+void Window::updateSendButton()
+{
+    sendButton->setEnabled(canSend && ready && connected && !busy && !groupId.isEmpty() &&
+                           (!composer->toPlainText().trimmed().isEmpty() || !attachments.items.isEmpty()));
 }
 void Window::quoteMessage(const QJsonObject &requested)
 {
@@ -2212,7 +2215,7 @@ void Window::updateComposeHeight()
 {
     if (auto *compose = findChild<QWidget *>("composeArea"))
     {
-        const int minimum = attachments.items.isEmpty() ? 140 : 212;
+        const int minimum = qMax(100, compose->layout()->minimumSize().height());
         const int maximum = qMax(minimum, height() * 65 / 100);
         const int requested = composeHeightPreference > 0 ? composeHeightPreference : qMin(303, height() * 24 / 100);
         compose->setFixedHeight(qBound(minimum, requested, maximum));

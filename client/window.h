@@ -79,6 +79,7 @@ class Window : public QMainWindow
     void activateCurrentGroup();
     void handleEvent(const QJsonObject &event);
     void refreshAttachments();
+    void updateSendButton();
     void quoteMessage(const QJsonObject &message);
     void refreshQuote();
     void recallMessage(const QJsonObject &message);

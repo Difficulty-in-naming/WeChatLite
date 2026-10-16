@@ -256,6 +256,56 @@ class DesktopTests : public QObject
         auto *send = probe.findChild<QPushButton *>("sendButton");
         QVERIFY(send);
         QVERIFY(probe.rect().contains(QRect(send->mapTo(&probe, QPoint()), send->size())));
+
+        const auto compactStart = handle->mapToGlobal(handle->rect().center());
+        const auto compactEnd = compactStart + QPoint(0, 1200);
+        QMouseEvent compactPress(QEvent::MouseButtonPress, QPointF(handle->rect().center()),
+                                 QPointF(compactStart), Qt::LeftButton, Qt::LeftButton, Qt::NoModifier);
+        QApplication::sendEvent(handle, &compactPress);
+        QMouseEvent compactMove(QEvent::MouseMove, QPointF(handle->mapFromGlobal(compactEnd)),
+                                QPointF(compactEnd), Qt::NoButton, Qt::LeftButton, Qt::NoModifier);
+        QApplication::sendEvent(handle, &compactMove);
+        QCoreApplication::processEvents();
+        QMouseEvent compactRelease(QEvent::MouseButtonRelease, QPointF(handle->mapFromGlobal(compactEnd)),
+                                   QPointF(compactEnd), Qt::LeftButton, Qt::NoButton, Qt::NoModifier);
+        QApplication::sendEvent(handle, &compactRelease);
+        QVERIFY(compose->height() < 140);
+        auto *editor = probe.findChild<Composer *>();
+        QVERIFY(editor && editor->height() >= 26);
+        QVERIFY(compose->rect().contains(QRect(send->mapTo(compose, QPoint()), send->size())));
+        QVERIFY(compose->rect().contains(QRect(editor->mapTo(compose, QPoint()), editor->size())));
+        QCOMPARE(QSettings().value("composeHeight").toInt(), compose->height());
+    }
+    void enterSendsAfterWeChatReadinessRecoversAndKeepsAnOfflineDraft()
+    {
+        auto *transport = window->findChild<Transport *>();
+        auto *editor = window->findChild<Composer *>();
+        auto *send = window->findChild<QPushButton *>("sendButton");
+        auto *model = window->findChild<MessageModel *>();
+        const auto draft = editor->toPlainText();
+        const auto mentions = editor->mentions();
+        const auto restore = qScopeGuard([&]
+        {
+            transport->event({{"type", "status"}, {"ready", true}});
+            editor->restore(draft, mentions);
+        });
+        window->activateWindow();
+        editor->setFocus();
+        QTRY_VERIFY(editor->hasFocus());
+        const auto text = "enter-after-ready-" + QUuid::createUuid().toString(QUuid::WithoutBraces);
+        transport->event({{"type", "status"}, {"ready", false}});
+        editor->setPlainText(text);
+        QVERIFY(!send->isEnabled());
+        QTest::keyClick(editor, Qt::Key_Return);
+        QCOMPARE(editor->toPlainText(), text);
+        QVERIFY(std::none_of(model->rows.cbegin(), model->rows.cend(), [&](const QJsonObject &message)
+            { return message["text"] == text; }));
+        transport->event({{"type", "status"}, {"ready", true}});
+        QTRY_VERIFY(send->isEnabled());
+        QTest::keyClick(editor, Qt::Key_Return);
+        QTRY_VERIFY_WITH_TIMEOUT(editor->toPlainText().isEmpty(), 8000);
+        QTRY_VERIFY_WITH_TIMEOUT(std::any_of(model->rows.cbegin(), model->rows.cend(), [&](const QJsonObject &message)
+            { return message["text"] == text && message["status"] == "sent"; }), 8000);
     }
     void oldPosterFailureAfterReconnectDoesNotPoisonTheCurrentConversation()
     {
@@ -1485,6 +1535,7 @@ class DesktopTests : public QObject
         QCOMPARE(composer->toPlainText(), "keep this local draft");
         allowed = true;
         transport->connectionChanged(true);
+        transport->event({{"type", "status"}, {"ready", true}});
         QTRY_VERIFY(send->isEnabled() && view->property("canDownload").toBool());
         menu = view->contextMenuFor(model->index(0), false);
         QVERIFY(menu);

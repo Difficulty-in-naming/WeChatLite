@@ -1,4 +1,5 @@
 #include "server_window.h"
+#include "autostart.h"
 #include "client_permissions.h"
 #include "server_settings.h"
 #include "update_widget.h"
@@ -90,6 +91,8 @@ ServerWindow::ServerWindow(const QString &path, bool demonstration, QWidget *par
     connectionSettings->setObjectName("serverConnectionSettings");
     auto *softwareUpdate = settingsMenu->addAction("检查更新", this, &ServerWindow::showSoftwareUpdate);
     softwareUpdate->setObjectName("serverSoftwareUpdate");
+    auto *autostart = settingsMenu->addAction("开机自启", this, &ServerWindow::showAutostart);
+    autostart->setObjectName("serverAutostart");
     settings->setMenu(settingsMenu);
     header->addWidget(start);
     header->addWidget(stop);
@@ -441,6 +444,32 @@ void ServerWindow::showSoftwareUpdate()
     dialog->resize(560, 380);
     auto *layout = new QVBoxLayout(dialog);
     layout->addWidget(new UpdateWidget(ReleaseUpdate::Role::Server, dialog));
+    auto *buttons = new QDialogButtonBox(QDialogButtonBox::Close);
+    buttons->button(QDialogButtonBox::Close)->setText("关闭");
+    layout->addWidget(buttons);
+    connect(buttons, &QDialogButtonBox::rejected, dialog, &QDialog::close);
+    dialog->show();
+}
+
+void ServerWindow::showAutostart()
+{
+    if (auto *existing = findChild<QDialog *>("serverAutostartDialog"))
+    {
+        existing->showNormal();
+        existing->raise();
+        existing->activateWindow();
+        return;
+    }
+    auto *dialog = new QDialog(this);
+    dialog->setObjectName("serverAutostartDialog");
+    dialog->setAttribute(Qt::WA_DeleteOnClose);
+    dialog->setWindowTitle("转发服务端 · 开机自启");
+    dialog->resize(480, 220);
+    auto *layout = new QVBoxLayout(dialog);
+    auto *control = new AutostartSettings(ServerAutostart::currentUser(configPath), dialog);
+    control->setEnabled(!demo);
+    layout->addWidget(control);
+    if (demo) layout->addWidget(new QLabel("演示模式不修改系统启动项。"));
     auto *buttons = new QDialogButtonBox(QDialogButtonBox::Close);
     buttons->button(QDialogButtonBox::Close)->setText("关闭");
     layout->addWidget(buttons);

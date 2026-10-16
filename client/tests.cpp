@@ -29,6 +29,7 @@
 #include <QSettings>
 #include <QStandardPaths>
 #include <QTemporaryDir>
+#include <QTextBlock>
 #include <QTextLayout>
 #include <QTextOption>
 #include <QUuid>
@@ -1266,6 +1267,62 @@ class ClientTests : public QObject
         QCOMPARE(spy.count(), 1);
         QTest::keyClick(&composer, Qt::Key_Return, Qt::ShiftModifier);
         QCOMPARE(spy.count(), 1);
+    }
+    void replacingComposedDraftDoesNotLeaveEnterInCompositionMode_data()
+    {
+        QTest::addColumn<int>("replacement");
+        QTest::newRow("clear") << 0;
+        QTest::newRow("restore") << 1;
+        QTest::newRow("replace-plain-text") << 2;
+        QTest::newRow("replace-document") << 3;
+    }
+    void replacingComposedDraftDoesNotLeaveEnterInCompositionMode()
+    {
+        QFETCH(int, replacement);
+        Composer composer;
+        composer.show();
+        composer.setFocus();
+        QSignalSpy sent(&composer, &Composer::sendRequested);
+        QInputMethodEvent preedit("ni", {});
+        QApplication::sendEvent(&composer, &preedit);
+        QVERIFY(!composer.textCursor().block().layout()->preeditAreaText().isEmpty());
+        if (replacement == 0)
+        {
+            composer.clear();
+            composer.insertPlainText("draft");
+        }
+        else if (replacement == 1) composer.restore("draft", {});
+        else if (replacement == 2) composer.setPlainText("draft");
+        else
+        {
+            auto *document = new QTextDocument(&composer);
+            document->setPlainText("draft");
+            composer.setDocument(document);
+        }
+        QVERIFY(composer.textCursor().block().layout()->preeditAreaText().isEmpty());
+        const auto draft = composer.toPlainText();
+        QTest::keyClick(&composer, Qt::Key_Return);
+        QCOMPARE(sent.count(), 1);
+        QCOMPARE(composer.toPlainText(), draft);
+    }
+    void chineseCandidateEnterDoesNotChooseAnExistingMentionPopup()
+    {
+        Composer composer;
+        composer.resize(400, 150);
+        composer.setMembers({QJsonObject{{"id", "candidate-member"}, {"name", "林小满"}}});
+        composer.show();
+        composer.activateWindow();
+        composer.setFocus();
+        QTest::qWait(30);
+        QSignalSpy sent(&composer, &Composer::sendRequested);
+        QTest::keyClicks(&composer, "@");
+        QTRY_VERIFY(composer.popupVisible());
+        QInputMethodEvent preedit("lin", {});
+        QApplication::sendEvent(&composer, &preedit);
+        QVERIFY(!composer.popupVisible());
+        QTest::keyClick(&composer, Qt::Key_Return);
+        QCOMPARE(sent.count(), 0);
+        QVERIFY(composer.mentions().isEmpty());
     }
     void avatarMentionInsertsTheSelectedIdentityAtTheDraftCursor()
     {
