@@ -1,7 +1,9 @@
 set(SERVER_UI_SOURCES server_window.cpp server_window.h client_permissions.cpp client_permissions.h
     server_settings.cpp server_settings.h ../client/transport.cpp ../client/transport.h
     ../client/attachment.cpp ../client/attachment.h
-    ../client/connection_info.cpp ../client/connection_info.h)
+    ../client/connection_info.cpp ../client/connection_info.h
+    ../client/release_update.cpp ../client/release_update.h
+    ../client/update_widget.cpp ../client/update_widget.h)
 qt_add_executable(wechat-server main.cpp ${SERVER_UI_SOURCES})
 target_include_directories(wechat-server PRIVATE ../client)
 target_link_libraries(wechat-server PRIVATE Qt6::Widgets Qt6::Network Qt6::WebSockets)

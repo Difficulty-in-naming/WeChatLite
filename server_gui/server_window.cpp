@@ -1,10 +1,13 @@
 #include "server_window.h"
 #include "client_permissions.h"
 #include "server_settings.h"
+#include "update_widget.h"
 #include <QApplication>
 #include <QCloseEvent>
 #include <QCryptographicHash>
 #include <QDesktopServices>
+#include <QDialog>
+#include <QDialogButtonBox>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
@@ -80,8 +83,14 @@ ServerWindow::ServerWindow(const QString &path, bool demonstration, QWidget *par
     stop = new QPushButton("停止服务");
     stop->setObjectName("serverStop");
     stop->setEnabled(false);
-    settings = new QPushButton("连接与存储");
+    settings = new QPushButton("设置");
     settings->setObjectName("serverConfigure");
+    auto *settingsMenu = new QMenu(settings);
+    auto *connectionSettings = settingsMenu->addAction("连接与存储", this, [this] { configureService(); });
+    connectionSettings->setObjectName("serverConnectionSettings");
+    auto *softwareUpdate = settingsMenu->addAction("检查更新", this, &ServerWindow::showSoftwareUpdate);
+    softwareUpdate->setObjectName("serverSoftwareUpdate");
+    settings->setMenu(settingsMenu);
     header->addWidget(start);
     header->addWidget(stop);
     header->addWidget(settings);
@@ -148,7 +157,7 @@ ServerWindow::ServerWindow(const QString &path, bool demonstration, QWidget *par
     statusTimer.setInterval(5000);
 #ifdef Q_OS_WIN
     service.setCreateProcessArgumentsModifier([](QProcess::CreateProcessArguments *arguments)
-        { arguments->flags |= 0x08000000; });
+        { arguments->flags = (arguments->flags & ~(0x08000000UL | 0x00000010UL)) | 0x00000008UL; });
 #endif
     service.setProcessChannelMode(QProcess::MergedChannels);
     auto environment = QProcessEnvironment::systemEnvironment();
@@ -165,7 +174,6 @@ ServerWindow::ServerWindow(const QString &path, bool demonstration, QWidget *par
         state->setText("运行中");
         start->setEnabled(false);
         stop->setEnabled(true);
-        settings->setEnabled(false);
         statusTimer.start();
         pollStatus();
     });
@@ -201,8 +209,6 @@ ServerWindow::ServerWindow(const QString &path, bool demonstration, QWidget *par
     connect(&statusTimer, &QTimer::timeout, this, &ServerWindow::pollStatus);
     connect(start, &QPushButton::clicked, this, &ServerWindow::startService);
     connect(stop, &QPushButton::clicked, this, &ServerWindow::stopService);
-    connect(settings, &QPushButton::clicked, this, [this]
-        { configureService(); });
     connect(clients, &ClientPermissions::editConnectionRequested, this,
         [this] { configureService(true); });
     connect(folder, &QPushButton::clicked, this, [this]
@@ -370,7 +376,6 @@ void ServerWindow::startService()
     state->setText("正在启动…");
     bridge->setText("正在连接本机微信…");
     start->setEnabled(false);
-    settings->setEnabled(false);
     observedHttp = false;
     service.setProgram(relayBinary());
     QStringList arguments{"--config", configPath};
@@ -418,6 +423,29 @@ void ServerWindow::configureService(bool showAutomatic)
     }
     if (editLocalService(this, configPath, showAutomatic))
         feedback->setText("连接配置已保存，启动服务后生效。请为客户端重新复制连接信息。");
+}
+
+void ServerWindow::showSoftwareUpdate()
+{
+    if (auto *existing = findChild<QDialog *>("serverSoftwareUpdateDialog"))
+    {
+        existing->showNormal();
+        existing->raise();
+        existing->activateWindow();
+        return;
+    }
+    auto *dialog = new QDialog(this);
+    dialog->setObjectName("serverSoftwareUpdateDialog");
+    dialog->setAttribute(Qt::WA_DeleteOnClose);
+    dialog->setWindowTitle("转发服务端 · 软件更新");
+    dialog->resize(560, 380);
+    auto *layout = new QVBoxLayout(dialog);
+    layout->addWidget(new UpdateWidget(ReleaseUpdate::Role::Server, dialog));
+    auto *buttons = new QDialogButtonBox(QDialogButtonBox::Close);
+    buttons->button(QDialogButtonBox::Close)->setText("关闭");
+    layout->addWidget(buttons);
+    connect(buttons, &QDialogButtonBox::rejected, dialog, &QDialog::close);
+    dialog->show();
 }
 
 void ServerWindow::pollStatus()

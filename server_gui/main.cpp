@@ -16,7 +16,7 @@ int main(int argc, char **argv)
     app.styleHints()->setColorScheme(Qt::ColorScheme::Light);
     QCoreApplication::setOrganizationName("WeChatLite");
     QCoreApplication::setApplicationName("WeChatLiteServer");
-    QCoreApplication::setApplicationVersion("0.3.1");
+    QCoreApplication::setApplicationVersion(QStringLiteral(WECHAT_LITE_VERSION));
     const auto profile = qEnvironmentVariable("WECHAT_LITE_PROFILE");
     if (!profile.isEmpty())
     {

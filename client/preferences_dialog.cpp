@@ -1,5 +1,6 @@
 #include "preferences_dialog.h"
 #include "media_storage.h"
+#include "update_widget.h"
 #include <QCheckBox>
 #include <QComboBox>
 #include <QDialogButtonBox>
@@ -83,7 +84,7 @@ PreferencesDialog::PreferencesDialog(const Values &initial, QWidget *parent)
     navigation->setFrameShape(QFrame::NoFrame);
     navigation->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
     navigation->setContentsMargins(0, 16, 0, 0);
-    navigation->addItems({"存储", "外观", "通知"});
+    navigation->addItems({"存储", "外观", "通知", "更新"});
     outer->addWidget(navigation);
     auto *divider = new QFrame;
     divider->setFrameShape(QFrame::VLine);
@@ -195,6 +196,10 @@ PreferencesDialog::PreferencesDialog(const Values &initial, QWidget *parent)
     notifications->addWidget(description("仅为允许通知的新消息播放提示音；忽略消息通知的群仍保持静音。"));
     notifications->addStretch();
     pages->addWidget(notificationPage);
+
+    auto *updatePage = new UpdateWidget(ReleaseUpdate::Role::Client);
+    updatePage->setObjectName("preferencesUpdatePage");
+    pages->addWidget(updatePage);
 
     auto *footer = new QVBoxLayout;
     footer->setContentsMargins(24, 8, 24, 18);

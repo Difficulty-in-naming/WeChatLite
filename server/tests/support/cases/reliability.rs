@@ -20,8 +20,18 @@ async fn shutdown_case(tls: bool) -> Result<()> {
     );
     assert_eq!(
         std::fs::read(relay.dir.path().join("server-stderr.log"))?,
-        b""
+        b"offline adapter diagnostics ready\noffline adapter diagnostics stopped\n"
     );
+    #[cfg(windows)]
+    {
+        let handles: Value = serde_json::from_slice(&std::fs::read(
+            relay.dir.path().join("adapter-handles.json"),
+        )?)?;
+        assert_eq!(handles["console_processes"], 0);
+        assert_eq!(handles["stdin_pipe"], true);
+        assert_eq!(handles["stdout_pipe"], true);
+        assert!([1, 3].contains(&handles["stderr_type"].as_u64().unwrap()));
+    }
     Ok(())
 }
 pub async fn local_shutdown_closes_websockets_and_reaps_adapter() -> Result<()> {

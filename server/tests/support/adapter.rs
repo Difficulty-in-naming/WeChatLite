@@ -54,6 +54,26 @@ pub fn run(mode: &str, directory: &Path) -> Result<()> {
         std::fs::write(directory, b"unexpected-start")?;
         return Ok(());
     }
+    if mode == "shutdown" {
+        #[cfg(windows)]
+        {
+            #[link(name = "kernel32")]
+            unsafe extern "system" {
+                fn GetConsoleProcessList(processes: *mut u32, count: u32) -> u32;
+                fn GetStdHandle(which: u32) -> *mut std::ffi::c_void;
+                fn GetFileType(handle: *mut std::ffi::c_void) -> u32;
+            }
+            let mut processes = [0u32; 16];
+            let handles = unsafe {
+                json!({"console_processes":GetConsoleProcessList(processes.as_mut_ptr(),16),
+                    "stdin_pipe":GetFileType(GetStdHandle((-10i32) as u32))==3,
+                    "stdout_pipe":GetFileType(GetStdHandle((-11i32) as u32))==3,
+                    "stderr_type":GetFileType(GetStdHandle((-12i32) as u32))})
+            };
+            std::fs::write(directory.join("adapter-handles.json"), handles.to_string())?;
+        }
+        eprintln!("offline adapter diagnostics ready");
+    }
     std::fs::write(
         directory.join("initial-policy.json"),
         std::env::var("WECHAT_LITE_FORWARD_GROUPS").context("missing fixture policy")?,
@@ -175,6 +195,7 @@ pub fn run(mode: &str, directory: &Path) -> Result<()> {
             json!({"type":"status","ready":false,"text":format!("EOF tail {}","x".repeat(128*1024))}),
         )?;
         std::fs::write(directory.join("adapter-stopped"), "stdin-closed")?;
+        eprintln!("offline adapter diagnostics stopped");
     }
     Ok(())
 }

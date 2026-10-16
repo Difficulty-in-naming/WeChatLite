@@ -1,5 +1,6 @@
 cmake_minimum_required(VERSION 3.24)
-project(WeChatLite VERSION 0.3.1 LANGUAGES CXX)
+project(WeChatLite VERSION 0.3.2 LANGUAGES CXX)
+add_compile_definitions(WECHAT_LITE_VERSION="${PROJECT_VERSION}")
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_AUTOMOC ON)

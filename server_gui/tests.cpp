@@ -17,6 +17,7 @@
 #include <QLineEdit>
 #include <QListWidget>
 #include <QMessageBox>
+#include <QMenu>
 #include <QPushButton>
 #include <QSaveFile>
 #include <QSignalSpy>
@@ -31,6 +32,7 @@
 #include <QUuid>
 #include <memory>
 #include <functional>
+#include <algorithm>
 
 namespace
 {
@@ -336,7 +338,18 @@ class ServerGuiTests : public QObject
         QVERIFY2(window.findChild<QLabel *>("serverBridgeStatus")->text() != "尚未启动",
             qPrintable(window.findChild<QLabel *>("serverFeedback")->text()));
         QTRY_COMPARE_WITH_TIMEOUT(window.findChild<QLabel *>("serverBridgeStatus")->text(), QString("已连接"), 15000);
-        QVERIFY(!window.findChild<QPushButton *>("serverConfigure")->isEnabled());
+        auto *serverSettingsButton = window.findChild<QPushButton *>("serverConfigure");
+        QVERIFY(serverSettingsButton->isEnabled() && serverSettingsButton->menu());
+        const auto settingsActions = serverSettingsButton->menu()->actions();
+        auto updateAction = std::find_if(settingsActions.cbegin(), settingsActions.cend(),
+            [](QAction *action) { return action->objectName() == "serverSoftwareUpdate"; });
+        QVERIFY(updateAction != settingsActions.cend());
+        (*updateAction)->trigger();
+        auto *updateDialog = window.findChild<QDialog *>("serverSoftwareUpdateDialog");
+        QVERIFY(updateDialog && updateDialog->isVisible());
+        QVERIFY(updateDialog->findChild<QLabel *>("updateStatus")->text().contains("尚未检查"));
+        QVERIFY(window.findChild<QPushButton *>("serverStop")->isEnabled());
+        updateDialog->close();
         tabs->setCurrentIndex(2);
         auto *groups = window.findChild<QListWidget *>("clientAccessGroups");
         QTRY_VERIFY_WITH_TIMEOUT(groups->count() > 0, 5000);

@@ -125,7 +125,12 @@ class PreferencesTests final : public QObject
         dialog.show();
         QTRY_COMPARE(usage.size(), 1);
         QCOMPARE(usage.first()[0].toString(), initial.downloads);
-        QCOMPARE(navigation->count(), 3);
+        QCOMPARE(navigation->count(), 4);
+        navigation->setCurrentRow(3);
+        QCOMPARE(pages->currentWidget()->objectName(), QString("preferencesUpdatePage"));
+        QVERIFY(dialog.findChild<QPushButton *>("updateCheck")->isEnabled());
+        QVERIFY(dialog.findChild<QLabel *>("updateStatus")->text().contains("尚未检查"));
+        navigation->setCurrentRow(0);
         QCOMPARE(pages->currentWidget()->objectName(), QString("preferencesStoragePage"));
         for (int row = 0; row < navigation->count(); ++row)
         {

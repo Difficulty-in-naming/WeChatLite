@@ -137,7 +137,8 @@ async fn run_process(app: &Arc<App>, receiver: &mut mpsc::Receiver<Value>) -> Re
         .kill_on_drop(true);
     #[cfg(windows)]
     {
-        command.creation_flags(0x08000000);
+        // DETACHED_PROCESS avoids a headless conhost while preserving redirected stdio.
+        command.creation_flags(0x00000008);
     }
     let mut child = command.spawn().context("无法启动本机适配器")?;
     let mut input = child.stdin.take().context("适配器没有标准输入")?;
