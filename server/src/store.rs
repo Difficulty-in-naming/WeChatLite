@@ -533,6 +533,7 @@ impl Store {
         text: &str,
         quote: &Quote,
         historical: bool,
+        source_server_id: Option<&str>,
     ) -> Result<Option<Value>> {
         let mut conn = self.db.lock().unwrap();
         let tx = conn.transaction()?;
@@ -548,9 +549,26 @@ impl Store {
         if message.status == "recalled"
             || !message.recall_status.is_empty()
             || !message.client_id.is_empty()
-            || message.quote.is_some()
         {
             return Ok(None);
+        }
+        if let Some(previous) = &message.quote {
+            // Only a newly verified copy of this same native reply can replace its old placeholder.
+            // Never retarget a real reference, restore a redacted quote, or infer identity from its label.
+            let previous_server_id = previous.id.strip_prefix("unavailable-");
+            let verified = previous_server_id.is_some_and(|id| {
+                source_server_id == Some(id)
+                    && id
+                        .parse::<u64>()
+                        .is_ok_and(|number| number > 0 && number.to_string() == id)
+            });
+            if previous.unavailable
+                || !verified
+                || quote.id.is_empty()
+                || quote.id.starts_with("unavailable-")
+            {
+                return Ok(None);
+            }
         }
         let mut quote = quote.clone();
         let source: Option<String> = tx
@@ -1199,6 +1217,102 @@ mod tests {
 
     fn message(id: &str) -> ChatMessage {
         serde_json::from_value(json!({"id":id,"group":"g","sender":"小林","text":"你好","timestamp":0,"status":"queued"})).unwrap()
+    }
+    #[test]
+    fn native_quote_placeholder_repair_requires_exact_proof_and_preserves_existing_and_redacted_links()
+     {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(&temp.path().join("quote-repair.sqlite")).unwrap();
+        let mut original = message("image-source");
+        original.status = "received".into();
+        original.source_id = "wx:g:message__message_0.db:1:1".into();
+        store.insert_message(&mut original).unwrap();
+        let quote = Quote {
+            id: original.id.clone(),
+            sender: "member".into(),
+            text: "[图片]".into(),
+            unavailable: false,
+        };
+        for (id, old_id, redacted, client, proof, repaired) in [
+            ("match", "unavailable-42", false, "", Some("42"), true),
+            ("missing-proof", "unavailable-42", false, "", None, false),
+            (
+                "wrong-proof",
+                "unavailable-42",
+                false,
+                "",
+                Some("43"),
+                false,
+            ),
+            ("zero-id", "unavailable-0", false, "", Some("0"), false),
+            (
+                "noncanonical-id",
+                "unavailable-0042",
+                false,
+                "",
+                Some("0042"),
+                false,
+            ),
+            ("existing", "existing-link", false, "", Some("42"), false),
+            ("redacted", "unavailable-42", true, "", Some("42"), false),
+            (
+                "client",
+                "unavailable-42",
+                false,
+                "client",
+                Some("42"),
+                false,
+            ),
+        ] {
+            let mut old = message(id);
+            old.status = "received".into();
+            old.source_id = format!("wx:g:message__message_0.db:{id}:1");
+            old.client_id = client.into();
+            old.quote = Some(Quote {
+                id: old_id.into(),
+                sender: "member".into(),
+                text: "old preview".into(),
+                unavailable: redacted,
+            });
+            store.insert_message(&mut old).unwrap();
+            let before = serde_json::to_value(&old).unwrap();
+            let event = store
+                .enrich_native_quote(id, "reply", &quote, true, proof)
+                .unwrap();
+            assert_eq!(event.is_some(), repaired, "{id}");
+            let current = store.message(id).unwrap().unwrap();
+            assert_eq!(current.seq, old.seq);
+            if repaired {
+                assert_eq!(current.quote.as_ref().unwrap(), &quote);
+                assert!(
+                    store
+                        .enrich_native_quote(id, "different reply", &quote, true, proof)
+                        .unwrap()
+                        .is_none()
+                );
+            } else {
+                assert_eq!(serde_json::to_value(current).unwrap(), before, "{id}");
+            }
+        }
+        let mut original = store.message(&original.id).unwrap().unwrap();
+        original.status = "recalled".into();
+        store.update_message(&original).unwrap();
+        let mut old = message("original-recalled");
+        old.source_id = "wx:g:message__message_0.db:99:99".into();
+        old.quote = Some(Quote {
+            id: "unavailable-42".into(),
+            sender: "member".into(),
+            text: "[图片]".into(),
+            unavailable: false,
+        });
+        store.insert_message(&mut old).unwrap();
+        store
+            .enrich_native_quote(&old.id, "reply", &quote, true, Some("42"))
+            .unwrap()
+            .unwrap();
+        let current = store.message(&old.id).unwrap().unwrap();
+        assert!(current.quote.as_ref().unwrap().unavailable);
+        assert!(current.quote.as_ref().unwrap().text.is_empty());
     }
     #[test]
     fn native_history_progress_handles_sparse_quotes_pending_media_recall_and_same_second_imports()

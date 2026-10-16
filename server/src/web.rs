@@ -87,6 +87,7 @@ fn build_router(app: Arc<App>, entry: EntryPoint) -> Router {
         .route("/history", get(native_history))
         .route("/records", get(records))
         .route("/messages/{id}", get(locate))
+        .route("/messages/{id}/quote-source", post(refresh_quote_source))
         .route("/messages/{id}/recall", post(recall))
         .route(
             "/media",
@@ -923,6 +924,69 @@ async fn locate(
     Ok(Json(public(json!(message))))
 }
 
+async fn refresh_quote_source(
+    State(app): State<Arc<App>>,
+    Extension(principal): Extension<Principal>,
+    Path(id): Path<String>,
+    Query(query): Query<LocateQuery>,
+) -> ApiResult<Json<Value>> {
+    {
+        let selected = app.forwarding.read().await;
+        check_group(&selected, &query.group)?;
+        let clients = app.clients.read().await;
+        check_access(&clients, &principal, &query.group, Capability::Read)?;
+    }
+    let message = app.db(move |s| s.message(&id)).await?
+        .filter(|message| message.group == query.group)
+        .ok_or_else(|| Error(anyhow::anyhow!("引用消息不存在"), StatusCode::NOT_FOUND))?;
+    let quote = message.quote.as_ref().context("该消息没有引用")?;
+    if message.status == "recalled" || quote.unavailable {
+        return Err(Error(anyhow::anyhow!("原消息已撤回或不可用"), StatusCode::GONE));
+    }
+    let original = app.db({ let id = quote.id.clone(); move |s| s.message(&id) }).await?;
+    if let Some(original) = original.filter(|original| original.group == query.group && original.status != "recalled") {
+        return Ok(Json(public(json!({"message":message,"original":original}))));
+    }
+    if app.status.read().await["ready"] != true {
+        return Err(Error(anyhow::anyhow!("本机微信未连接"), StatusCode::SERVICE_UNAVAILABLE));
+    }
+    if crate::history::position(&query.group, &message.source_id).is_none() {
+        return Err(Error(anyhow::anyhow!("引用来源尚未确认"), StatusCode::CONFLICT));
+    }
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let mut events = app.events.subscribe();
+    app.commands.try_send(json!({"op":"quote_refresh","request_id":request_id,"group":query.group,
+        "source_id":message.source_id,"_access_client":principal.client_id()}))
+        .map_err(|_| Error(anyhow::anyhow!("引用读取任务较多，请稍后重试"), StatusCode::SERVICE_UNAVAILABLE))?;
+    let completed = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match events.recv().await {
+                Ok(event) if event["type"] == "quote_refresh_done" && event["request_id"] == request_id
+                    && event["group"] == query.group && event["source_id"] == message.source_id => break,
+                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {},
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    }).await.is_ok();
+    // Revocation while the adapter was reading must win over the completed result.
+    let selected = app.forwarding.read().await;
+    check_group(&selected, &query.group)?;
+    let clients = app.clients.read().await;
+    check_access(&clients, &principal, &query.group, Capability::Read)?;
+    let updated = app.db({ let id = message.id; move |s| s.message(&id) }).await?
+        .filter(|updated| updated.group == query.group && updated.source_id == message.source_id)
+        .ok_or_else(|| Error(anyhow::anyhow!("引用消息不存在"), StatusCode::NOT_FOUND))?;
+    let quote = updated.quote.as_ref().context("该消息没有引用")?;
+    if updated.status == "recalled" || quote.unavailable {
+        return Err(Error(anyhow::anyhow!("原消息已撤回或不可用"), StatusCode::GONE));
+    }
+    let original = app.db({ let id = quote.id.clone(); move |s| s.message(&id) }).await?
+        .filter(|original| original.group == query.group && original.status != "recalled")
+        .ok_or_else(|| Error(anyhow::anyhow!(if completed { "原消息尚未同步或不可用" } else { "引用原文读取超时，请重试" }),
+            if completed { StatusCode::NOT_FOUND } else { StatusCode::GATEWAY_TIMEOUT }))?;
+    Ok(Json(public(json!({"message":updated,"original":original}))))
+}
+
 #[derive(Deserialize)]
 struct SendRequest {
     id: String,
@@ -1546,6 +1610,53 @@ pub async fn import_media(
 mod tests {
     use super::*;
     use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn old_image_reference_is_refreshed_from_the_stored_reply_before_locating() {
+        let temp = tempfile::tempdir().unwrap();
+        let (app, mut commands) = crate::test_app(temp.path());
+        grant(&app).await;
+        app.status.write().await["ready"] = json!(true);
+        let mut original: ChatMessage = serde_json::from_value(json!({"id":"original-image","group":"g","sender":"成员","text":"[图片]","timestamp":1000,"status":"received"})).unwrap();
+        app.store.insert_message(&mut original).unwrap();
+        let source = "wx:g:message__message_0.db:7:70";
+        let mut reply: ChatMessage = serde_json::from_value(json!({"id":"old-reply","group":"g","source_id":source,"sender":"成员","text":"这个","timestamp":2000,"status":"received","quote":{"id":"unavailable-42","sender":"成员","text":"[图片]"}})).unwrap();
+        app.store.insert_message(&mut reply).unwrap();
+        let router = client_router(app.clone());
+        let response = tokio::spawn({
+            let router = router.clone();
+            async move { router.oneshot(request("POST", "/api/messages/old-reply/quote-source?group=g", "fixture-independent-secret", "192.0.2.3:2345", Body::from(r#"{"source_id":"not-trusted"}"#))).await.unwrap() }
+        });
+        let job = tokio::time::timeout(Duration::from_secs(1), commands.recv()).await.expect("legacy references must request their verified source").unwrap();
+        assert_eq!(job["op"], "quote_refresh");
+        assert_eq!(job["source_id"], source);
+        assert_eq!(job["_access_client"], "fixture-key");
+        reply.quote.as_mut().unwrap().id = original.id.clone();
+        app.store.enrich_native_quote(&reply.id, &reply.text, reply.quote.as_ref().unwrap(), false, Some("42")).unwrap();
+        app.publish(json!({"type":"quote_refresh_done","group":"g","source_id":source,"request_id":job["request_id"],"ok":true}));
+        let response = response.await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let value = json_body(response).await;
+        assert_eq!(value["message"]["quote"]["id"], original.id);
+        assert_eq!(value["original"]["id"], original.id);
+        app.status.write().await["ready"] = json!(false);
+        let cached = router.oneshot(request("POST", "/api/messages/old-reply/quote-source?group=g", "fixture-independent-secret", "192.0.2.3:2345", Body::empty())).await.unwrap();
+        assert_eq!(cached.status(), StatusCode::OK);
+        assert!(commands.try_recv().is_err());
+        app.status.write().await["ready"] = json!(true);
+        reply.id = "revoked-reply".into();
+        reply.source_id = "wx:g:message__message_0.db:8:80".into();
+        reply.quote.as_mut().unwrap().id = "unavailable-43".into();
+        app.store.insert_message(&mut reply).unwrap();
+        let denied = tokio::spawn({
+            let router = client_router(app.clone());
+            async move { router.oneshot(request("POST", "/api/messages/revoked-reply/quote-source?group=g", "fixture-independent-secret", "192.0.2.3:2345", Body::empty())).await.unwrap() }
+        });
+        let job = tokio::time::timeout(Duration::from_secs(1), commands.recv()).await.unwrap().unwrap();
+        app.clients.write().await.get_mut("fixture-key").unwrap().access.enabled = false;
+        app.publish(json!({"type":"quote_refresh_done","group":"g","source_id":job["source_id"],"request_id":job["request_id"],"ok":true}));
+        assert_eq!(tokio::time::timeout(Duration::from_secs(1), denied).await.unwrap().unwrap().status(), StatusCode::FORBIDDEN);
+    }
 
     #[tokio::test]
     async fn unsupported_background_recall_is_rejected_before_state_change_or_enqueue() {

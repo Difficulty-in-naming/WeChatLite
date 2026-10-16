@@ -7,6 +7,7 @@
 #include <QSet>
 #include <QTimer>
 #include <memory>
+#include <atomic>
 
 namespace MediaStorage { class LocalFiles; }
 
@@ -52,6 +53,7 @@ class HistoryBrowser : public QDialog
     void updateThemeStyle();
     void updateCachePins();
     std::shared_ptr<MediaStorage::LocalFiles> localFiles;
+    std::shared_ptr<std::atomic<quint64>> cacheRecoveryGeneration = std::make_shared<std::atomic<quint64>>(0);
     QPointer<Transport> transport;
     QString groupId, downloadRoot, nextBefore, type = "all";
     QAbstractListModel *records;

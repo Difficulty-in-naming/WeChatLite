@@ -130,6 +130,9 @@ pub trait Backend {
     fn signatures(&mut self) -> Result<Value>;
     fn authorize(&mut self, groups: &BTreeSet<String>) -> Result<()>;
     fn convert(&mut self, group: &str, row: &Value) -> Result<Option<Value>>;
+    fn is_quote(&mut self, _group: &str, row: &Value) -> bool {
+        crate::quotes::reference(text(row, "content")).is_some()
+    }
     fn prepare_media(&mut self, data: &Path, id: &str, index: usize, media: &Value)
     -> Result<Step>;
     fn prepare_quote(
@@ -443,7 +446,8 @@ fn history_page<A: Backend>(
         {
             continue;
         }
-        let plain = text(row, "type") == "文本";
+        // Received quote metadata can be repaired after an adapter upgrade even when its reply was delivered.
+        let plain = text(row, "type") == "文本" || access.is_quote(group, row);
         if !plain {
             if media_budget == 0 || store.contains("delivered", "source", &key)? {
                 continue;
@@ -471,6 +475,32 @@ fn history_page<A: Backend>(
         )?;
     }
     events.push(json!({"type":"history_done","group":group,"request_id":request,"before_source":before_source,"has_more":has_more,"sources":sources}));
+    Ok(())
+}
+
+fn quote_refresh<A: Backend>(
+    access: &mut A,
+    command: &Value,
+    events: &mut Vec<Value>,
+) -> Result<()> {
+    let group = text(command, "group");
+    let request = text(command, "request_id");
+    uuid::Uuid::parse_str(request).context("引用来源请求编号无效")?;
+    let key = text(command, "source_id");
+    let locator = history_position(group, key)?.context("缺少原引用回复定位")?;
+    let row = access.reload(group, &locator)?;
+    ensure!(source(group, &row)? == key, "原引用回复定位已变化");
+    ensure!(access.is_quote(group, &row), "原回复不是微信引用消息");
+    let message = access.convert(group, &row)?.context("原引用回复无法读取")?;
+    ensure!(message["quote"].is_object(), "原回复缺少有效微信引用");
+    let resolved = !text(&message, "_quote_source").is_empty();
+    // A targeted metadata read does not authorize native actions, journal history, or move watch cursors.
+    events.push(json!({"type":"message","historical":true,"message":message}));
+    let mut done = json!({"type":"quote_refresh_done","request_id":request,"group":group,"source_id":key,"ok":resolved});
+    if !resolved {
+        done["error"] = json!("未找到可验证的引用原消息");
+    }
+    events.push(done);
     Ok(())
 }
 
@@ -1010,6 +1040,13 @@ impl<A: Backend> Engine<A> {
                         self.jobs.first(),
                     )
                 })(),
+                "quote_refresh" => (|| {
+                    ensure!(
+                        self.watched.contains(text(command, "group")),
+                        "该群未获准读取引用"
+                    );
+                    quote_refresh(&mut self.access, command, events)
+                })(),
                 "announcement" => (|| {
                     let group = text(command, "group");
                     let request = text(command, "request_id");
@@ -1083,6 +1120,14 @@ impl<A: Backend> Engine<A> {
                     events.push(json!({"type":"ack","id":id,"status":if self.store.submitted(id)? {"uncertain"} else {"failed"},"error":error.to_string()}));
                 } else if operation == "history" {
                     events.push(json!({"type":"history_done","group":command["group"],"request_id":command["request_id"],"error":error.to_string()}));
+                } else if operation == "quote_refresh" {
+                    // Keep DB parse errors and original content out of the public completion event.
+                    let request = text(command, "request_id");
+                    let request = uuid::Uuid::parse_str(request)
+                        .ok()
+                        .map(|id| id.to_string())
+                        .unwrap_or_default();
+                    events.push(json!({"type":"quote_refresh_done","group":command["group"],"source_id":command["source_id"],"request_id":request,"ok":false,"error":"引用原消息暂时无法读取"}));
                 } else if operation == "announcement" {
                     let request = text(command, "request_id");
                     let request = if request.len() <= 128 && !request.chars().any(char::is_control)

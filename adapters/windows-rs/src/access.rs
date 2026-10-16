@@ -86,7 +86,6 @@ impl Local {
     }
     fn referenced_original(&mut self, group: &str, reference: &Value) -> Result<Option<Value>> {
         use md5::{Digest, Md5};
-        use rusqlite::OptionalExtension;
         if reference["type"] != 1 && reference["type"] != 3 {
             return Ok(None);
         }
@@ -94,6 +93,7 @@ impl Local {
             .parse::<u64>()
             .context("引用来源编号无效")?;
         let table = format!("Msg_{:x}", Md5::digest(group.as_bytes()));
+        let mut original = None;
         for rel in self.db.rels().into_iter().filter(|rel| {
             rel.strip_prefix("message/message_")
                 .and_then(|v| v.strip_suffix(".db"))
@@ -108,13 +108,17 @@ impl Local {
                 continue;
             }
             let found = connection
-                .query_row(
-                    &format!("SELECT local_id,sort_seq FROM {table} WHERE server_id=?1 LIMIT 1"),
-                    [server as i64],
-                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
-                )
-                .optional()?;
-            if let Some((id, sequence)) = found {
+                .prepare(&format!(
+                    "SELECT local_id,sort_seq FROM {table} WHERE server_id=?1 LIMIT 2"
+                ))?
+                .query_map([server as i64], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            if found.len() > 1 || (!found.is_empty() && original.is_some()) {
+                return Ok(None); // A duplicate server ID must never select whichever shard was visited first.
+            }
+            if let Some((id, sequence)) = found.first().copied() {
                 let locator =
                     json!({"local_id":id,"sort_seq":sequence,"shard":rel.replace('/',"__")});
                 let row = self.db.reload(group, &locator)?;
@@ -122,10 +126,10 @@ impl Local {
                 if !crate::quotes::matches_reference(group, &row, &raw, &self.db.wxid, reference) {
                     return Ok(None);
                 }
-                return Ok(Some(row));
+                original = Some(row);
             }
         }
-        Ok(None)
+        Ok(original)
     }
 }
 impl Drop for Local {
@@ -212,6 +216,10 @@ impl Backend for Local {
         }
         self.allowed = groups.clone();
         Ok(())
+    }
+    fn is_quote(&mut self, group: &str, row: &Value) -> bool {
+        self.identity(group, row)
+            .is_ok_and(|(content, _)| crate::quotes::reference(&content).is_some())
     }
     fn convert(&mut self, group: &str, row: &Value) -> Result<Option<Value>> {
         if system_message(row) {
@@ -307,7 +315,10 @@ impl Backend for Local {
         if let Some(reference) = crate::quotes::reference(&content) {
             message["text"] = json!(xml_text(&content, "title"));
             let source_row = self.referenced_original(group, &reference)?;
-            let source_id = source_row.as_ref().map(|row| source(group, row)).transpose()?;
+            let source_id = source_row
+                .as_ref()
+                .map(|row| source(group, row))
+                .transpose()?;
             // A referenced image can still be downloading; its reply and stable source ID are ready.
             let original = if let Some(row) = &source_row {
                 match self.convert(group, row) {
@@ -328,8 +339,14 @@ impl Backend for Local {
                 .as_ref()
                 .map(|source| Uuid::new_v5(&Uuid::NAMESPACE_URL, source.as_bytes()).to_string())
                 .unwrap_or_else(|| format!("unavailable-{}", text(&reference, "server_id")));
-            let preview = if reference["type"] == 3 { "[图片]" } else { text(&reference, "text") };
+            let preview = if reference["type"] == 3 {
+                "[图片]"
+            } else {
+                text(&reference, "text")
+            };
             message["quote"] = json!({"id":id,"sender":if caption.is_empty(){"群成员"}else{&caption},"text":preview,"unavailable":false});
+            // Internal proof for repairing legacy unresolved IDs; it is not part of the public Quote model.
+            message["_quote_server_id"] = reference["server_id"].clone();
             if let Some(source_id) = source_id {
                 message["_quote_source"] = json!(source_id);
             }

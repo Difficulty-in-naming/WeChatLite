@@ -213,10 +213,15 @@ async fn import_message(app: &App, message: ChatMessage) -> Result<bool> {
     import_message_kind(app, message, false).await
 }
 
-async fn import_message_kind(
+async fn import_message_kind(app: &App, message: ChatMessage, historical: bool) -> Result<bool> {
+    import_message_with_quote_source(app, message, historical, None).await
+}
+
+async fn import_message_with_quote_source(
     app: &App,
     mut message: ChatMessage,
     historical: bool,
+    source_server_id: Option<String>,
 ) -> Result<bool> {
     if !app.allows(&message.group).await {
         return Ok(false);
@@ -231,7 +236,6 @@ async fn import_message_kind(
         if existing.status != "recalled"
             && existing.recall_status.is_empty()
             && existing.client_id.is_empty()
-            && existing.quote.is_none()
             && message.quote.is_some()
         {
             let selected = app.forwarding.read().await;
@@ -241,7 +245,15 @@ async fn import_message_kind(
             let text = message.text.clone();
             let quote = message.quote.clone().unwrap();
             if let Some(event) = app
-                .db(move |s| s.enrich_native_quote(&existing.id, &text, &quote, historical))
+                .db(move |s| {
+                    s.enrich_native_quote(
+                        &existing.id,
+                        &text,
+                        &quote,
+                        historical,
+                        source_server_id.as_deref(),
+                    )
+                })
                 .await?
             {
                 app.publish(event);
@@ -438,6 +450,12 @@ async fn run_stream<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                             app.history.finish(app,value).await?;
                         },
                         "announcement"=>{app.announcements.finish(value).await;},
+                        "quote_refresh_done"=>{
+                            let group=value["group"].as_str().unwrap_or("");
+                            if app.allows(group).await {
+                                app.publish(json!({"type":"quote_refresh_done","request_id":value["request_id"],"group":group,"source_id":value["source_id"],"ok":value["ok"]==true,"error":if value["ok"]==true{""}else{"引用原消息暂时无法读取"}}));
+                            }
+                        },
                         "message"=>{
                             let historical=value["historical"]==true;
                             let mut body=value["message"].clone();
@@ -456,9 +474,10 @@ async fn run_stream<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                                     if original.status=="recalled" {body["quote"]["unavailable"]=json!(true);body["quote"]["text"]=json!("");}
                                 }
                             }
+                            let source_server_id=body["_quote_server_id"].as_str().map(str::to_owned);
                             let message:ChatMessage=serde_json::from_value(body)?;
                             let group=message.group.clone();let source=message.source_id.clone();
-                            match import_message_kind(app,message,historical).await {
+                            match import_message_with_quote_source(app,message,historical,source_server_id).await {
                                 Ok(true)=>{},
                                 Ok(false)=>continue,
                                 Err(error)=>{
@@ -505,6 +524,16 @@ async fn run_stream<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                         if !ready || !selected.contains(group) || !crate::access::can_read(&clients,command["_access_client"].as_str().unwrap_or(""),group) {
                             let mut error=command;error["error"]=json!("本机微信未连接或历史读取权限已取消，请重试");
                             app.history.finish(app,error).await?;
+                        } else {
+                            let mut command=command;if let Some(object)=command.as_object_mut(){object.remove("_access_client");}
+                            write_command(app,input,command).await?;
+                        }
+                    } else if command["op"]=="quote_refresh" {
+                        let selected=app.forwarding.read().await;
+                        let clients=app.clients.read().await;
+                        let group=command["group"].as_str().unwrap_or("");
+                        if !ready || !selected.contains(group) || !crate::access::can_read(&clients,command["_access_client"].as_str().unwrap_or(""),group) {
+                            app.publish(json!({"type":"quote_refresh_done","request_id":command["request_id"],"group":group,"source_id":command["source_id"],"ok":false,"error":"本机微信未连接或历史读取权限已取消"}));
                         } else {
                             let mut command=command;if let Some(object)=command.as_object_mut(){object.remove("_access_client");}
                             write_command(app,input,command).await?;
@@ -689,6 +718,126 @@ mod tests {
             .unwrap()
             .unwrap();
         serde_json::from_str(&line).unwrap()
+    }
+
+    #[tokio::test]
+    async fn historical_adapter_message_repairs_a_legacy_unresolved_quote_with_exact_server_proof()
+    {
+        let temp = tempfile::tempdir().unwrap();
+        let (app, receiver) = crate::test_app(temp.path());
+        let mut original = message("real-image");
+        original.status = "received".into();
+        original.source_id = "wx:g:message__message_0.db:3:30".into();
+        app.store.insert_message(&mut original).unwrap();
+        let mut legacy = message("legacy-image-reply");
+        legacy.status = "received".into();
+        legacy.source_id = "wx:g:message__message_0.db:4:40".into();
+        legacy.quote = Some(
+            serde_json::from_value(json!({"id":"unavailable-42","sender":"成员","text":"[图片]"}))
+                .unwrap(),
+        );
+        app.store.insert_message(&mut legacy).unwrap();
+        let head = app.store.event_head().unwrap();
+        let (task, mut output, mut input) = fixture(app.clone(), receiver).await;
+        let mut broadcasts = app.events.subscribe();
+        emit(&mut output, json!({"type":"status","ready":true})).await;
+        recall_barrier(&mut output, &mut broadcasts).await;
+        let request = uuid::Uuid::new_v4().to_string();
+        let command = json!({"op":"quote_refresh","group":"g","source_id":legacy.source_id,"request_id":request});
+        let mut authorized_command = command.clone();
+        authorized_command["_access_client"] = json!("");
+        app.commands.send(authorized_command).await.unwrap();
+        assert_eq!(next(&mut input).await, command);
+        let mut fresh = json!(&legacy);
+        fresh["id"] = json!("fresh-reply-id");
+        fresh["quote"]["id"] = json!("stable-native-image-id");
+        fresh["_quote_source"] = json!(&original.source_id);
+        fresh["_quote_server_id"] = json!("42");
+        emit(
+            &mut output,
+            json!({"type":"message","historical":true,"message":fresh}),
+        )
+        .await;
+        assert_eq!(
+            next(&mut input).await,
+            json!({"op":"receipt","group":"g","source_id":legacy.source_id})
+        );
+        emit(&mut output, json!({"type":"quote_refresh_done","group":"g","source_id":legacy.source_id,"request_id":request,"ok":true})).await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let event = broadcasts.recv().await.unwrap();
+                if event["type"] == "quote_refresh_done" && event["request_id"] == request {
+                    assert_eq!(event["ok"], true);
+                    // Completion may only be observed after the corrected link is committed.
+                    assert_eq!(
+                        app.store
+                            .message(&legacy.id)
+                            .unwrap()
+                            .unwrap()
+                            .quote
+                            .unwrap()
+                            .id,
+                        original.id
+                    );
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let repaired = app.store.message(&legacy.id).unwrap().unwrap();
+        assert_eq!(repaired.quote.as_ref().unwrap().id, original.id);
+        assert_eq!(repaired.id, legacy.id);
+        assert_eq!(repaired.seq, legacy.seq);
+        let events = app.store.events(head).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["historical"], true);
+        assert_eq!(events[0]["message"]["id"], legacy.id);
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn quote_refresh_rechecks_readiness_selection_and_read_access_before_forwarding() {
+        let temp = tempfile::tempdir().unwrap();
+        let (app, receiver) = crate::test_app(temp.path());
+        let (task, mut output, mut input) = fixture(app.clone(), receiver).await;
+        let mut events = app.events.subscribe();
+        for (ready, selected, client) in [
+            (false, true, ""),
+            (true, true, "missing-client"),
+            (true, false, ""),
+        ] {
+            emit(&mut output, json!({"type":"status","ready":ready})).await;
+            recall_barrier(&mut output, &mut events).await;
+            if !selected {
+                app.set_forwarding(Default::default()).await.unwrap();
+                assert_eq!(
+                    next(&mut input).await,
+                    json!({"op":"configure","groups":[]})
+                );
+            }
+            let request = uuid::Uuid::new_v4().to_string();
+            app.commands.send(json!({"op":"quote_refresh","request_id":request,"group":"g","source_id":"wx:g:message__message_0.db:4:40","_access_client":client})).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let event = events.recv().await.unwrap();
+                    if event["type"] == "quote_refresh_done" && event["request_id"] == request {
+                        assert_eq!(event["ok"], false);
+                        break;
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(40), input.next())
+                    .await
+                    .is_err()
+            );
+        }
+        app.shutdown.send_replace(true);
+        task.await.unwrap().unwrap();
     }
 
     async fn recall_barrier(

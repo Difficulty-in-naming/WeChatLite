@@ -1708,6 +1708,7 @@ QMenu *MessageView::quoteContextMenuFor(const QModelIndex &index)
     if (quote["id"].toString().isEmpty() || message["status"] == "recalled")
         return nullptr;
     quote["group"] = message["group"];
+    quote["_reply_id"] = message["id"];
     auto *menu = new ChatContextMenu(this);
     auto *locate = menu->addAction("定位到原文位置", this, [this, quote] { emit locateRequested(quote); });
     locate->setObjectName("locateQuote");

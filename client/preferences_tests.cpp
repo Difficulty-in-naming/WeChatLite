@@ -4,11 +4,13 @@
 #include <QApplication>
 #include <QCheckBox>
 #include <QComboBox>
+#include <QCryptographicHash>
 #include <QDate>
 #include <QDateTime>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QJsonDocument>
 #include <QLabel>
 #include <QLineEdit>
 #include <QListWidget>
@@ -23,6 +25,7 @@
 #include <QtTest>
 #include <filesystem>
 #include <memory>
+#include <thread>
 
 namespace
 {
@@ -60,6 +63,11 @@ QByteArray read(const QString &path)
     QFile file(path);
     return file.open(QIODevice::ReadOnly) ? file.readAll() : QByteArray();
 }
+QJsonObject media(const QString &id, const QString &kind, const QString &name, const QByteArray &contents)
+{
+    return {{"id", id}, {"kind", kind}, {"name", name}, {"size", contents.size()},
+        {"sha256", QString::fromLatin1(QCryptographicHash::hash(contents, QCryptographicHash::Sha256).toHex())}};
+}
 }
 
 class PreferencesTests final : public QObject
@@ -74,6 +82,11 @@ class PreferencesTests final : public QObject
         PreferencesDialog::Values value;
         value.downloads = currentFiles->filePath("downloads");
         return value;
+    }
+
+    QString indexDirectory() const
+    {
+        return QDir(QFileInfo(currentFiles->path()).canonicalFilePath()).filePath("index");
     }
 
   private slots:
@@ -437,6 +450,215 @@ class PreferencesTests final : public QObject
         QVERIFY(files->findPoster("other-group", descriptor).isEmpty());
         files->discard({cover});
         QVERIFY(files->findPoster("g", descriptor).isEmpty());
+    }
+
+    void scopedLocalFilesSurviveRestartWithoutTrustingPayloadPaths()
+    {
+        const auto index = indexDirectory();
+        const auto contents = QByteArray("GIF89a-persistent-media-fixture");
+        const auto original = cacheFiles->filePath("retained.gif");
+        const QJsonObject descriptor{{"id", "retained"}, {"kind", "gif"}, {"name", "retained.gif"},
+            {"size", contents.size()},
+            {"sha256", QString::fromLatin1(QCryptographicHash::hash(contents, QCryptographicHash::Sha256).toHex())}};
+        QVERIFY(store(original, contents));
+        {
+            MediaStorage::LocalFiles first("server-account-A", index);
+            first.remember("g", descriptor, original);
+            QCOMPARE(first.find("g", descriptor), QFileInfo(original).absoluteFilePath());
+        }
+        MediaStorage::LocalFiles restarted("server-account-A", index);
+        QCOMPARE(restarted.find("g", descriptor), QFileInfo(original).absoluteFilePath());
+        auto payload = descriptor;
+        payload["_local"] = currentFiles->filePath("untrusted-private.gif");
+        payload["_poster"] = payload["_local"];
+        const QJsonObject message{{"group", "g"}, {"media", QJsonArray{payload}}};
+        const auto hydrated = restarted.hydrate(message)["media"].toArray()[0].toObject();
+        QCOMPARE(hydrated["_local"].toString(), QFileInfo(original).absoluteFilePath());
+        QVERIFY(hydrated["_poster"].toString().isEmpty());
+        MediaStorage::LocalFiles anotherAccount("server-account-B", index);
+        QVERIFY(anotherAccount.find("g", descriptor).isEmpty());
+        QVERIFY(restarted.find("other-group", descriptor).isEmpty());
+        for (const auto &field : {"id", "sha256", "size", "kind"})
+        {
+            auto changed = descriptor;
+            changed[field] = QString::fromLatin1(field) == "size" ? QJsonValue(contents.size() + 1) :
+                QJsonValue(QString::fromLatin1(field) == "kind" ? "image" : QString(64, 'b'));
+            QVERIFY(restarted.find("g", changed).isEmpty());
+        }
+    }
+
+    void originalAndPosterIndicesSurviveIndependentlyAndInvalidateChangedFiles()
+    {
+        const auto index = indexDirectory();
+        const auto bytes = QByteArray(2048, 'v');
+        const auto descriptor = media("clip", "video", "clip.mp4", bytes);
+        const auto original = cacheFiles->filePath("clip.mp4");
+        const auto poster = cacheFiles->filePath("poster.jpg");
+        const auto modified = QDateTime::fromMSecsSinceEpoch(1700000000000LL);
+        QVERIFY(store(original, bytes, modified));
+        QVERIFY(store(poster, QByteArray(100, 'p'), modified));
+        {
+            MediaStorage::LocalFiles first("scope", index);
+            first.remember("g", descriptor, original);
+            first.rememberPoster("g", descriptor, poster);
+            // Original/poster keys use separate domains even if an allowed
+            // synthetic group ID starts with the old "poster:" prefix.
+            first.remember("poster:g", descriptor, original);
+            QCOMPARE(first.findPoster("g", descriptor), QFileInfo(poster).absoluteFilePath());
+            QCOMPARE(first.pathForId("poster:g", "clip"), QFileInfo(original).absoluteFilePath());
+        }
+        {
+            MediaStorage::LocalFiles restarted("scope", index);
+            QCOMPARE(restarted.find("g", descriptor), QFileInfo(original).absoluteFilePath());
+            QCOMPARE(restarted.findPoster("g", descriptor), QFileInfo(poster).absoluteFilePath());
+            QVERIFY(store(original, bytes, modified.addSecs(1))); // Even unchanged bytes with a new mtime expire.
+            QVERIFY(restarted.find("g", descriptor).isEmpty());
+            QCOMPARE(restarted.findPoster("g", descriptor), QFileInfo(poster).absoluteFilePath());
+            QVERIFY(store(poster, QByteArray(101, 'p'), modified)); // Size changes also expire the cover alone.
+            QVERIFY(restarted.findPoster("g", descriptor).isEmpty());
+        }
+        {
+            MediaStorage::LocalFiles restarted("scope", index);
+            QVERIFY(restarted.find("g", descriptor).isEmpty());
+            QVERIFY(restarted.findPoster("g", descriptor).isEmpty());
+            restarted.remember("g", descriptor, original);
+            QVERIFY(QFile::remove(original));
+            QVERIFY(restarted.find("g", descriptor).isEmpty());
+        }
+    }
+
+    void legacyMediaRecoveryHashesDatedAndNumberedCandidatesOncePerBatch()
+    {
+        const auto index = indexDirectory();
+        const auto downloads = defaults().downloads;
+        const auto picture = QByteArray("GIF89a-legacy-picture");
+        const auto video = QByteArray(128 * 1024, 'v');
+        const auto gif = media("old-picture", "gif", "picture.gif", picture);
+        const auto clip = media("old-video", "video", "clip.mp4", video);
+        const auto wrong = QDir(downloads).filePath("2024-01-01/picture.gif");
+        const auto good = QDir(downloads).filePath("2024-01-02/picture (2).gif");
+        const auto movie = QDir(downloads).filePath("clip.mp4");
+        QVERIFY(store(wrong, QByteArray(picture.size(), 'x'))); // Name/length are insufficient.
+        QVERIFY(store(good, picture));
+        QVERIFY(store(movie, video));
+        MediaStorage::LocalFiles files("scope", index);
+        const QJsonArray messages{
+            QJsonObject{{"group", "g"}, {"media", QJsonArray{gif, clip}}},
+            QJsonObject{{"group", "g"}, {"media", QJsonArray{gif}}}};
+        QVERIFY(files.find("g", gif).isEmpty());
+        std::thread worker([&] { files.recover(messages, downloads); });
+        worker.join();
+        QCOMPARE(files.find("g", gif), QFileInfo(good).canonicalFilePath());
+        QCOMPARE(files.find("g", clip), QFileInfo(movie).canonicalFilePath());
+        QVERIFY(files.findPoster("g", clip).isEmpty()); // Random legacy JPEGs cannot be assigned safely.
+        MediaStorage::LocalFiles restarted("scope", index);
+        QCOMPARE(restarted.find("g", gif), QFileInfo(good).canonicalFilePath());
+        QCOMPARE(restarted.find("g", clip), QFileInfo(movie).canonicalFilePath());
+        QCOMPARE(QDir(QFileInfo(good).absolutePath()).entryList(QDir::Files).size(), 1);
+    }
+
+    void legacyMediaRecoverySkipsPayloadPathsNestedFoldersAndCancelledHashes()
+    {
+        const auto downloads = defaults().downloads;
+        const auto bytes = QByteArray(8 * 1024 * 1024, 'b');
+        auto descriptor = media("large", "video", "large.mp4", bytes);
+        const auto privateFile = currentFiles->filePath("private/large.mp4");
+        const auto nested = QDir(downloads).filePath("2024-01-01/private/large.mp4");
+        const auto invalidDate = QDir(downloads).filePath("2024-02-30/large.mp4");
+        QVERIFY(store(privateFile, bytes));
+        QVERIFY(store(nested, bytes));
+        QVERIFY(store(invalidDate, bytes));
+        descriptor["_local"] = privateFile;
+        descriptor["_poster"] = privateFile;
+        MediaStorage::LocalFiles files;
+        std::thread miss([&] { files.recover("g", descriptor, downloads); });
+        miss.join();
+        QVERIFY(files.find("g", descriptor).isEmpty());
+        const auto candidate = QDir(downloads).filePath("2024-01-01/large.mp4");
+        QVERIFY(store(candidate, bytes));
+        int polls = 0;
+        std::thread cancelled([&] { files.recover("g", descriptor, downloads, [&] { return ++polls >= 32; }); });
+        cancelled.join();
+        QVERIFY(polls >= 32); // A large candidate is cancellable during its 64 KiB hash loop.
+        QVERIFY(files.find("g", descriptor).isEmpty());
+        QString recovered;
+        std::thread retry([&] { recovered = files.recover("g", descriptor, downloads); });
+        retry.join();
+        QCOMPARE(recovered, QFileInfo(candidate).canonicalFilePath());
+        const QJsonObject recalled{{"group", "other"}, {"status", "recalled"}, {"media", QJsonArray{descriptor}}};
+        files.recover(QJsonArray{recalled}, downloads);
+        QVERIFY(files.find("other", descriptor).isEmpty());
+    }
+
+    void persistentMediaIndexRejectsLinksCorruptionAndOversizedData()
+    {
+        // Canonical temporary roots avoid treating macOS's system /var alias as
+        // a nested attacker-controlled link in this isolated fixture.
+        const auto root = QFileInfo(currentFiles->path()).canonicalFilePath();
+        const auto index = QDir(root).filePath("index");
+        const auto folder = QDir(root).filePath("actual");
+        const auto path = QDir(folder).filePath("file.bin");
+        const auto contents = QByteArray("retained");
+        const auto descriptor = media("id", "file", "file.bin", contents);
+        QVERIFY(store(path, contents));
+        {
+            MediaStorage::LocalFiles files("scope", index);
+            files.remember("g", descriptor, path);
+        }
+        const auto names = QDir(index).entryList({"*.json"}, QDir::Files);
+        QCOMPARE(names.size(), 1);
+        const auto indexFile = QDir(index).filePath(names.first());
+        const auto validIndex = read(indexFile);
+        QVERIFY(validIndex.size() < 4 * 1024 * 1024);
+        QVERIFY(store(indexFile, QByteArray("{broken")));
+        QVERIFY(MediaStorage::LocalFiles("scope", index).find("g", descriptor).isEmpty());
+        QVERIFY(store(indexFile, QByteArray(4 * 1024 * 1024 + 1, 'x')));
+        QVERIFY(MediaStorage::LocalFiles("scope", index).find("g", descriptor).isEmpty());
+        auto changed = QJsonDocument::fromJson(validIndex).object();
+        changed["scope"] = QString(64, '0');
+        QVERIFY(store(indexFile, QJsonDocument(changed).toJson(QJsonDocument::Compact)));
+        QVERIFY(MediaStorage::LocalFiles("scope", index).find("g", descriptor).isEmpty());
+        QVERIFY(store(indexFile, validIndex));
+        const auto moved = QDir(root).filePath("moved");
+        QVERIFY(QDir().rename(folder, moved));
+        const auto unlink = qScopeGuard([&]
+        {
+            std::error_code error;
+            std::filesystem::remove(nativePath(folder), error);
+        });
+        if (!directoryLink(moved, folder)) QSKIP("This account cannot create a directory symlink.");
+        QVERIFY(MediaStorage::LocalFiles("scope", index).find("g", descriptor).isEmpty());
+        MediaStorage::LocalFiles files;
+        files.remember("g", descriptor, path);
+        QVERIFY(files.find("g", descriptor).isEmpty());
+        files.recover("g", descriptor, root);
+        QVERIFY(files.find("g", descriptor).isEmpty());
+    }
+
+    void sameScopeInstancesMergeDownloadsAndPersistExplicitDiscard()
+    {
+        const auto index = indexDirectory();
+        const auto firstBytes = QByteArray("first"), secondBytes = QByteArray("second");
+        const auto first = media("first", "file", "first.txt", firstBytes);
+        const auto second = media("second", "file", "second.txt", secondBytes);
+        const auto root = QFileInfo(currentFiles->path()).canonicalFilePath();
+        const auto firstPath = QDir(root).filePath("first.txt"), secondPath = QDir(root).filePath("second.txt");
+        QVERIFY(store(firstPath, firstBytes));
+        QVERIFY(store(secondPath, secondBytes));
+        MediaStorage::LocalFiles window("scope", index), history("scope", index);
+        window.remember("g", first, firstPath);
+        history.remember("g", second, secondPath);
+        {
+            MediaStorage::LocalFiles restarted("scope", index);
+            QCOMPARE(restarted.find("g", first), QFileInfo(firstPath).absoluteFilePath());
+            QCOMPARE(restarted.find("g", second), QFileInfo(secondPath).absoluteFilePath());
+        }
+        // The older window has not seen second, but its explicit discard must
+        // also exclude the newer on-disk entry when it merges the snapshot.
+        window.discard({secondPath});
+        MediaStorage::LocalFiles restarted("scope", index);
+        QCOMPARE(restarted.find("g", first), QFileInfo(firstPath).absoluteFilePath());
+        QVERIFY(restarted.find("g", second).isEmpty());
     }
 
     void cleanup()

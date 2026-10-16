@@ -876,6 +876,73 @@ class DesktopTests : public QObject
         QTest::qWait(40);
         QVERIFY(api.clientCredentialOnly);
     }
+    void legacyImageQuoteRepairsItsSourceBeforeLocatingTheLoadedOriginal()
+    {
+        QSettings settings;
+        const QStringList keys{"serverUrl", "token", "certificatePin", "p2p", "connectionMode"};
+        QVariantMap previous;
+        for (const auto &key : keys) { previous[key] = settings.value(key); settings.remove(key); }
+        const auto restore = qScopeGuard([&]
+        {
+            for (const auto &key : keys)
+                if (previous[key].isValid()) settings.setValue(key, previous[key]); else settings.remove(key);
+        });
+        RecordsApiFixture api;
+        QVERIFY(api.server.listen(QHostAddress::LocalHost, 0));
+        const QJsonObject original{{"id", "real-image"}, {"group", "A"}, {"seq", 1}, {"timestamp", 1000},
+            {"sender", "成员"}, {"status", "received"}, {"text", "[图片]"}};
+        QJsonObject reply{{"id", "old-image-reply"}, {"group", "A"}, {"seq", 80}, {"timestamp", 2000},
+            {"sender", "成员"}, {"status", "received"}, {"text", "这个"},
+            {"quote", QJsonObject{{"id", "unavailable-42"}, {"sender", "成员"}, {"text", "[图片]"}}}};
+        QJsonArray rows{original};
+        for (int i = 2; i < 80; ++i)
+            rows.append(QJsonObject{{"id", "filler-" + QString::number(i)}, {"group", "A"},
+                {"seq", i}, {"timestamp", 1000}, {"text", "历史消息"}, {"status", "received"}});
+        rows.append(reply);
+        api.handler = [&](QTcpSocket *socket, const QUrl &url)
+        {
+            const auto path = url.path();
+            QJsonValue value(QJsonObject{});
+            if (path == "/api/events") return;
+            if (path == "/api/status") value = QJsonObject{{"ready", true},
+                {"permissions", QJsonObject{{"can_send", true}, {"can_download", true}}}};
+            else if (path == "/api/groups") value = QJsonArray{QJsonObject{{"id", "A"}, {"name", "合成群"}}};
+            else if (path.endsWith("/members")) value = QJsonArray{};
+            else if (path == "/api/history") value = QJsonObject{{"messages", rows}, {"has_more", false}};
+            else if (path == "/api/messages/old-image-reply/quote-source")
+            {
+                QCOMPARE(api.methods.last(), "POST");
+                QCOMPARE(QUrlQuery(url).queryItemValue("group"), "A");
+                reply["quote"] = QJsonObject{{"id", "real-image"}, {"sender", "成员"}, {"text", "[图片]"}};
+                value = QJsonObject{{"message", reply}, {"original", original}};
+            }
+            RecordsApiFixture::respond(socket, value);
+        };
+        Window isolated(false);
+        isolated.show();
+        auto *transport = isolated.findChild<Transport *>();
+        transport->configure(api.url(), "offline-records-client");
+        transport->connectionChanged(true);
+        auto *groups = isolated.findChild<QListWidget *>("groups");
+        auto *view = isolated.findChild<MessageView *>();
+        auto *model = isolated.findChild<MessageModel *>();
+        QTRY_COMPARE(groups->count(), 1);
+        groups->setCurrentRow(0);
+        QTest::mouseClick(groups->viewport(), Qt::LeftButton, {}, groups->visualItemRect(groups->item(0)).center());
+        QTRY_COMPARE(model->rowCount(), 80);
+        view->scrollToBottom();
+        auto *menu = view->quoteContextMenuFor(model->index(79));
+        QVERIFY(menu && menu->actions().size() == 1);
+        menu->actions().first()->trigger();
+        menu->actions().first()->trigger();
+        delete menu;
+        QTRY_COMPARE(view->itemDelegate()->property("locatedId").toString(), "real-image");
+        QCOMPARE(api.count("/api/messages/old-image-reply/quote-source"), 1);
+        QCOMPARE(api.count("/api/messages/unavailable-42"), 0);
+        QCOMPARE(model->rows.last()["quote"].toObject()["id"].toString(), "real-image");
+        QVERIFY(view->viewport()->rect().contains(view->visualRect(model->index(0)).center()));
+        QVERIFY(api.clientCredentialOnly);
+    }
     void headerEntriesLocateOriginalsAndInvalidateScopedWindows()
     {
         QSettings settings;
@@ -2145,6 +2212,85 @@ class DesktopTests : public QObject
         QCOMPARE(sent.size(), sentBeforeEdit);
         QCOMPARE(recalls, 1);
         transport->disconnectService();
+    }
+    void restartingClientRestoresLegacyAndIndexedImagesBeforeTheirFirstPaint()
+    {
+        RecordsApiFixture api;
+        QVERIFY(api.server.listen(QHostAddress::LocalHost, 0));
+        QSettings settings;
+        const QStringList keys{"serverUrl", "token", "certificatePin", "p2p", "connectionMode", "downloads"};
+        QVariantMap previous;
+        for (const auto &key : keys) { previous[key] = settings.value(key); settings.remove(key); }
+        const auto restore = qScopeGuard([&]
+        {
+            for (const auto &key : keys)
+                if (previous[key].isValid()) settings.setValue(key, previous[key]); else settings.remove(key);
+        });
+        settings.setValue("serverUrl", api.url());
+        settings.setValue("token", "offline-restart-client-at-least-24");
+        settings.setValue("downloads", files.filePath("restart-downloads"));
+        QImage image(16, 12, QImage::Format_RGB32);
+        image.fill(Qt::cyan);
+        QByteArray bytes;
+        QBuffer buffer(&bytes);
+        QVERIFY(buffer.open(QIODevice::WriteOnly));
+        QVERIFY(image.save(&buffer, "PNG"));
+        const auto name = "restart-" + QUuid::createUuid().toString(QUuid::WithoutBraces) + ".png";
+        const auto directory = QDir(MediaStorage::cacheDirectory()).filePath("2026-10-16");
+        QVERIFY(QDir().mkpath(directory));
+        const auto path = QDir(directory).filePath(name);
+        QFile legacy(path);
+        QVERIFY(legacy.open(QIODevice::WriteOnly | QIODevice::NewOnly));
+        QCOMPARE(legacy.write(bytes), bytes.size());
+        legacy.close();
+        const auto cleanup = qScopeGuard([&] { QFile::remove(path); QDir().rmdir(directory); });
+        const QJsonObject media{{"id", "restart-picture"}, {"name", name}, {"kind", "image"},
+            {"size", bytes.size()}, {"sha256", QString::fromLatin1(QCryptographicHash::hash(bytes, QCryptographicHash::Sha256).toHex())}};
+        const QJsonObject row{{"id", "restart-row"}, {"group", "restart-group"}, {"seq", 1},
+            {"timestamp", 1000}, {"status", "received"}, {"media", QJsonArray{media}}};
+        int mediaRequests = 0;
+        api.handler = [&](QTcpSocket *socket, const QUrl &url)
+        {
+            const auto route = url.path();
+            if (route == "/api/events") return;
+            if (route.startsWith("/api/media/"))
+            {
+                ++mediaRequests;
+                socket->write("HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: " + QByteArray::number(bytes.size()) + "\r\n\r\n" + bytes);
+                socket->disconnectFromHost();
+                return;
+            }
+            QJsonValue value(QJsonObject{});
+            if (route == "/api/status") value = QJsonObject{{"ready", true},
+                {"permissions", QJsonObject{{"can_send", true}, {"can_download", true}}}};
+            else if (route == "/api/groups") value = QJsonArray{QJsonObject{{"id", "restart-group"}, {"name", "合成图片群"}}};
+            else if (route.endsWith("/members")) value = QJsonArray{};
+            else if (route == "/api/history") value = QJsonObject{{"messages", QJsonArray{row}}, {"has_more", false}};
+            RecordsApiFixture::respond(socket, value);
+        };
+        for (int launch = 0; launch < 2; ++launch)
+        {
+            Window isolated(false);
+            auto *model = isolated.findChild<MessageModel *>();
+            auto *groups = isolated.findChild<QListWidget *>("groups");
+            bool paintedMissing = false;
+            connect(model, &QAbstractItemModel::modelReset, &isolated, [&]
+            {
+                for (const auto &entry : model->rows)
+                    if (entry["id"] == "restart-row")
+                        paintedMissing |= entry["media"].toArray().first().toObject()["_local"].toString().isEmpty();
+            });
+            isolated.show();
+            QTRY_COMPARE(groups->count(), 1);
+            isolated.findChild<Transport *>()->connectionChanged(true);
+            groups->setCurrentRow(0);
+            QTest::mouseClick(groups->viewport(), Qt::LeftButton, {}, groups->visualItemRect(groups->item(0)).center());
+            QTRY_COMPARE(model->rowCount(), 1);
+            QCOMPARE(model->rows.first()["media"].toArray().first().toObject()["_local"].toString(), path);
+            QVERIFY(!paintedMissing);
+            QTest::qWait(220);
+            QCOMPARE(mediaRequests, 0); // Neither legacy recovery nor reopening needs an HTTP download.
+        }
     }
     void verifiedMediaIndexRejectsStaleDescriptorsAndUntrustedPaths()
     {

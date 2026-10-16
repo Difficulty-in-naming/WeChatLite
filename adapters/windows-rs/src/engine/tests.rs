@@ -227,9 +227,22 @@ impl Backend for Fake {
             }
             ensure!(self.mode != "media_error", "fixture media is invalid");
         }
-        Ok(Some(
-            json!({"id":source(g,r)?,"source_id":source(g,r)?,"group":g,"text":r["content"]}),
-        ))
+        let mut message =
+            json!({"id":source(g,r)?,"source_id":source(g,r)?,"group":g,"text":r["content"]});
+        for field in [
+            "quote",
+            "_quote_source",
+            "_quote_server_id",
+            "_quote_original",
+        ] {
+            if let Some(value) = r.get(field) {
+                message[field] = value.clone();
+            }
+        }
+        Ok(Some(message))
+    }
+    fn is_quote(&mut self, _group: &str, row: &Value) -> bool {
+        row["fixture_quote"] == true || crate::quotes::reference(text(row, "content")).is_some()
     }
     fn prepare_media(&mut self, _: &Path, _: &str, index: usize, m: &Value) -> Result<Step> {
         ensure!(m["bad"] != true, "附件校验失败");
@@ -923,6 +936,126 @@ fn short_media_retries_preserve_live_and_history_conversion_budgets() {
         .unwrap();
     assert_eq!(done["sources"].as_array().unwrap().len(), 20);
     assert!(engine.access.calls.is_empty());
+}
+
+#[test]
+fn delivered_native_quotes_are_reparsed_on_history_reads_without_reimporting_other_media() {
+    let (_temp, mut engine) = setup(json!(["g"]));
+    engine.last_poll = 1000.0;
+    let mut quote = row(11, 11);
+    quote["type"] = json!("文件/链接/卡片");
+    quote["fixture_quote"] = json!(true);
+    quote["content"] = json!(
+        "<msg><appmsg><type>57</type><title>reply</title><refermsg><type>3</type><svrid>42</svrid><fromusr>wxid_fixture_self</fromusr><chatusr>wxid_fixture_self</chatusr><content>&lt;msg&gt;&lt;img md5='0123456789abcdef0123456789abcdef'/&gt;&lt;/msg&gt;</content></refermsg></appmsg></msg>"
+    );
+    quote["content"] = json!(format!("member-a:\n{}", text(&quote, "content")));
+    let mut image = row(12, 12);
+    image["type"] = json!("图片");
+    engine
+        .access
+        .rows
+        .insert("g".into(), vec![quote.clone(), image.clone()]);
+    for row in [&quote, &image] {
+        journal(&engine.store, "g", row).unwrap();
+        engine
+            .store
+            .acknowledge("g", &source("g", row).unwrap())
+            .unwrap();
+    }
+    let events = engine.cycle(&[json!({"op":"history","group":"g","request_id":uuid::Uuid::new_v4().to_string(),"before_source":"","limit":60})], 1000.1);
+    let messages: Vec<_> = events
+        .iter()
+        .filter(|event| event["type"] == "message")
+        .collect();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(
+        messages[0]["message"]["source_id"],
+        source("g", &quote).unwrap()
+    );
+    assert_eq!(messages[0]["historical"], true);
+    assert!(engine.access.calls.is_empty());
+    assert!(engine.access.allowed.is_empty());
+}
+
+#[test]
+fn explicit_quote_refresh_reloads_only_the_reply_and_emits_metadata_before_correlated_completion() {
+    let (_temp, mut engine) = setup(json!(["g"]));
+    engine.last_poll = 1000.0;
+    let mut reply = row(11, 11);
+    reply["type"] = json!("文件/链接/卡片");
+    reply["fixture_quote"] = json!(true);
+    reply["content"] = json!(
+        "<msg><appmsg><type>57</type><title>reply</title><refermsg><type>3</type><svrid>42</svrid><fromusr>wxid_fixture_self</fromusr><chatusr>wxid_fixture_self</chatusr><content>&lt;msg&gt;&lt;img md5='0123456789abcdef0123456789abcdef'/&gt;&lt;/msg&gt;</content></refermsg></appmsg></msg>"
+    );
+    reply["content"] = json!(format!("member-a:\n{}", text(&reply, "content")));
+    reply["quote"] = json!({"id":"resolved-image","sender":"member","text":"[图片]"});
+    reply["_quote_source"] = json!("wx:g:message__message_0.db:3:30");
+    reply["_quote_server_id"] = json!("42");
+    let key = source("g", &reply).unwrap();
+    journal(&engine.store, "g", &reply).unwrap();
+    engine.access.rows.insert("g".into(), vec![reply]);
+    engine.store.acknowledge("g", &key).unwrap();
+    let cursor = engine.store.state("cursor:g").unwrap();
+    let floor = engine.store.state("watch_floor:g").unwrap();
+    let request = uuid::Uuid::new_v4().to_string();
+    let events = engine.cycle(
+        &[json!({"op":"quote_refresh","group":"g","source_id":key,"request_id":request})],
+        1000.1,
+    );
+    let message_index = events
+        .iter()
+        .position(|event| event["type"] == "message")
+        .unwrap();
+    let done_index = events
+        .iter()
+        .position(|event| event["type"] == "quote_refresh_done")
+        .unwrap();
+    assert!(message_index < done_index);
+    assert_eq!(events[message_index]["historical"], true);
+    assert_eq!(
+        events[message_index]["message"]["_quote_source"],
+        "wx:g:message__message_0.db:3:30"
+    );
+    assert_eq!(
+        events[done_index],
+        json!({"type":"quote_refresh_done","request_id":request,"group":"g","source_id":key,"ok":true})
+    );
+    assert_eq!(engine.store.state("cursor:g").unwrap(), cursor);
+    assert_eq!(engine.store.state("watch_floor:g").unwrap(), floor);
+    assert_eq!(engine.access.conversions, 1);
+    assert!(engine.access.calls.is_empty());
+    assert!(engine.access.allowed.is_empty());
+}
+
+#[test]
+fn quote_refresh_rejects_unselected_foreign_missing_or_nonquote_locators_without_native_actions() {
+    let (_temp, mut engine) = setup(json!(["g"]));
+    engine.last_poll = 1000.0;
+    let key = source("g", &engine.access.rows["g"][0]).unwrap();
+    for (group, source) in [
+        ("h", key.as_str()),
+        ("g", "wx:h:message__message_0.db:1:10"),
+        ("g", "wx:g:message__message_0.db:999:999"),
+        ("g", key.as_str()),
+        ("g", ""),
+    ] {
+        let request = uuid::Uuid::new_v4().to_string();
+        let events = engine.cycle(
+            &[json!({"op":"quote_refresh","group":group,"source_id":source,"request_id":request})],
+            1000.1,
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event["type"] == "quote_refresh_done"
+                    && event["request_id"] == request
+                    && event["ok"] == false)
+        );
+        assert!(!events.iter().any(|event| event["type"] == "message"));
+    }
+    assert_eq!(engine.access.conversions, 0);
+    assert!(engine.access.calls.is_empty());
+    assert!(engine.access.allowed.is_empty());
 }
 
 #[test]

@@ -12,6 +12,7 @@
 #include <QQueue>
 #include <QSystemTrayIcon>
 #include <QTimer>
+#include <atomic>
 #include <memory>
 
 namespace MediaStorage { class LocalFiles; }
@@ -87,11 +88,13 @@ class Window : public QMainWindow
     void cacheMessageDraft(const QJsonObject &message);
     void refreshReeditLinks();
     void locateQuote(const QJsonObject &quote);
+    void refreshQuoteSource(const QJsonObject &quote);
     void updateNativeFrame();
     void refreshThemeIcons();
     void pruneMediaCache(qint64 limit, std::function<void(const QString &)> callback = {});
     void updateCachePins();
     QJsonArray hydrateMessages(const QJsonArray &snapshot) const;
+    void recoverCachedMessages(const QJsonArray &snapshot, std::function<void()> callback);
     bool hasCurrentMedia(const QJsonObject &media) const;
     void updateComposeHeight();
     void fitToScreen(bool initial = false);
@@ -160,6 +163,7 @@ class Window : public QMainWindow
     QString lastError;
     QJsonArray memberCache;
     std::shared_ptr<MediaStorage::LocalFiles> localFiles;
+    std::shared_ptr<std::atomic<quint64>> cacheRecoveryGeneration = std::make_shared<std::atomic<quint64>>(0);
     QHash<QString, int> unread;
     QHash<QString, QJsonObject> historyUpdates;
     QSet<QString> downloading, openRequests, saveRequests;

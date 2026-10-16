@@ -28,6 +28,7 @@
 #include <QPushButton>
 #include <QScrollBar>
 #include <QStyledItemDelegate>
+#include <QThreadPool>
 #include <QUrlQuery>
 #include <QVBoxLayout>
 
@@ -417,11 +418,12 @@ HistoryBrowser::HistoryBrowser(Transport *service, const QString &group, const Q
     loadMembers();
     QTimer::singleShot(0, this, &HistoryBrowser::loadPage);
 }
-HistoryBrowser::~HistoryBrowser() { localFiles->unpin(this); }
+HistoryBrowser::~HistoryBrowser() { ++*cacheRecoveryGeneration; localFiles->unpin(this); }
 
 void HistoryBrowser::resetSearch()
 {
     ++generation;
+    ++*cacheRecoveryGeneration;
     loading = false;
     hasMore = true;
     nextBefore.clear();
@@ -468,8 +470,7 @@ void HistoryBrowser::loadPage()
     const auto requestedGeneration = generation;
     const auto cursor = nextBefore;
     QPointer<HistoryBrowser> self(this);
-    transport->get("/api/records?" + query.toString(QUrl::FullyEncoded),
-        [self, requestedGeneration, cursor](const QJsonValue &value, const QString &error)
+    auto applyPage = [self, requestedGeneration, cursor](const QJsonValue &value, const QString &error)
         {
             if (!self)
                 return;
@@ -510,6 +511,24 @@ void HistoryBrowser::loadPage()
             self->more->setText(pending ? "继续读取" : entries.isEmpty() && self->hasMore ? "继续查找" : "加载更多");
             self->more->setEnabled(self->hasMore);
             self->thumbnailTimer.start();
+        };
+    transport->get("/api/records?" + query.toString(QUrl::FullyEncoded),
+        [self, requestedGeneration, applyPage](const QJsonValue &value, const QString &error)
+        {
+            if (!self) return;
+            if (!error.isEmpty() || !self->valid || requestedGeneration != self->generation)
+            { applyPage(value, error); return; }
+            const auto files = self->localFiles;
+            const auto entries = value.toObject()["messages"].toArray();
+            const auto root = self->downloadRoot;
+            const auto group = self->groupId;
+            const auto cancellation = self->cacheRecoveryGeneration;
+            const auto expected = cancellation->load();
+            QThreadPool::globalInstance()->start([files, entries, root, group, cancellation, expected, applyPage, value, error]
+            {
+                files->recover(entries, root, group, [cancellation, expected] { return cancellation->load() != expected; });
+                QMetaObject::invokeMethod(qApp, [applyPage, value, error] { applyPage(value, error); });
+            });
         }, 20000);
 }
 
@@ -744,6 +763,7 @@ void HistoryBrowser::invalidate()
 {
     valid = false;
     ++generation;
+    ++*cacheRecoveryGeneration;
     searchTimer.stop();
     thumbnailTimer.stop();
     localFiles->unpin(this);
@@ -754,6 +774,7 @@ void HistoryBrowser::closeEvent(QCloseEvent *event)
 {
     valid = false;
     ++generation;
+    ++*cacheRecoveryGeneration;
     searchTimer.stop();
     thumbnailTimer.stop();
     localFiles->unpin(this);

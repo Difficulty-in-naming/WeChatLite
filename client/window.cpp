@@ -172,6 +172,7 @@ Window::Window(bool demo, const QString &tunnelExecutable)
     : transport(this), tunnel(this, tunnelExecutable), attachments(this), demoServer(this), tray(this)
 {
     localFiles = std::make_shared<MediaStorage::LocalFiles>();
+    connect(this, &QObject::destroyed, [generation = cacheRecoveryGeneration] { ++*generation; });
 #ifdef Q_OS_WIN
     demoServer.setCreateProcessArgumentsModifier([](QProcess::CreateProcessArguments *arguments)
                                                  { arguments->flags |= 0x08000000; });
@@ -961,7 +962,7 @@ void Window::showPreferences()
         if (downloadRoot != values.downloads)
         {
             invalidateAuxiliaryWindows();
-            localFiles = std::make_shared<MediaStorage::LocalFiles>();
+            localFiles = std::make_shared<MediaStorage::LocalFiles>(chatPreferences.scope());
         }
         downloadRoot = values.downloads;
         QSettings settings;
@@ -1079,6 +1080,38 @@ QJsonArray Window::hydrateMessages(const QJsonArray &snapshot) const
     for (const auto &message : snapshot)
         result.append(localFiles->hydrate(message.toObject(), groupId));
     return result;
+}
+void Window::recoverCachedMessages(const QJsonArray &snapshot, std::function<void()> callback)
+{
+    bool missing = false;
+    for (const auto &entry : snapshot)
+    {
+        const auto message = entry.toObject();
+        if (message["status"] == "recalled") continue;
+        const auto group = message["group"].toString(groupId);
+        for (const auto &value : message["media"].toArray())
+            if (localFiles->find(group, value.toObject()).isEmpty()) { missing = true; break; }
+        if (missing) break;
+    }
+    if (!missing) { callback(); return; }
+    const auto files = localFiles;
+    const auto directory = downloadRoot;
+    const auto group = groupId;
+    const auto cancellation = cacheRecoveryGeneration;
+    const auto generation = cancellation->load();
+    QPointer<Window> self(this);
+    QThreadPool::globalInstance()->start([self, files, snapshot, directory, group, cancellation, generation,
+                                        callback = std::move(callback)]
+    {
+        files->recover(snapshot, directory, group, [cancellation, generation] { return cancellation->load() != generation; });
+        QMetaObject::invokeMethod(qApp, [self, files, snapshot, callback, cancellation, generation]
+        {
+            if (!self) return;
+            if (cancellation->load() != generation) { callback(); return; }
+            if (files != self->localFiles) { self->recoverCachedMessages(snapshot, callback); return; }
+            callback();
+        });
+    });
 }
 bool Window::hasCurrentMedia(const QJsonObject &media) const
 {
@@ -1209,7 +1242,7 @@ void Window::showSettings()
         settings.setValue("connectionMode", mode->currentData());
         p2pSettings = mode->currentData() == "p2p" ? automatic : QJsonObject{};
         settings.setValue("p2p", QJsonDocument(p2pSettings).toJson(QJsonDocument::Compact));
-        localFiles = std::make_shared<MediaStorage::LocalFiles>();
+        localFiles = std::make_shared<MediaStorage::LocalFiles>(chatPreferences.scope());
     };
     auto *buttons = new QDialogButtonBox(QDialogButtonBox::Save | QDialogButtonBox::Cancel);
     buttons->button(QDialogButtonBox::Save)->setText("保存并连接");
@@ -1367,6 +1400,7 @@ void Window::clearConversation()
     cancelSend();
     saveDraft();
     ++conversationGeneration;
+    ++*cacheRecoveryGeneration;
     ++historyGeneration;
     loading = false;
     hasOlder = true;
@@ -1393,7 +1427,7 @@ void Window::connectService()
     notificationSyncSeq = 0;
     if (chatPreferences.configure(serverUrl, secret))
     {
-        localFiles = std::make_shared<MediaStorage::LocalFiles>();
+        localFiles = std::make_shared<MediaStorage::LocalFiles>(chatPreferences.scope());
         seenMessages.clear();
         seenMessageOrder.clear();
     }
@@ -1833,6 +1867,7 @@ void Window::selectGroup(const QString &id, const QString &name)
     messages->setProperty("locatedHistory", false);
     messages->stopScrollAnimation();
     ++conversationGeneration;
+    ++*cacheRecoveryGeneration;
     ++historyGeneration;
     loading = false;
     hasOlder = true;
@@ -1883,9 +1918,7 @@ void Window::loadHistory(bool older, int pendingAttempt)
     query.addQueryItem("group", id);
     if (older && !model->rows.isEmpty())
         query.addQueryItem("before", QString::number(model->rows.first()["seq"].toInteger()));
-    transport.get(
-        "/api/history?" + query.toString(QUrl::FullyEncoded),
-        [this, id, older, pendingAttempt, generation](const QJsonValue &value, const QString &error)
+    auto applyPage = [this, id, older, pendingAttempt, generation](const QJsonValue &value, const QString &error)
         {
             if (id != groupId || generation != historyGeneration)
                 return;
@@ -1982,6 +2015,14 @@ void Window::loadHistory(bool older, int pendingAttempt)
                     if (id == groupId && generation == historyGeneration && !loading)
                         loadHistory(older, pendingAttempt + 1);
                 });
+        };
+    transport.get("/api/history?" + query.toString(QUrl::FullyEncoded),
+        [this, id, generation, applyPage](const QJsonValue &value, const QString &error)
+        {
+            if (id != groupId || generation != historyGeneration) return;
+            if (!error.isEmpty()) { applyPage(value, error); return; }
+            const auto entries = value.isArray() ? value.toArray() : value.toObject()["messages"].toArray();
+            recoverCachedMessages(entries, [applyPage, value, error] { applyPage(value, error); });
         });
 }
 void Window::loadMembers()
@@ -2370,6 +2411,51 @@ void Window::reeditMessage(const QString &id)
            : keptQuote && !draft["quote"].toObject().isEmpty() ? "已追加原稿并保留当前引用"
                                                                : "已恢复原稿，可继续编辑");
 }
+void Window::refreshQuoteSource(const QJsonObject &quote)
+{
+    const auto replyId = quote["_reply_id"].toString();
+    const auto id = quote["id"].toString();
+    if (replyId.isEmpty() || replyId.size() > 512 || !locatingId.isEmpty() || groupId.isEmpty())
+        return;
+    const bool currentReply = std::any_of(model->rows.cbegin(), model->rows.cend(), [&](const QJsonObject &row)
+    {
+        return row["id"] == replyId && row["group"] == groupId && row["status"] != "recalled" &&
+               row["quote"].toObject()["id"] == id;
+    });
+    if (!currentReply)
+        return;
+    const auto group = groupId;
+    const auto conversation = conversationGeneration;
+    const auto generation = ++locateGeneration;
+    locatingId = id;
+    QUrlQuery query;
+    query.addQueryItem("group", group);
+    transport.post("/api/messages/" + QString::fromLatin1(QUrl::toPercentEncoding(replyId)) +
+        "/quote-source?" + query.toString(QUrl::FullyEncoded), {},
+        [this, replyId, group, conversation, generation](const QJsonValue &value, const QString &error)
+        {
+            if (group != groupId || conversation != conversationGeneration || generation != locateGeneration)
+                return;
+            locatingId.clear();
+            const auto response = value.toObject();
+            const auto updated = response["message"].toObject();
+            const auto original = response["original"].toObject();
+            auto source = updated["quote"].toObject();
+            const auto originalId = original["id"].toString();
+            if (!error.isEmpty() || updated["id"] != replyId || updated["group"] != group ||
+                updated["status"] == "recalled" || source["unavailable"].toBool() ||
+                originalId.isEmpty() || originalId.startsWith("unavailable-") || source["id"] != originalId ||
+                original["group"] != group || original["status"] == "recalled" ||
+                original["seq"].toInteger() <= 0 || unavailableOriginals.contains(originalId))
+            {
+                notify(error.isEmpty() ? "引用原消息尚未同步或不可用" : error, true);
+                return;
+            }
+            model->upsert(localFiles->hydrate(updated, group));
+            source["group"] = group;
+            locateQuote(source);
+        }, 18000);
+}
 void Window::locateQuote(const QJsonObject &quote)
 {
     const auto id = quote["id"].toString();
@@ -2394,6 +2480,11 @@ void Window::locateQuote(const QJsonObject &quote)
                 messages->locateMessage(id);
             return;
         }
+    if (id.startsWith("unavailable-") && !quote["_reply_id"].toString().isEmpty())
+    {
+        refreshQuoteSource(quote);
+        return;
+    }
     const auto group = groupId;
     const auto generation = ++locateGeneration;
     const auto conversation = conversationGeneration;
@@ -2403,7 +2494,7 @@ void Window::locateQuote(const QJsonObject &quote)
     transport.get(
         "/api/messages/" + QString::fromLatin1(QUrl::toPercentEncoding(id)) + '?' +
             sourceQuery.toString(QUrl::FullyEncoded),
-        [this, id, group, generation, conversation](const QJsonValue &value, const QString &error)
+        [this, id, group, generation, conversation, quote](const QJsonValue &value, const QString &error)
         {
             if (generation != locateGeneration || conversation != conversationGeneration || group != groupId)
                 return;
@@ -2413,6 +2504,12 @@ void Window::locateQuote(const QJsonObject &quote)
                 unavailableOriginals.contains(id))
             {
                 locatingId.clear();
+                if (!quote["_reply_id"].toString().isEmpty() && !unavailableOriginals.contains(id) &&
+                    original["status"] != "recalled")
+                {
+                    refreshQuoteSource(quote);
+                    return;
+                }
                 clearPendingRecord(id);
                 notify(error.isEmpty() ? "原消息已撤回或不可用，无法定位" : error, true);
                 return;
@@ -2448,21 +2545,33 @@ void Window::locateQuote(const QJsonObject &quote)
                     hasOlder = !context.isEmpty();
                     context.append(original);
                     ++historyGeneration;
-                    loading = false;
+                    loading = true;
                     historyUpdates.clear();
                     messages->setProperty("locatedHistory", true);
                     messages->stopScrollAnimation();
-                    model->replace(hydrateMessages(context));
-                    refreshReeditLinks();
-                    QTimer::singleShot(0, this,
-                                       [this, id, group, conversation]
-                                       {
-                                           if (group == groupId && conversation == conversationGeneration)
-                                           {
-                                               messages->locateMessage(id);
-                                               playLocatedRecord(id);
-                                           }
-                                       });
+                    recoverCachedMessages(context, [this, id, group, generation, conversation, context]() mutable
+                    {
+                        if (group != groupId || conversation != conversationGeneration || generation != locateGeneration)
+                            return;
+                        loading = false;
+                        for (int row = 0; row < context.size(); ++row)
+                        {
+                            const auto key = context[row].toObject()["id"].toString();
+                            if (historyUpdates.contains(key)) context[row] = historyUpdates[key];
+                        }
+                        historyUpdates.clear();
+                        model->replace(hydrateMessages(context));
+                        refreshReeditLinks();
+                        if (unavailableOriginals.contains(id)) { clearPendingRecord(id); return; }
+                        QTimer::singleShot(0, this, [this, id, group, conversation]
+                        {
+                            if (group == groupId && conversation == conversationGeneration)
+                            {
+                                messages->locateMessage(id);
+                                playLocatedRecord(id);
+                            }
+                        });
+                    });
                     notify("已定位原文；向下滚动到底或按 End 返回最新消息");
                 },
                 10000);

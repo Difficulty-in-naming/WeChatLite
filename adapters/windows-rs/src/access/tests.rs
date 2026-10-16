@@ -244,7 +244,10 @@ fn recall_db_fixture() -> (TempDir, Local, String) {
             temp.path().join("fixture-account"),
             "wxid_self",
             None,
-            HashMap::from([("message/message_0.db".into(), messages), ("contact/contact.db".into(), contacts)]),
+            HashMap::from([
+                ("message/message_0.db".into(), messages),
+                ("contact/contact.db".into(), contacts),
+            ]),
         ),
         native: NativeClient::new(temp.path().join("native")),
         media: Media::new(temp.path().to_owned()),
@@ -264,34 +267,350 @@ fn recall_db_fixture() -> (TempDir, Local, String) {
 fn received_image_quote_uses_a_label_and_real_source_even_before_media_is_cached() {
     let (temp, mut access, table) = recall_db_fixture();
     let mut png = std::io::Cursor::new(Vec::new());
-    image::DynamicImage::new_rgb8(2, 2).write_to(&mut png, image::ImageFormat::Png).unwrap();
+    image::DynamicImage::new_rgb8(2, 2)
+        .write_to(&mut png, image::ImageFormat::Png)
+        .unwrap();
     let png = png.into_inner();
     let digest = format!("{:x}", Md5::digest(&png));
     let image = format!("<?xml version=\"1.0\"?><msg><img md5=\"{digest}\"/></msg>");
-    let card = format!("<msg><appmsg><type>57</type><title>这个</title><refermsg><type>3</type><svrid>18446744073709551615</svrid><fromusr>wxid_self</fromusr><chatusr>wxid_self</chatusr><displayname>成员</displayname><content><![CDATA[{image}]]></content></refermsg></appmsg></msg>");
-    access.db.open("message/message_0.db").unwrap().execute(
-        &format!("UPDATE {table} SET local_type=3,message_content=?1 WHERE local_id=3"), [&image]).unwrap();
-    let reply = json!({"local_id":4,"sort_seq":40,"shard":"message__message_0.db","sender_id":2,"create_time":1001,"type":"引用","content":card});
+    let reference_image =
+        format!("<msg><img cdnmidimgurl='refreshed-download' md5='{digest}'/></msg>");
+    let card = format!(
+        "<msg><appmsg><type>57</type><title>这个</title><refermsg><type>3</type><svrid>18446744073709551615</svrid><fromusr>wxid_self</fromusr><chatusr>wxid_self</chatusr><displayname>成员</displayname><content><![CDATA[{reference_image}]]></content></refermsg></appmsg></msg>"
+    );
+    access
+        .db
+        .open("message/message_0.db")
+        .unwrap()
+        .execute(
+            &format!("UPDATE {table} SET local_type=3,message_content=?1 WHERE local_id=3"),
+            [&image],
+        )
+        .unwrap();
+    let reply = json!({"local_id":4,"sort_seq":40,"shard":"message__message_0.db","sender_id":2,"create_time":1001,"type":"文件/链接/卡片","content":card});
     let converted = access.convert(RECALL_GROUP, &reply).unwrap().unwrap();
     assert_eq!(converted["text"], "这个");
     assert_eq!(converted["quote"]["text"], "[图片]");
     let expected_source = format!("wx:{RECALL_GROUP}:message__message_0.db:3:30");
     assert_eq!(converted["_quote_source"], expected_source);
-    assert_eq!(converted["quote"]["id"], Uuid::new_v5(&Uuid::NAMESPACE_URL, expected_source.as_bytes()).to_string());
+    assert_eq!(converted["_quote_server_id"], "18446744073709551615");
+    assert_eq!(
+        converted["quote"]["id"],
+        Uuid::new_v5(&Uuid::NAMESPACE_URL, expected_source.as_bytes()).to_string()
+    );
     assert!(converted.get("_quote_original").is_none()); // An uncached image must not hold up its reply.
-    let row = access.db.reload(RECALL_GROUP, &json!({"local_id":3,"sort_seq":30,"shard":"message__message_0.db"})).unwrap();
-    let raw = access.db.raw_message(RECALL_GROUP, 3, "message__message_0.db").unwrap();
+    let row = access
+        .db
+        .reload(
+            RECALL_GROUP,
+            &json!({"local_id":3,"sort_seq":30,"shard":"message__message_0.db"}),
+        )
+        .unwrap();
+    let raw = access
+        .db
+        .raw_message(RECALL_GROUP, 3, "message__message_0.db")
+        .unwrap();
     assert!(crate::quotes::prepare_source(RECALL_GROUP, &row, &raw, "wxid_self").is_err());
-    let folder = temp.path().join("fixture-account/msg/attach")
-        .join(format!("{:x}", Md5::digest(RECALL_GROUP.as_bytes()))).join("2026-10/Img");
+    let folder = temp
+        .path()
+        .join("fixture-account/msg/attach")
+        .join(format!("{:x}", Md5::digest(RECALL_GROUP.as_bytes())))
+        .join("2026-10/Img");
     std::fs::create_dir_all(&folder).unwrap();
-    std::fs::write(folder.join(format!("{digest}.dat")), png.iter().map(|b| b ^ 0x88).collect::<Vec<_>>()).unwrap();
+    std::fs::write(
+        folder.join(format!("{digest}.dat")),
+        png.iter().map(|b| b ^ 0x88).collect::<Vec<_>>(),
+    )
+    .unwrap();
     let ready = access.convert(RECALL_GROUP, &reply).unwrap().unwrap();
     assert_eq!(ready["quote"], converted["quote"]);
     assert_eq!(ready["_quote_original"]["id"], ready["quote"]["id"]);
     assert_eq!(ready["_quote_original"]["media"][0]["kind"], "image");
     assert!(access.native.pid.is_none());
     assert!(!temp.path().join("native").exists());
+}
+
+#[test]
+fn received_reference_rejects_duplicate_server_ids_instead_of_choosing_the_first_row() {
+    let (temp, mut access, table) = recall_db_fixture();
+    let reference = json!({"type":1,"server_id":"18446744073709551615","fromusr":"wxid_self","chatusr":"wxid_self","text":"fixture message"});
+    assert!(
+        access
+            .referenced_original(RECALL_GROUP, &reference)
+            .unwrap()
+            .is_some()
+    );
+    access.db.open("message/message_0.db").unwrap().execute(
+        &format!("INSERT INTO {table} SELECT 4,local_type,real_sender_id,create_time,message_content,source,packed_info_data,compress_content,server_id,40 FROM {table} WHERE local_id=3"), []).unwrap();
+    assert!(
+        access
+            .referenced_original(RECALL_GROUP, &reference)
+            .unwrap()
+            .is_none()
+    );
+    assert!(access.native.pid.is_none());
+    assert!(!temp.path().join("native").exists());
+}
+
+#[test]
+fn received_reference_rejects_the_same_server_id_in_different_shards() {
+    let (temp, mut access, table) = recall_db_fixture();
+    let mut shards = HashMap::new();
+    for index in 0..2 {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(&format!("CREATE TABLE Name2Id(user_name TEXT);CREATE TABLE {table}(local_id INTEGER PRIMARY KEY,local_type INTEGER,real_sender_id INTEGER,create_time INTEGER,message_content TEXT,source BLOB,packed_info_data BLOB,compress_content BLOB,server_id INTEGER,sort_seq INTEGER);INSERT INTO {table} VALUES(3,1,2,1000,'fixture message',NULL,NULL,NULL,-1,30);")).unwrap();
+        shards.insert(format!("message/message_{index}.db"), db);
+    }
+    access.db = Db::media_fixture(
+        temp.path().join("duplicate-account"),
+        "wxid_self",
+        None,
+        shards,
+    );
+    let reference = json!({"type":1,"server_id":"18446744073709551615","fromusr":"wxid_self","chatusr":"wxid_self","text":"fixture message"});
+    assert!(
+        access
+            .referenced_original(RECALL_GROUP, &reference)
+            .unwrap()
+            .is_none()
+    );
+    assert!(access.native.pid.is_none());
+    assert!(!temp.path().join("native").exists());
+}
+
+#[test]
+fn disconnected_read_probe_drop_leaves_neighbor_native_permissions_untouched() {
+    let (temp, mut access, _) = recall_db_fixture();
+    let neighbor = temp.path().join("neighbor-native/native.json");
+    std::fs::create_dir_all(neighbor.parent().unwrap()).unwrap();
+    let permissions =
+        json!({"groups":[RECALL_GROUP],"token":"fixture-not-a-credential","port":1}).to_string();
+    std::fs::write(&neighbor, &permissions).unwrap();
+    let disconnected = temp.path().join("isolated-read-probe/never-connect-native");
+    access.native = NativeClient::new(disconnected.clone());
+    access.allowed.clear();
+    assert!(access.native.pid.is_none());
+    assert!(access.actions.is_none());
+    assert!(access.quotes.is_none());
+    drop(access); // Both Local::drop and NativeClient::drop restrict only the absent isolated root.
+    assert!(!disconnected.exists());
+    assert_eq!(std::fs::read_to_string(neighbor).unwrap(), permissions);
+}
+
+#[test]
+fn received_quote_classification_uses_the_verified_sender_envelope_like_conversion() {
+    let (temp, mut access, _) = recall_db_fixture();
+    let card = "<msg><appmsg><type>57</type><title>reply</title><refermsg><type>3</type><svrid>42</svrid><fromusr>wxid_self</fromusr><chatusr>wxid_self</chatusr><content>[图片]</content></refermsg></appmsg></msg>";
+    let mut reply = json!({"sender_id":2,"sender_username":"wxid_self","type":"文件/链接/卡片","content":format!("wxid_self:\r\n{card}")});
+    assert!(access.is_quote(RECALL_GROUP, &reply));
+    reply["content"] = json!(format!("wxid_other:\n{card}"));
+    assert!(!access.is_quote(RECALL_GROUP, &reply));
+    assert!(access.native.pid.is_none());
+    assert!(!temp.path().join("native").exists());
+}
+
+#[cfg(windows)]
+#[test]
+#[ignore = "Explicit WECHAT_LITE_QUOTE_IDENTITIES and a private diagnosis parent ACL are required; only reads WeChat DB/local images, never connects native components"]
+fn read_only_image_quote_identity_probe() {
+    let Some(identity_path) = std::env::var_os("WECHAT_LITE_QUOTE_IDENTITIES") else {
+        return; // Even an explicit --ignored invocation without the opt-in must have no side effects.
+    };
+    let result = (|| -> Result<Value> {
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()?;
+        let diagnosis = workspace.join(".state/diagnosis-v0.3.6").canonicalize()?;
+        ensure!(
+            diagnosis.starts_with(&workspace),
+            "Probe diagnosis directory is outside the workspace"
+        );
+        let identities = PathBuf::from(identity_path).canonicalize()?;
+        ensure!(
+            identities.starts_with(&diagnosis),
+            "Probe identities must remain private"
+        );
+        ensure!(
+            std::fs::metadata(&identities)?.len() <= 1024 * 1024,
+            "Probe identity list is too large"
+        );
+        let identities: Value = serde_json::from_slice(&std::fs::read(identities)?)?;
+        let identities = identities
+            .as_array()
+            .context("Probe identity list must be an array")?;
+        ensure!(
+            !identities.is_empty() && identities.len() <= 200,
+            "Probe identity count is invalid"
+        );
+        // The operator protects the diagnosis parent ACL before opting in; this fresh child inherits it.
+        let directory = diagnosis.join(format!("readonly-quote-probe-{}", Uuid::new_v4()));
+        std::fs::create_dir(&directory)?;
+        ensure!(
+            directory.canonicalize()?.starts_with(&diagnosis),
+            "Probe directory escaped its parent"
+        );
+        let disconnected = directory.join("never-connect-native");
+        ensure!(
+            !disconnected.exists(),
+            "Probe native directory must not exist"
+        );
+        let mut access = Local {
+            db: Db::connect(&directory.join("wechat"))?,
+            native: NativeClient::new(disconnected.clone()),
+            media: Media::new(directory.clone()),
+            allowed: BTreeSet::new(),
+            directory,
+            avatars: HashMap::new(),
+            avatar_order: VecDeque::new(),
+            actions: None,
+            actions_error: String::new(),
+            quotes: None,
+            quotes_error: String::new(),
+        };
+        let (mut reloaded, mut parsed, mut matched, mut media_available) = (0, 0, 0, 0);
+        let (mut classified, mut converted_source_matched) = (0, 0);
+        let mut stages = std::collections::BTreeMap::<String, u64>::new();
+        for identity in identities {
+            let group = text(identity, "group");
+            let Ok(position) = locator(group, text(identity, "source_id")) else {
+                continue;
+            };
+            let Ok(reply) = access.db.reload(group, &position) else {
+                continue;
+            };
+            reloaded += 1;
+            if access.is_quote(group, &reply) {
+                classified += 1;
+            }
+            let Ok((content, _)) = access.identity(group, &reply) else {
+                continue;
+            };
+            let Some(reference) = crate::quotes::reference(&content) else {
+                continue;
+            };
+            if reference["type"] != 3 {
+                continue;
+            }
+            parsed += 1;
+            for (key, value) in crate::quotes::image_reference_shape(&reference)
+                .as_object()
+                .unwrap()
+            {
+                if value == true {
+                    *stages.entry(key.clone()).or_default() += 1;
+                }
+            }
+            let mut candidate_count = 0;
+            if let Ok(server) = text(&reference, "server_id").parse::<u64>() {
+                let table = format!("Msg_{:x}", Md5::digest(group.as_bytes()));
+                for rel in access.db.rels().into_iter().filter(|rel| {
+                    rel.strip_prefix("message/message_")
+                        .and_then(|name| name.strip_suffix(".db"))
+                        .is_some_and(|name| {
+                            !name.is_empty() && name.bytes().all(|byte| byte.is_ascii_digit())
+                        })
+                }) {
+                    let candidates = (|| -> Result<Vec<(i64, i64)>> {
+                        let connection = access.db.open(&rel)?;
+                        if !connection.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)", [&table], |row| row.get::<_,bool>(0))? { return Ok(vec![]); }
+                        Ok(connection
+                            .prepare(&format!(
+                                "SELECT local_id,sort_seq FROM {table} WHERE server_id=?1 LIMIT 2"
+                            ))?
+                            .query_map([server as i64], |row| Ok((row.get(0)?, row.get(1)?)))?
+                            .collect::<rusqlite::Result<Vec<_>>>()?)
+                    })();
+                    let Ok(candidates) = candidates else {
+                        *stages.entry("candidate_read_error".into()).or_default() += 1;
+                        continue;
+                    };
+                    for (local, sequence) in candidates {
+                        candidate_count += 1;
+                        *stages.entry("candidate_rows".into()).or_default() += 1;
+                        let locator = json!({"local_id":local,"sort_seq":sequence,"shard":rel.replace('/',"__")});
+                        let Ok(row) = access.db.reload(group, &locator) else {
+                            continue;
+                        };
+                        let Ok(raw) = access.db.raw_message(group, local, text(&locator, "shard"))
+                        else {
+                            continue;
+                        };
+                        let diagnostic = crate::quotes::reference_diagnostics(
+                            group,
+                            &row,
+                            &raw,
+                            &access.db.wxid,
+                            &reference,
+                        );
+                        for (key, value) in diagnostic.as_object().unwrap() {
+                            if value == true {
+                                *stages.entry(key.clone()).or_default() += 1;
+                            }
+                            if key == "source_failure" {
+                                *stages
+                                    .entry(format!(
+                                        "source_failure_{}",
+                                        value.as_str().unwrap_or("other")
+                                    ))
+                                    .or_default() += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            *stages
+                .entry(
+                    match candidate_count {
+                        0 => "references_without_candidate",
+                        1 => "references_with_unique_candidate",
+                        _ => "references_with_duplicate_candidates",
+                    }
+                    .into(),
+                )
+                .or_default() += 1;
+            let Ok(Some(original)) = access.referenced_original(group, &reference) else {
+                continue;
+            };
+            // referenced_original already checks the exact server ID, DB actor, locator and image MD5.
+            let Ok(original_source) = source(group, &original) else {
+                continue;
+            };
+            matched += 1;
+            if access
+                .media
+                .inbound(&mut access.db, None, group, &original, "image")
+                .is_ok()
+            {
+                media_available += 1;
+            }
+            if let Ok(Some(converted)) = access.convert(group, &reply) {
+                if converted["_quote_source"] == original_source
+                    && converted["_quote_server_id"] == reference["server_id"]
+                    && converted["quote"]["id"]
+                        == Uuid::new_v5(&Uuid::NAMESPACE_URL, original_source.as_bytes())
+                            .to_string()
+                {
+                    converted_source_matched += 1;
+                }
+            }
+        }
+        ensure!(
+            access.native.pid.is_none() && !disconnected.exists(),
+            "Probe initialized a native component"
+        );
+        drop(access);
+        ensure!(
+            !disconnected.exists(),
+            "Probe Drop changed its native directory"
+        );
+        Ok(
+            json!({"total":identities.len(),"reloaded":reloaded,"production_classified":classified,"parsed":parsed,"target_source_matched":matched,"converted_source_matched":converted_source_matched,"media_available":media_available,"stages":stages}),
+        )
+    })();
+    match result {
+        Ok(counts) => println!("{counts}"),
+        Err(_) => panic!("Read-only quote probe setup failed; private diagnostics were suppressed"),
+    }
 }
 
 #[test]

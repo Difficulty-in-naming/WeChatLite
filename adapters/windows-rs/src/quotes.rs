@@ -293,7 +293,13 @@ pub fn prepare_source(group: &str, row: &Value, raw: &Value, wxid: &str) -> Resu
 }
 
 /// Resolve received references without enabling additional native send types.
-pub fn matches_reference(group: &str, row: &Value, raw: &Value, wxid: &str, reference: &Value) -> bool {
+pub fn matches_reference(
+    group: &str,
+    row: &Value,
+    raw: &Value,
+    wxid: &str,
+    reference: &Value,
+) -> bool {
     let label = match reference["type"].as_u64() {
         Some(1) => "文本",
         Some(3) => "图片",
@@ -306,9 +312,139 @@ pub fn matches_reference(group: &str, row: &Value, raw: &Value, wxid: &str, refe
         return false;
     };
     source["server_id"] == reference["server_id"]
-        && source["fromusr"] == reference["fromusr"]
+        // Received cards use either the original author or the conversation as fromusr.
+        // Neither spelling may override the actor confirmed by this exact group's DB row.
+        && (reference["fromusr"] == source["chatusr"] || reference["fromusr"] == group)
         && source["chatusr"] == reference["chatusr"]
-        && xml_newlines(text(&source, "content")) == xml_newlines(text(reference, "text"))
+        && if reference["type"] == 3 {
+            // CDN URLs, thumbnail fields and XML formatting can change when WeChat quotes an image.
+            // The exact group/server ID/DB actor above plus the original image digest identify it.
+            image_digest(text(&source, "content")).is_some_and(|digest| {
+                image_digest(remove_envelope(text(reference, "text"), text(&source, "chatusr"))).as_deref() == Some(digest.as_str())
+            })
+        } else {
+            xml_newlines(text(&source, "content")) == xml_newlines(text(reference, "text"))
+        }
+}
+
+fn image_digest(content: &str) -> Option<String> {
+    if content.len() > 2 * 1024 * 1024
+        || content.contains("<!DOCTYPE")
+        || content.contains("<!ENTITY")
+    {
+        return None;
+    }
+    let doc = roxmltree::Document::parse(content).ok()?;
+    let root = doc.root_element();
+    if !root.has_tag_name("msg") {
+        return None;
+    }
+    let mut images = root.descendants().filter(|node| node.has_tag_name("img"));
+    let image = images.next()?;
+    if image.parent() != Some(root) || images.next().is_some() {
+        return None;
+    }
+    let digest = image.attribute("md5")?;
+    (digest.len() == 32 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .then(|| digest.to_ascii_lowercase())
+}
+
+#[cfg(test)]
+pub fn image_reference_shape(reference: &Value) -> Value {
+    let body = text(reference, "text");
+    let doc = roxmltree::Document::parse(body).ok();
+    let image = doc
+        .as_ref()
+        .and_then(|doc| doc.descendants().find(|node| node.has_tag_name("img")));
+    let digest = image.and_then(|image| image.attribute("md5"));
+    let envelope_body = remove_envelope(body, text(reference, "chatusr"));
+    let unescaped = if !body.contains('<') && body.contains('&') {
+        let wrapped = format!("<probe>{body}</probe>");
+        roxmltree::Document::parse(&wrapped)
+            .ok()
+            .filter(|doc| !doc.root_element().children().any(|node| node.is_element()))
+            .map(|doc| {
+                doc.root_element()
+                    .children()
+                    .filter(|node| node.is_text())
+                    .filter_map(|node| node.text())
+                    .collect::<String>()
+            })
+    } else {
+        None
+    };
+    json!({"reference_body_empty":body.trim().is_empty(),"reference_body_is_image_label":body.trim()=="[图片]",
+        "reference_body_xml":doc.is_some(),"reference_body_root_msg":doc.as_ref().is_some_and(|doc|doc.root_element().has_tag_name("msg")),
+        "reference_body_root_img":doc.as_ref().is_some_and(|doc|doc.root_element().has_tag_name("img")),
+        "reference_body_has_img":image.is_some(),"reference_body_md5_attr":digest.is_some(),
+        "reference_body_md5_valid":digest.is_some_and(|digest|digest.len()==32 && digest.bytes().all(|byte|byte.is_ascii_hexdigit())),
+        "reference_body_md5_empty":digest.is_some_and(str::is_empty),
+        "reference_body_escaped_xml":body.trim_start().starts_with("&lt;"),
+        "reference_body_has_actor_envelope":envelope_body!=body,
+        "reference_body_envelope_image_md5":image_digest(envelope_body).is_some(),
+        "reference_body_unescaped_image_md5":unescaped.as_ref().is_some_and(|body|image_digest(body).is_some()),
+        "reference_body_short_preview":body.len()<=256 && !body.contains(['<','>','&']),
+        "reference_body_bracketed_preview":body.trim().starts_with('[') && body.trim().ends_with(']')})
+}
+
+#[cfg(test)]
+pub fn reference_diagnostics(
+    group: &str,
+    row: &Value,
+    raw: &Value,
+    wxid: &str,
+    reference: &Value,
+) -> Value {
+    let source = source_fields(group, row, raw, wxid);
+    let failure = source
+        .as_ref()
+        .err()
+        .map(|error| {
+            let message = error.to_string();
+            if message.contains("账号或群") {
+                "identity"
+            } else if message.contains("已撤回") {
+                "recalled"
+            } else if message.contains("定位")
+                || message.contains("游标")
+                || message.contains("分片")
+            {
+                "locator"
+            } else if message.contains("发送者") {
+                "actor"
+            } else if message.contains("服务端编号") {
+                "server_id"
+            } else if message.contains("时间") {
+                "time"
+            } else if message.contains("原文") || message.contains("显示内容") {
+                "body"
+            } else {
+                "other"
+            }
+        })
+        .unwrap_or("none");
+    let actor = if row["sender_id"] == 2 {
+        wxid
+    } else {
+        text(row, "sender_username")
+    };
+    let body = db_text(&raw["content"]).or_else(|_| db_text(&raw["compress_content"]));
+    let body = body
+        .as_ref()
+        .map(|body| remove_envelope(body, actor))
+        .unwrap_or("");
+    let digest = image_digest(body);
+    let reference_digest = image_digest(text(reference, "text"));
+    json!({"row_image":row["type"]=="图片","raw_type_matches":raw["local_type"]==reference["type"],
+        "source_fields_ok":source.is_ok(),"source_failure":failure,
+        "source_server_matches":source.as_ref().is_ok_and(|value| value["server_id"]==reference["server_id"]),
+        "source_from_matches":source.as_ref().is_ok_and(|value| value["fromusr"]==reference["fromusr"]),
+        "source_chat_matches":source.as_ref().is_ok_and(|value| value["chatusr"]==reference["chatusr"]),
+        "reference_from_is_group":reference["fromusr"]==group,"reference_chat_is_group":reference["chatusr"]==group,
+        "reference_from_is_actor":reference["fromusr"]==actor,"reference_chat_is_actor":reference["chatusr"]==actor,
+        "actor_is_self":actor==wxid,"body_exact":xml_newlines(body)==xml_newlines(text(reference,"text")),
+        "db_image_md5_present":digest.is_some(),"reference_image_md5_present":reference_digest.is_some(),
+        "image_md5_matches":digest.as_ref().is_some_and(|digest| Some(digest)==reference_digest.as_ref())})
 }
 
 fn source_fields(group: &str, row: &Value, raw: &Value, wxid: &str) -> Result<Value> {
@@ -801,20 +937,99 @@ mod tests {
         let (mut row, mut raw) = rows(false, body);
         row["type"] = json!("图片");
         raw["local_type"] = json!(3);
-        let reference = json!({"type":3,"server_id":"42","fromusr":GROUP,"chatusr":"wxid_member","text":body});
+        let reference =
+            json!({"type":3,"server_id":"42","fromusr":GROUP,"chatusr":"wxid_member","text":body});
         assert!(matches_reference(GROUP, &row, &raw, SELF, &reference));
         assert!(prepare_source(GROUP, &row, &raw, SELF).is_err());
-        for (field, value) in [("type", json!(1)), ("server_id", json!("43")),
-            ("fromusr", json!("555555@chatroom")), ("chatusr", json!(SELF)), ("text", json!("other image"))] {
+        for (field, value) in [
+            ("type", json!(1)),
+            ("server_id", json!("43")),
+            ("fromusr", json!("555555@chatroom")),
+            ("chatusr", json!(SELF)),
+            ("text", json!("other image")),
+        ] {
             let mut changed = reference.clone();
             changed[field] = value;
-            assert!(!matches_reference(GROUP, &row, &raw, SELF, &changed), "{field}");
+            assert!(
+                !matches_reference(GROUP, &row, &raw, SELF, &changed),
+                "{field}"
+            );
         }
-        for (field, value) in [("status", json!("recalled")), ("sender_id", json!(9)),
-            ("group", json!("555555@chatroom")), ("content", json!("different body"))] {
+        for (field, value) in [
+            ("status", json!("recalled")),
+            ("sender_id", json!(9)),
+            ("group", json!("555555@chatroom")),
+            ("content", json!("different body")),
+        ] {
             let mut changed = row.clone();
             changed[field] = value;
-            assert!(!matches_reference(GROUP, &changed, &raw, SELF, &reference), "{field}");
+            assert!(
+                !matches_reference(GROUP, &changed, &raw, SELF, &reference),
+                "{field}"
+            );
+        }
+    }
+    #[test]
+    fn received_image_reference_uses_verified_media_identity_instead_of_transport_xml() {
+        let body = "<?xml version='1.0'?><msg><img md5='0123456789abcdef0123456789abcdef' cdnmidimgurl='old-download' length='123'/></msg>";
+        let (mut row, mut raw) = rows(false, body);
+        row["type"] = json!("图片");
+        raw["local_type"] = json!(3);
+        let reference = json!({"type":3,"server_id":"42","fromusr":GROUP,"chatusr":"wxid_member",
+            "text":"<msg>\n<img length='123' cdnmidimgurl='new-download' md5='0123456789ABCDEF0123456789ABCDEF'/>\n</msg>"});
+        assert!(matches_reference(GROUP, &row, &raw, SELF, &reference));
+        for body in [
+            "<msg><img md5='fedcba9876543210fedcba9876543210'/></msg>",
+            "<msg><img cdnthumbaeskey='fixture-not-a-media-identifier'/></msg>",
+            "<msg><img md5='invalid'/></msg>",
+            "<msg><wrapper><img md5='0123456789abcdef0123456789abcdef'/></wrapper></msg>",
+            "<msg><img md5='0123456789abcdef0123456789abcdef'/><img md5='0123456789abcdef0123456789abcdef'/></msg>",
+            "<!DOCTYPE msg [<!ENTITY x 'ignored'>]><msg><img md5='0123456789abcdef0123456789abcdef'/></msg>",
+        ] {
+            let mut changed = reference.clone();
+            changed["text"] = json!(body);
+            assert!(!matches_reference(GROUP, &row, &raw, SELF, &changed));
+        }
+    }
+    #[test]
+    fn received_reference_sender_fields_bind_to_the_database_actor_and_group() {
+        let body = "<msg><img md5='0123456789abcdef0123456789abcdef'/></msg>";
+        for own in [false, true] {
+            let (mut row, mut raw) = rows(own, body);
+            row["type"] = json!("图片");
+            raw["local_type"] = json!(3);
+            let actor = if own { SELF } else { "wxid_member" };
+            for from in [actor, GROUP] {
+                let reference =
+                    json!({"type":3,"server_id":"42","fromusr":from,"chatusr":actor,"text":body});
+                assert!(matches_reference(GROUP, &row, &raw, SELF, &reference));
+                for (field, value) in [
+                    ("fromusr", "wxid_third_party"),
+                    ("chatusr", "wxid_third_party"),
+                ] {
+                    let mut changed = reference.clone();
+                    changed[field] = json!(value);
+                    assert!(!matches_reference(GROUP, &row, &raw, SELF, &changed));
+                }
+            }
+        }
+    }
+    #[test]
+    fn received_image_reference_strips_only_the_verified_database_actor_envelope() {
+        let body = "<msg><img md5='0123456789abcdef0123456789abcdef'/></msg>";
+        let (mut row, mut raw) = rows(false, body);
+        row["type"] = json!("图片");
+        raw["local_type"] = json!(3);
+        let reference = json!({"type":3,"server_id":"42","fromusr":GROUP,"chatusr":"wxid_member","text":format!("wxid_member:\r\n{body}")});
+        assert!(matches_reference(GROUP, &row, &raw, SELF, &reference));
+        for content in [
+            format!("wxid_other:\n{body}"),
+            format!("prefix\nwxid_member:\n{body}"),
+            "wxid_member:\n<msg><img md5='fedcba9876543210fedcba9876543210'/></msg>".into(),
+        ] {
+            let mut changed = reference.clone();
+            changed["text"] = json!(content);
+            assert!(!matches_reference(GROUP, &row, &raw, SELF, &changed));
         }
     }
     #[test]
