@@ -15,7 +15,7 @@ Windows 每个角色只需分发一个 EXE。首次启动会校验并释放依�
 
 服务端“设置 → 开机自启”可选择登录系统后自动启动本应用和转发服务，默认关闭；Windows 和 Mac 分别使用当前用户的系统启动项，更新后会跟随新程序路径。
 
-Mac 使用自包含的 `.app`，在 Finder 中是一个应用，依赖和使用说明位于应用内部。DMG 是下载载体。当前构建采用 ad-hoc 签名，尚未完成 Developer ID 签名与 Apple 公证。
+Mac 使用自包含的 `.app`，在 Finder 中是一个应用，依赖和使用说明位于应用内部。DMG 是下载载体。本机构建若检测到 Apple Development 证书则用它签名，否则回退到 ad-hoc；发布用的 Developer ID 签名与 Apple 公证尚未完成。
 
 **当前 Mac 本机微信适配器尚未实现。Mac 客户端可以连接 Windows 微信服务端；Mac 服务端包仅包含管理 GUI、Rust 核心与 P2P 模块，不能直接转发本机 Mac 微信。** Windows 适配器限定微信 **4.1.15.13**，版本或指纹不匹配会拒绝接入。
 

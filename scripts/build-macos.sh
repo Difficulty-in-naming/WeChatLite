@@ -105,4 +105,4 @@ done
 shasum -a 256 dist/WeChatLite-*-macOS-arm64.dmg > dist/MACOS_SHA256SUMS.txt
 echo 'Output: two DMGs, each containing one self-contained .app.'
 echo 'The Mac server has no native Mac WeChat adapter. It cannot forward local Mac WeChat yet.'
-echo 'Ad-hoc signed for local testing. Developer ID signing/notarization require the owner certificate.'
+echo "Signed with: $CODESIGN_IDENTITY. Developer ID signing/notarization require the owner certificate."
