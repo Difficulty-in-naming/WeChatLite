@@ -2288,6 +2288,12 @@ class DesktopTests : public QObject
             QTRY_COMPARE(model->rowCount(), 1);
             QCOMPARE(model->rows.first()["media"].toArray().first().toObject()["_local"].toString(), path);
             QVERIFY(!paintedMissing);
+            // A restart must use the durable index, not silently pass by hashing
+            // the same legacy file on every launch.
+            ChatPreferences account;
+            account.configure(api.url(), settings.value("token").toString());
+            MediaStorage::LocalFiles persisted(account.scope());
+            QCOMPARE(persisted.find("restart-group", media), path);
             QTest::qWait(220);
             QCOMPARE(mediaRequests, 0); // Neither legacy recovery nor reopening needs an HTTP download.
         }

@@ -171,7 +171,6 @@ static QIcon svgIcon(const QString &resource)
 Window::Window(bool demo, const QString &tunnelExecutable)
     : transport(this), tunnel(this, tunnelExecutable), attachments(this), demoServer(this), tray(this)
 {
-    localFiles = std::make_shared<MediaStorage::LocalFiles>();
     connect(this, &QObject::destroyed, [generation = cacheRecoveryGeneration] { ++*generation; });
 #ifdef Q_OS_WIN
     demoServer.setCreateProcessArgumentsModifier([](QProcess::CreateProcessArguments *arguments)
@@ -189,6 +188,7 @@ Window::Window(bool demo, const QString &tunnelExecutable)
     pin = settings.value("certificatePin").toString();
     p2pSettings = QJsonDocument::fromJson(settings.value("p2p").toByteArray()).object();
     chatPreferences.configure(serverUrl, secret);
+    localFiles = std::make_shared<MediaStorage::LocalFiles>(chatPreferences.scope());
     clientId = settings.value("clientId").toString();
     if (clientId.isEmpty())
     {
