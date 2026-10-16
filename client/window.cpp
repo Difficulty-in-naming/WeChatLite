@@ -1444,6 +1444,7 @@ void Window::connectService()
     ++groupsGeneration;
     clearConversation();
     unread.clear();
+    updateUnreadTotal();
     groups->clear();
     ready = false;
     tunnel.stop();
@@ -1696,6 +1697,14 @@ void Window::activateConversation(const QString &id)
         loadGroups();
 }
 
+void Window::updateUnreadTotal()
+{
+    int total = 0;
+    for (auto count : unread)
+        total += count;
+    emit unreadTotalChanged(total);
+}
+
 void Window::sortGroups()
 {
     QList<QListWidgetItem *> ordered;
@@ -1883,6 +1892,7 @@ void Window::selectGroup(const QString &id, const QString &name)
     findChild<QWidget *>("composeArea")->setEnabled(true);
     composer->setReadOnly(false);
     unread.remove(id);
+    updateUnreadTotal();
     if (auto *item = groups->currentItem())
     {
         auto group = item->data(Qt::UserRole).toJsonObject();
@@ -2173,7 +2183,10 @@ void Window::handleEvent(const QJsonObject &event)
                 }
                 if (firstSeen && message["group"] != groupId && !message["outgoing"].toBool() &&
                     message["status"] == "received")
+                {
                     obj["unread"] = ++unread[message["group"].toString()];
+                    updateUnreadTotal();
+                }
                 item->setData(Qt::UserRole, obj);
                 break;
             }

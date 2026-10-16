@@ -49,6 +49,8 @@ class Window : public QMainWindow
   signals:
     void systemNotificationRequested(const QString &groupId, const QString &title, const QString &body);
     void notificationSoundPreviewRequested();
+    // Aggregate unread across conversations, mirrored to the Dock tile by the native notifier.
+    void unreadTotalChanged(int count);
 
   protected:
     void closeEvent(QCloseEvent *event) override;
@@ -74,6 +76,7 @@ class Window : public QMainWindow
     void sortGroups();
     bool rememberMessage(const QJsonObject &message);
     void maybeNotifyMessage(const QJsonObject &event, bool firstSeen);
+    void updateUnreadTotal();
     void selectGroup(const QString &id, const QString &name);
     void loadHistory(bool older = false, int pendingAttempt = 0);
     void loadMembers();

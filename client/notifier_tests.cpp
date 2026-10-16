@@ -113,6 +113,26 @@ class NotifierTests final : public QObject
         QCOMPARE(requested.first()[2].toString(), QString("first second thirdlast"));
     }
 
+    void unreadTotalDrivesAnObservableBadgeIntent()
+    {
+        SystemNotifier notifier;
+        QSignalSpy badge(&notifier, &SystemNotifier::badgeChanged);
+        notifier.setUnreadTotal(0); // Already zero: no redundant platform write.
+        QCOMPARE(badge.count(), 0);
+        notifier.setUnreadTotal(3);
+        QCOMPARE(badge.count(), 1);
+        QCOMPARE(badge.takeFirst()[0].toInt(), 3);
+        notifier.setUnreadTotal(3); // Unchanged totals must not re-emit or re-render.
+        QCOMPARE(badge.count(), 0);
+        notifier.setUnreadTotal(-5); // Negative input clamps to zero and clears the badge.
+        QCOMPARE(badge.count(), 1);
+        QCOMPARE(badge.takeFirst()[0].toInt(), 0);
+        notifier.setUnreadTotal(100000); // Absurd counts cannot overflow the Dock tile label.
+        QCOMPARE(badge.count(), 1);
+        QCOMPARE(badge.takeFirst()[0].toInt(), 9999);
+        QVERIFY(notifier.children().isEmpty());
+    }
+
     void nativeActivationArgumentsAreRemovedWithoutDroppingClientArguments()
     {
         QProcess fixture;

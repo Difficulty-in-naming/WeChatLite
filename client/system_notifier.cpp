@@ -93,6 +93,18 @@ void SystemNotifier::showMessage(const QString &groupId, const QString &title, c
 
 bool SystemNotifier::soundEnabled() { return QSettings().value("notificationSound", true).toBool(); }
 
+void SystemNotifier::setUnreadTotal(int count)
+{
+    Q_ASSERT(QThread::currentThread() == thread());
+    const auto bounded = qBound(0, count, 9999);
+    if (bounded == unreadTotal)
+        return;
+    unreadTotal = bounded;
+    emit badgeChanged(bounded);
+    if (!disabled() && native)
+        native->setBadge(bounded);
+}
+
 bool SystemNotifier::isActivationRelay() const { return native && native->isActivationRelay(); }
 
 #if !defined(Q_OS_WIN) && !defined(Q_OS_MACOS)
