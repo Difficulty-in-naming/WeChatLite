@@ -1906,6 +1906,7 @@ class DesktopTests : public QObject
                 {"timestamp", 1000 + i}, {"status", "received"}, {"sender", "合成媒体"}, {"media", QJsonArray{media}}});
         }
         const auto recordsSnapshot = snapshot;
+        bool failRecordLookup = false;
         api.handler = [&](QTcpSocket *socket, const QUrl &url)
         {
             const auto path = url.path();
@@ -1930,6 +1931,13 @@ class DesktopTests : public QObject
                                     {"has_more", false}, {"pending", false}};
             else if (path.startsWith("/api/messages/"))
             {
+                if (failRecordLookup)
+                {
+                    failRecordLookup = false;
+                    socket->write("HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 2\r\n\r\n{}");
+                    socket->disconnectFromHost();
+                    return;
+                }
                 for (const auto &row : recordsSnapshot)
                     if (row.toObject()["id"].toString() == path.mid(14)) value = row;
             }
@@ -2024,6 +2032,20 @@ class DesktopTests : public QObject
         QVERIFY(olderBrowser);
         QTRY_COMPARE(olderBrowser->findChild<QListView *>("historyRecords")->model()->rowCount(), 5);
         const auto oldFile = recordsSnapshot.last().toObject();
+        failRecordLookup = true;
+        olderBrowser->recordActivated(oldFile, descriptors.last().toObject());
+        const auto sourcePath = "/api/messages/" + oldFile["id"].toString();
+        QTRY_COMPARE(api.count(sourcePath), 1);
+        QVERIFY(opened.urls.isEmpty());
+        // A later quote-location request carries no intention to open an attachment.
+        QTRY_VERIFY(([&]
+        {
+            view->locateRequested({{"id", oldFile["id"]}, {"group", "media-A"}});
+            return api.count(sourcePath) == 2;
+        })());
+        QTRY_COMPARE(view->itemDelegate()->property("locatedId").toString(), oldFile["id"].toString());
+        QVERIFY(opened.urls.isEmpty());
+        QCOMPARE(api.count("/api/media/" + descriptors.last().toObject()["id"].toString()), 1);
         olderBrowser->recordActivated(oldFile, descriptors.last().toObject());
         QTRY_COMPARE(opened.urls.size(), 1);
         QCOMPARE(opened.urls.first().toLocalFile(), retained.value(descriptors.last().toObject()["id"].toString()));

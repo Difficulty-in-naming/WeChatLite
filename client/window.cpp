@@ -1499,18 +1499,28 @@ void Window::playLocatedRecord(const QString &id)
     if (pendingRecordId != id || pendingRecordMedia.isEmpty())
         return;
     for (const auto &message : model->rows)
-        if (message["id"] == id && message["group"] == groupId && message["status"] != "recalled")
-            for (const auto &value : message["media"].toArray())
-            {
-                const auto media = value.toObject();
-                if (sameMediaDescriptor(media, pendingRecordMedia))
+        if (message["id"] == id && message["group"] == groupId)
+        {
+            if (message["status"] != "recalled")
+                for (const auto &value : message["media"].toArray())
                 {
-                    pendingRecordId.clear();
-                    pendingRecordMedia = {};
-                    fetchMedia(media);
-                    return;
+                    const auto media = value.toObject();
+                    if (sameMediaDescriptor(media, pendingRecordMedia))
+                    {
+                        clearPendingRecord(id);
+                        fetchMedia(media);
+                        return;
+                    }
                 }
-            }
+            clearPendingRecord(id); // The source arrived but no longer contains this attachment.
+            return;
+        }
+}
+void Window::clearPendingRecord(const QString &id)
+{
+    if (pendingRecordId != id) return;
+    pendingRecordId.clear();
+    pendingRecordMedia = {};
 }
 
 void Window::activateConversation(const QString &id)
@@ -2249,6 +2259,7 @@ void Window::locateQuote(const QJsonObject &quote)
         return;
     if (quote["unavailable"].toBool())
     {
+        clearPendingRecord(id);
         notify("原消息已撤回或不可用，无法定位", true);
         return;
     }
@@ -2256,7 +2267,10 @@ void Window::locateQuote(const QJsonObject &quote)
         if (message["id"] == id)
         {
             if (message["status"] == "recalled")
+            {
+                clearPendingRecord(id);
                 notify("原消息已撤回，无法定位", true);
+            }
             else
                 messages->locateMessage(id);
             return;
@@ -2280,6 +2294,7 @@ void Window::locateQuote(const QJsonObject &quote)
                 unavailableOriginals.contains(id))
             {
                 locatingId.clear();
+                clearPendingRecord(id);
                 notify(error.isEmpty() ? "原消息已撤回或不可用，无法定位" : error, true);
                 return;
             }
@@ -2297,11 +2312,13 @@ void Window::locateQuote(const QJsonObject &quote)
                     locatingId.clear();
                     if (unavailableOriginals.contains(id))
                     {
+                        clearPendingRecord(id);
                         notify("原消息已撤回，无法定位", true);
                         return;
                     }
                     if (!pageError.isEmpty())
                     {
+                        clearPendingRecord(id);
                         notify(pageError, true);
                         return;
                     }

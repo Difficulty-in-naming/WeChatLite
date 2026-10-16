@@ -65,6 +65,7 @@ class Window : public QMainWindow
     void invalidateAuxiliaryWindows();
     void activateHistoryRecord(const QJsonObject &message, const QJsonObject &media);
     void playLocatedRecord(const QString &messageId);
+    void clearPendingRecord(const QString &messageId);
     void loadGroups();
     void sortGroups();
     bool rememberMessage(const QJsonObject &message);
