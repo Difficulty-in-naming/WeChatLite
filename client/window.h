@@ -12,6 +12,9 @@
 #include <QQueue>
 #include <QSystemTrayIcon>
 #include <QTimer>
+#include <memory>
+
+namespace MediaStorage { class LocalFiles; }
 
 class Composer;
 class MessageModel;
@@ -82,6 +85,9 @@ class Window : public QMainWindow
     void updateNativeFrame();
     void refreshThemeIcons();
     void pruneMediaCache(qint64 limit, std::function<void(const QString &)> callback = {});
+    void updateCachePins();
+    QJsonArray hydrateMessages(const QJsonArray &snapshot) const;
+    bool hasCurrentMedia(const QJsonObject &media) const;
     void updateComposeHeight();
     void send();
     void uploadNext(int index, quint64 generation, const QString &targetGroup);
@@ -141,7 +147,7 @@ class Window : public QMainWindow
     QString groupId, serverUrl, secret, downloadRoot, nickname, clientId, pin, pendingId, demoFailure;
     QString lastError;
     QJsonArray memberCache;
-    QHash<QString, QString> downloaded;
+    std::shared_ptr<MediaStorage::LocalFiles> localFiles;
     QHash<QString, int> unread;
     QHash<QString, QJsonObject> historyUpdates;
     QSet<QString> downloading, openRequests, saveRequests;

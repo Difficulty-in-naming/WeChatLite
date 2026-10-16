@@ -12,7 +12,9 @@
 #include "voice_player.h"
 #include "window.h"
 #include <QApplication>
+#include <QBuffer>
 #include <QClipboard>
+#include <QCryptographicHash>
 #include <QComboBox>
 #include <QCheckBox>
 #include <QDataStream>
@@ -33,11 +35,13 @@
 #include <QScopeGuard>
 #include <QScreen>
 #include <QScrollBar>
+#include <QSemaphore>
 #include <QSettings>
 #include <QStandardPaths>
 #include <QTcpServer>
 #include <QTcpSocket>
 #include <QTemporaryDir>
+#include <QThreadPool>
 #include <QToolButton>
 #include <QTextBrowser>
 #include <QTextBlock>
@@ -1820,6 +1824,385 @@ class DesktopTests : public QObject
         QCOMPARE(recalls, 1);
         transport->disconnectService();
     }
+    void verifiedMediaIndexRejectsStaleDescriptorsAndUntrustedPaths()
+    {
+        QTemporaryDir directory;
+        const auto path = directory.filePath("verified.bin");
+        QFile file(path);
+        QVERIFY(file.open(QIODevice::WriteOnly));
+        QCOMPARE(file.write("verified fixture"), 16);
+        file.close();
+        const QJsonObject media{{"id", "asset"}, {"kind", "file"}, {"size", 16},
+            {"sha256", QString::fromLatin1(QCryptographicHash::hash("verified fixture", QCryptographicHash::Sha256).toHex())}};
+        MediaStorage::LocalFiles index;
+        index.remember("A", media, path);
+        QCOMPARE(index.find("A", media), path);
+        QVERIFY(index.find("B", media).isEmpty());
+        for (const auto &field : {"id", "sha256", "kind", "size"})
+        {
+            auto changed = media;
+            changed[field] = QString::fromLatin1(field) == "size" ? QJsonValue(17) : QJsonValue("changed");
+            QVERIFY(index.find("A", changed).isEmpty());
+        }
+        auto untrusted = media;
+        untrusted["_local"] = directory.filePath("arbitrary-server-path");
+        auto message = QJsonObject{{"id", "row"}, {"group", "B"}, {"media", QJsonArray{untrusted}}};
+        QVERIFY(index.hydrate(message)["media"].toArray().first().toObject()["_local"].toString().isEmpty());
+        message["group"] = "A";
+        QCOMPARE(index.hydrate(message)["media"].toArray().first().toObject()["_local"].toString(), path);
+        message["status"] = "recalled";
+        QVERIFY(index.hydrate(message)["media"].toArray().isEmpty());
+        index.discard({directory.filePath("another.bin")});
+        QCOMPARE(index.find("A", media), path);
+        for (int i = 0; i < 1024; ++i)
+        {
+            auto distinct = media;
+            distinct["id"] = "bounded-" + QString::number(i);
+            index.remember("A", distinct, path);
+        }
+        QVERIFY(index.find("A", media).isEmpty()); // Bounded LRU, without creating thousands of files.
+        index.remember("A", media, path);
+        QVERIFY(file.open(QIODevice::Append));
+        QCOMPARE(file.write("changed"), 7);
+        file.close();
+        QVERIFY(index.find("A", media).isEmpty());
+    }
+    void retainedMediaSurvivesSnapshotsConversationChangesAndRecordReopening()
+    {
+        QSettings settings;
+        const auto previousUrl = settings.value("serverUrl"), previousToken = settings.value("token");
+        const auto restore = qScopeGuard([&]
+        {
+            if (previousUrl.isValid()) settings.setValue("serverUrl", previousUrl); else settings.remove("serverUrl");
+            if (previousToken.isValid()) settings.setValue("token", previousToken); else settings.remove("token");
+        });
+        settings.remove("serverUrl");
+        settings.remove("token");
+        RecordsApiFixture api;
+        QVERIFY(api.server.listen(QHostAddress::LocalHost, 0));
+        QHash<QString, QByteArray> contents;
+        QByteArray png;
+        QBuffer buffer(&png);
+        QVERIFY(buffer.open(QIODevice::WriteOnly));
+        QImage image(80, 35, QImage::Format_RGB32);
+        image.fill(Qt::green);
+        QVERIFY(image.save(&buffer, "PNG"));
+        const auto gif = QByteArray::fromBase64("R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7");
+        QJsonArray snapshot;
+        const QString unique = QUuid::createUuid().toString(QUuid::WithoutBraces);
+        const QStringList kinds{"image", "gif", "video", "voice", "file"};
+        QJsonArray descriptors;
+        for (int i = 0; i < kinds.size(); ++i)
+        {
+            const auto kind = kinds[i], id = unique + '-' + kind;
+            contents[id] = kind == "image" ? png : kind == "gif" ? gif : QByteArray("synthetic media ") + kind.toUtf8();
+            const auto suffix = kind == "image" ? "png" : kind == "gif" ? "gif" : kind == "voice" ? "wav" :
+                                kind == "video" ? "mp4" : "txt";
+            const QJsonObject media{{"id", id}, {"kind", kind}, {"name", id + '.' + suffix},
+                {"size", contents[id].size()},
+                {"sha256", QString::fromLatin1(QCryptographicHash::hash(contents[id], QCryptographicHash::Sha256).toHex())}};
+            descriptors.append(media);
+            snapshot.append(QJsonObject{{"id", "message-" + id}, {"group", "media-A"}, {"seq", i + 1},
+                {"timestamp", 1000 + i}, {"status", "received"}, {"sender", "合成媒体"}, {"media", QJsonArray{media}}});
+        }
+        const auto recordsSnapshot = snapshot;
+        api.handler = [&](QTcpSocket *socket, const QUrl &url)
+        {
+            const auto path = url.path();
+            if (path.startsWith("/api/media/"))
+            {
+                const auto body = contents.value(path.mid(11));
+                socket->write("HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: application/octet-stream\r\nContent-Length: " +
+                              QByteArray::number(body.size()) + "\r\n\r\n" + body);
+                socket->disconnectFromHost();
+                return;
+            }
+            QJsonValue value(QJsonObject{});
+            if (path == "/api/status")
+                value = QJsonObject{{"permissions", QJsonObject{{"can_send", true}, {"can_download", true}}}};
+            else if (path == "/api/groups")
+                value = QJsonArray{QJsonObject{{"id", "media-A"}, {"name", "合成媒体 A"}},
+                                   QJsonObject{{"id", "media-B"}, {"name", "合成媒体 B"}}};
+            else if (path.endsWith("/members")) value = QJsonArray{};
+            else if (path == "/api/history" || path == "/api/records")
+                value = QJsonObject{{"messages", QUrlQuery(url).queryItemValue("group") == "media-A"
+                        ? (path == "/api/records" ? recordsSnapshot : snapshot) : QJsonArray{}},
+                                    {"has_more", false}, {"pending", false}};
+            else if (path.startsWith("/api/messages/"))
+            {
+                for (const auto &row : recordsSnapshot)
+                    if (row.toObject()["id"].toString() == path.mid(14)) value = row;
+            }
+            else if (path == "/api/messages") value = QJsonArray{};
+            RecordsApiFixture::respond(socket, value);
+        };
+        Window isolated(false);
+        isolated.show();
+        auto *transport = isolated.findChild<Transport *>();
+        auto *model = isolated.findChild<MessageModel *>();
+        auto *view = isolated.findChild<MessageView *>();
+        transport->configure(api.url(), "offline-records-client");
+        transport->connectionChanged(true);
+        QTRY_COMPARE(model->rowCount(), 5);
+        for (int i = 2; i < descriptors.size(); ++i)
+            view->mediaClicked(descriptors[i].toObject(), true); // Save fixtures; never open external apps or play audio.
+        const auto paths = [&]
+        {
+            QHash<QString, QString> result;
+            for (const auto &row : model->rows)
+                for (const auto &entry : row["media"].toArray())
+                {
+                    const auto media = entry.toObject();
+                    const auto local = media["_local"].toString();
+                    if (!local.isEmpty() && QFileInfo(local).isFile()) result[media["id"].toString()] = local;
+                }
+            return result;
+        };
+        QTRY_COMPARE_WITH_TIMEOUT(paths().size(), 5, 6000);
+        const auto retained = paths();
+        int blankSnapshots = 0;
+        connect(model, &QAbstractItemModel::modelReset, &isolated, [&]
+        {
+            if (model->rowCount() == 5 && model->rows.first()["group"] == "media-A" && paths().size() != 5)
+                ++blankSnapshots;
+        });
+        const auto reads = api.count("/api/history");
+        transport->event({{"type", "reset"}});
+        QTRY_COMPARE(api.count("/api/history"), reads + 1);
+        QTest::qWait(40);
+        QCOMPARE(paths(), retained);
+        QCOMPARE(blankSnapshots, 0);
+        for (const auto &entry : snapshot)
+            transport->event({{"type", "message"}, {"message", entry}});
+        QCOMPARE(paths(), retained);
+        isolated.activateConversation("media-B");
+        QTRY_COMPARE(model->rowCount(), 0);
+        isolated.activateConversation("media-A");
+        QTRY_COMPARE(model->rowCount(), 5);
+        QCOMPARE(paths(), retained);
+        QCOMPARE(blankSnapshots, 0);
+        auto *button = isolated.findChild<QPushButton *>("historyButton");
+        for (int opening = 0; opening < 2; ++opening)
+        {
+            button->click();
+            QPointer<HistoryBrowser> browser = isolated.findChild<HistoryBrowser *>();
+            QVERIFY(browser);
+            auto *records = browser->findChild<QListView *>("historyRecords");
+            QTRY_COMPARE(records->model()->rowCount(), 5);
+            QTest::qWait(240);
+            for (int row = 0; row < 5; ++row)
+            {
+                const auto item = records->model()->index(row, 0).data(Qt::UserRole).toJsonObject()["media"].toArray().first().toObject();
+                QCOMPARE(item["_local"].toString(), retained.value(item["id"].toString()));
+            }
+            if (!opening)
+            {
+                browser->findChild<QLineEdit *>("historySearch")->setText("same-page");
+                QTRY_COMPARE(api.count("/api/records"), 2);
+                QTest::qWait(220);
+            }
+            browser->close();
+            QTRY_VERIFY(!browser);
+        }
+        for (const auto &entry : descriptors)
+            QCOMPARE(api.count("/api/media/" + entry.toObject()["id"].toString()), 1);
+        QVERIFY(api.clientCredentialOnly);
+
+        // Opening a retained attachment from an older records page must wait for
+        // its authorized source/context, even when the file is already local.
+        FileOpenHandler opened;
+        QDesktopServices::setUrlHandler("file", &opened, "open");
+        const auto resetHandler = qScopeGuard([] { QDesktopServices::unsetUrlHandler("file"); });
+        const auto initialSnapshot = snapshot;
+        snapshot = QJsonArray{QJsonObject{{"id", "latest-without-media"}, {"group", "media-A"},
+            {"timestamp", 2000}, {"text", "最新消息"}}};
+        transport->event({{"type", "reset"}});
+        QTRY_COMPARE(model->rowCount(), 1);
+        QCOMPARE(model->rows.first()["id"].toString(), QString("latest-without-media"));
+        button->click();
+        QPointer<HistoryBrowser> olderBrowser = isolated.findChild<HistoryBrowser *>();
+        QVERIFY(olderBrowser);
+        QTRY_COMPARE(olderBrowser->findChild<QListView *>("historyRecords")->model()->rowCount(), 5);
+        const auto oldFile = recordsSnapshot.last().toObject();
+        olderBrowser->recordActivated(oldFile, descriptors.last().toObject());
+        QTRY_COMPARE(opened.urls.size(), 1);
+        QCOMPARE(opened.urls.first().toLocalFile(), retained.value(descriptors.last().toObject()["id"].toString()));
+        QCOMPARE(api.count("/api/media/" + descriptors.last().toObject()["id"].toString()), 1);
+        olderBrowser->close();
+        QTRY_VERIFY(!olderBrowser);
+
+        // Pause the real cleanup worker after its initial visible snapshot. A cached
+        // image that scrolls into view while it is queued must remain pinned.
+        QJsonArray expanded{initialSnapshot.first()};
+        for (int i = 0; i < 40; ++i)
+            expanded.append(QJsonObject{{"id", "spacer-" + QString::number(i)}, {"group", "media-A"},
+                {"timestamp", 1010 + i}, {"text", "缓存清理期间仍能自由阅读"}});
+        for (int i = 1; i < initialSnapshot.size(); ++i)
+        {
+            auto row = initialSnapshot[i].toObject();
+            row["timestamp"] = 1100 + i;
+            expanded.append(row);
+        }
+        snapshot = expanded;
+        transport->event({{"type", "reset"}});
+        QTRY_COMPARE(model->rowCount(), 45);
+        view->scrollTo(model->index(41), QAbstractItemView::PositionAtTop);
+        QTRY_VERIFY(!view->visualRect(model->index(0)).intersects(view->viewport()->rect()));
+        isolated.showPreferences();
+        QPointer<PreferencesDialog> preferences = isolated.findChild<PreferencesDialog *>();
+        QVERIFY(preferences);
+        QTRY_VERIFY_WITH_TIMEOUT(!preferences->findChild<QLabel *>("preferencesUsageCache")->text().contains("正在统计"), 5000);
+        auto *pool = QThreadPool::globalInstance();
+        const auto previousThreads = pool->maxThreadCount();
+        QVERIFY(pool->waitForDone(5000));
+        pool->setMaxThreadCount(1);
+        QSemaphore entered, release;
+        pool->start([&] { entered.release(); release.acquire(); });
+        const auto unblock = qScopeGuard([&]
+        {
+            release.release();
+            pool->waitForDone(5000);
+            pool->setMaxThreadCount(previousThreads);
+        });
+        QVERIFY(entered.tryAcquire(1, 5000));
+        preferences->findChild<QPushButton *>("preferencesClearCache")->click();
+        QVERIFY(!preferences->findChild<QPushButton *>("preferencesClearCache")->isEnabled());
+        preferences->close();
+        view->scrollTo(model->index(0), QAbstractItemView::PositionAtTop);
+        emit view->viewportChanged();
+        QVERIFY(view->visualRect(model->index(0)).intersects(view->viewport()->rect()));
+        release.release();
+        QVERIFY(pool->waitForDone(5000));
+        QTest::qWait(260);
+        const auto imageId = descriptors.first().toObject()["id"].toString();
+        QVERIFY(QFileInfo::exists(retained.value(imageId)));
+        QCOMPARE(paths().value(imageId), retained.value(imageId));
+        QCOMPARE(api.count("/api/media/" + imageId), 1);
+        const auto downloadedFile = descriptors.last().toObject()["id"].toString();
+        QVERIFY(QFileInfo::exists(retained.value(downloadedFile))); // User downloads are outside the cache.
+        transport->disconnectService();
+    }
+    void lateDownloadsAndCopiesCannotRestoreChangedOrRecalledAttachments()
+    {
+        QSettings settings;
+        const auto previousUrl = settings.value("serverUrl"), previousToken = settings.value("token");
+        const auto restore = qScopeGuard([&]
+        {
+            if (previousUrl.isValid()) settings.setValue("serverUrl", previousUrl); else settings.remove("serverUrl");
+            if (previousToken.isValid()) settings.setValue("token", previousToken); else settings.remove("token");
+        });
+        settings.remove("serverUrl"); settings.remove("token");
+        FileOpenHandler opened;
+        QDesktopServices::setUrlHandler("file", &opened, "open");
+        const auto resetHandler = qScopeGuard([] { QDesktopServices::unsetUrlHandler("file"); });
+        RecordsApiFixture api;
+        QVERIFY(api.server.listen(QHostAddress::LocalHost, 0));
+        QByteArray png;
+        QBuffer buffer(&png);
+        QVERIFY(buffer.open(QIODevice::WriteOnly));
+        QImage pixels(40, 30, QImage::Format_RGB32);
+        pixels.fill(Qt::green);
+        QVERIFY(pixels.save(&buffer, "PNG"));
+        const auto unique = QUuid::createUuid().toString(QUuid::WithoutBraces);
+        QHash<QString, QByteArray> contents;
+        QHash<QString, QPointer<QTcpSocket>> held;
+        QJsonArray rows, mediaList;
+        for (int i = 0; i < 3; ++i)
+        {
+            const auto id = unique + '-' + QString::number(i);
+            contents[id] = i == 2 ? png : QByteArray("late completion fixture ") + QByteArray::number(i);
+            QJsonObject media{{"id", id}, {"name", id + (i == 2 ? ".png" : ".txt")},
+                {"kind", i == 2 ? "image" : "file"}, {"size", contents[id].size()},
+                {"sha256", QString::fromLatin1(QCryptographicHash::hash(contents[id], QCryptographicHash::Sha256).toHex())}};
+            mediaList.append(media);
+            rows.append(QJsonObject{{"id", "late-row-" + QString::number(i)}, {"group", "late"},
+                {"timestamp", 1000 + i}, {"status", "received"}, {"media", QJsonArray{media}}});
+        }
+        const auto complete = [&](QTcpSocket *socket, const QByteArray &body)
+        {
+            if (!socket) return;
+            socket->write("HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: " +
+                QByteArray::number(body.size()) + "\r\n\r\n" + body);
+            socket->disconnectFromHost();
+        };
+        api.handler = [&](QTcpSocket *socket, const QUrl &url)
+        {
+            const auto path = url.path();
+            if (path.startsWith("/api/media/"))
+            {
+                const auto id = path.mid(11);
+                if (id == mediaList[2].toObject()["id"].toString()) complete(socket, contents[id]);
+                else held[id] = socket;
+                return;
+            }
+            QJsonValue value(QJsonObject{});
+            if (path == "/api/groups") value = QJsonArray{QJsonObject{{"id", "late"}, {"name", "合成延迟附件"}}};
+            else if (path == "/api/status") value = QJsonObject{{"permissions", QJsonObject{{"can_download", true}, {"can_send", true}}}};
+            else if (path == "/api/history") value = QJsonObject{{"messages", rows}, {"has_more", false}, {"pending", false}};
+            else if (path.endsWith("/members")) value = QJsonArray{};
+            RecordsApiFixture::respond(socket, value);
+        };
+        Window isolated(false);
+        isolated.show();
+        auto *transport = isolated.findChild<Transport *>();
+        auto *model = isolated.findChild<MessageModel *>();
+        auto *view = isolated.findChild<MessageView *>();
+        transport->configure(api.url(), "offline-records-client");
+        transport->connectionChanged(true);
+        QTRY_COMPARE(model->rowCount(), 3);
+        const auto local = [&](int row)
+        {
+            const auto items = model->rows[row]["media"].toArray();
+            return items.isEmpty() ? QString() : items.first().toObject()["_local"].toString();
+        };
+        QTRY_VERIFY(!local(2).isEmpty());
+        for (int i = 0; i < 2; ++i)
+        {
+            const auto media = mediaList[i].toObject();
+            const auto id = media["id"].toString();
+            view->mediaClicked(media, false);
+            QTRY_VERIFY(held.value(id));
+            auto changed = rows[i].toObject();
+            if (i == 0)
+            {
+                auto other = media;
+                other["sha256"] = QString(64, 'b');
+                other["size"] = media["size"].toInteger() + 1;
+                changed["media"] = QJsonArray{other};
+            }
+            else { changed["status"] = "recalled"; changed["media"] = QJsonArray{}; }
+            transport->event({{"type", "message"}, {"message", changed}});
+            complete(held.value(id), contents[id]);
+            QTRY_VERIFY(!transport->hasActiveDownloads());
+            QTest::qWait(20);
+            QVERIFY(local(i).isEmpty());
+            QVERIFY(opened.urls.isEmpty());
+            QCOMPARE(api.count("/api/media/" + id), 1);
+        }
+        auto *pool = QThreadPool::globalInstance();
+        QVERIFY(pool->waitForDone(5000));
+        const auto previousThreads = pool->maxThreadCount();
+        pool->setMaxThreadCount(1);
+        QSemaphore entered, release;
+        pool->start([&] { entered.release(); release.acquire(); });
+        const auto unblock = qScopeGuard([&]
+        {
+            release.release(); pool->waitForDone(5000); pool->setMaxThreadCount(previousThreads);
+        });
+        QVERIFY(entered.tryAcquire(1, 5000));
+        view->mediaClicked(mediaList[2].toObject(), false); // Queue the real cache-to-download copy.
+        auto recalled = rows[2].toObject();
+        recalled["status"] = "recalled"; recalled["media"] = QJsonArray{};
+        transport->event({{"type", "message"}, {"message", recalled}});
+        release.release();
+        QVERIFY(pool->waitForDone(5000));
+        QTest::qWait(40);
+        QVERIFY(model->rows[2]["media"].toArray().isEmpty());
+        QVERIFY(opened.urls.isEmpty());
+        QCOMPARE(api.count("/api/media/" + mediaList[2].toObject()["id"].toString()), 1);
+        QVERIFY(api.clientCredentialOnly);
+        transport->disconnectService();
+    }
     void downloadedMediaUsesSystemApplicationsWithoutPreviewDialogs()
     {
         FileOpenHandler handler;
@@ -1854,6 +2237,10 @@ class DesktopTests : public QObject
             QVERIFY2(failure.isEmpty(), qPrintable(failure));
             QVERIFY(!media["id"].toString().isEmpty());
             media["kind"] = kinds[i];
+            transport->event({{"type", "message"}, {"message", QJsonObject{
+                {"id", "system-open-" + QString::number(i)}, {"group", group},
+                {"timestamp", QDateTime::currentMSecsSinceEpoch()}, {"status", "received"},
+                {"media", QJsonArray{media}}}}});
             if (i == 0)
             {
                 // Saving and automatic thumbnail downloads must never launch an app.

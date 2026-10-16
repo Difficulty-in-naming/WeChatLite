@@ -7,6 +7,7 @@
 #include <QBuffer>
 #include <QClipboard>
 #include <QContextMenuEvent>
+#include <QCryptographicHash>
 #include <QDateTime>
 #include <QDir>
 #include <QDragEnterEvent>
@@ -263,6 +264,137 @@ class ClientTests : public QObject
         QCOMPARE(chatAvatar(member, 36).toImage(), lightAvatar);
         QCOMPARE(render(), lightImage);
         delete menu;
+    }
+    void snapshotRefreshKeepsVerifiedLocalMedia_data()
+    {
+        QTest::addColumn<QString>("kind");
+        for (const auto &kind : {"image", "gif", "video", "voice", "file"})
+            QTest::newRow(kind) << QString::fromLatin1(kind);
+    }
+    void snapshotRefreshKeepsVerifiedLocalMedia()
+    {
+        QFETCH(QString, kind);
+        QTemporaryDir directory;
+        const auto path = directory.filePath("retained.png");
+        QImage pixels(35, 80, QImage::Format_RGB32);
+        pixels.fill(Qt::green);
+        QVERIFY(pixels.save(path));
+        QFile file(path);
+        QVERIFY(file.open(QIODevice::ReadOnly));
+        const auto bytes = file.readAll();
+        const QJsonObject media{{"id", "retained-media"}, {"kind", kind}, {"name", "retained.png"},
+            {"size", bytes.size()}, {"sha256", QString::fromLatin1(QCryptographicHash::hash(bytes, QCryptographicHash::Sha256).toHex())}};
+        const QJsonObject message{{"id", "retained-row"}, {"group", "A"}, {"media", QJsonArray{media}}};
+        MessageModel model;
+        model.replace({message});
+        model.setLocalMedia("retained-media", path);
+        QString pathAtReset;
+        connect(&model, &QAbstractItemModel::modelReset, &model, [&]
+            { pathAtReset = model.rows.first()["media"].toArray().first().toObject()["_local"].toString(); });
+        model.replace({message}); // A real HTTP snapshot contains no client-local path.
+        QCOMPARE(pathAtReset, path);
+        QCOMPARE(model.rows.first()["media"].toArray().first().toObject()["_local"].toString(), path);
+        QVERIFY(QFileInfo::exists(path));
+    }
+    void staleMediaCompletionsCannotReattachChangedOrRecalledContent()
+    {
+        QTemporaryDir directory;
+        const auto path = directory.filePath("verified.png");
+        QImage pixels(35, 80, QImage::Format_RGB32);
+        pixels.fill(Qt::green);
+        QVERIFY(pixels.save(path));
+        const QJsonObject media{{"id", "asset"}, {"kind", "image"}, {"size", QFileInfo(path).size()}, {"sha256", QString(64, 'a')}};
+        const QJsonObject original{{"id", "row"}, {"group", "A"}, {"media", QJsonArray{media}}};
+        MessageModel model;
+        for (const auto &field : {"sha256", "size", "kind"})
+        {
+            model.replace({original});
+            model.setLocalMedia("asset", path, media);
+            auto changed = media;
+            changed[field] = QString::fromLatin1(field) == "size" ? QJsonValue(QFileInfo(path).size() + 1)
+                : QJsonValue(QString::fromLatin1(field) == "kind" ? "gif" : QString(64, 'b'));
+            auto updated = original;
+            updated["media"] = QJsonArray{changed};
+            model.upsert(updated);
+            model.setLocalMedia("asset", path, media); // The old HTTP completion arrives last.
+            QVERIFY(model.rows.first()["media"].toArray().first().toObject()["_local"].toString().isEmpty());
+        }
+        model.replace({original});
+        auto recalled = original;
+        recalled["status"] = "recalled";
+        model.upsert(recalled);
+        model.setLocalMedia("asset", path, media);
+        QVERIFY(model.rows.first()["media"].toArray().isEmpty());
+    }
+    void reusedImageAndGifPathsInvalidateContentCaches()
+    {
+        QTemporaryDir directory;
+        const auto path = directory.filePath("same-name.png");
+        QImage pixels(35, 80, QImage::Format_RGB32);
+        pixels.fill(Qt::green);
+        QVERIFY(pixels.save(path));
+        MessageModel model;
+        QJsonObject media{{"id", "first-image"}, {"kind", "image"}, {"_local", path}, {"sha256", QString(64, 'a')}};
+        QJsonObject row{{"id", "row"}, {"media", QJsonArray{media}}};
+        model.replace({row});
+        MessageDelegate delegate;
+        QStyleOptionViewItem option;
+        option.rect = QRect(0, 0, 520, 260);
+        option.font = QApplication::font();
+        const auto first = MessageDelegate::bubbleRect(option, model.index(0));
+        auto render = [&]
+        {
+            QImage image(option.rect.size(), QImage::Format_RGB32);
+            image.fill(Qt::white);
+            QPainter painter(&image);
+            delegate.paint(&painter, option, model.index(0));
+            return image;
+        };
+        QCOMPARE(render().pixelColor(first.topLeft() + QPoint(10, 10)), QColor(Qt::green));
+        pixels = QImage(80, 35, QImage::Format_RGB32);
+        pixels.fill(Qt::blue);
+        QVERIFY(pixels.save(path));
+        media["id"] = "second-image";
+        media["sha256"] = QString(64, 'b');
+        row["media"] = QJsonArray{media};
+        model.upsert(row);
+        const auto second = MessageDelegate::bubbleRect(option, model.index(0));
+        QVERIFY(second.height() < first.height());
+        QCOMPARE(render().pixelColor(second.topLeft() + QPoint(10, 10)), QColor(Qt::blue));
+
+        const auto gifPath = directory.filePath("same-name.gif");
+        auto bytes = animatedGif();
+        QFile gif(gifPath);
+        QVERIFY(gif.open(QIODevice::WriteOnly));
+        QCOMPARE(gif.write(bytes), bytes.size());
+        gif.close();
+        auto message = gifMessage(1, gifPath);
+        media = message["media"].toArray().first().toObject();
+        media["sha256"] = QString::fromLatin1(QCryptographicHash::hash(bytes, QCryptographicHash::Sha256).toHex());
+        message["media"] = QJsonArray{media};
+        model.replace({message});
+        MessageView view;
+        view.resize(520, 260);
+        view.setModel(&model);
+        view.show();
+        QTRY_COMPARE(view.findChildren<QMovie *>("visibleChatGif").size(), 1);
+        QPointer<QMovie> old = view.findChild<QMovie *>("visibleChatGif");
+        model.replace({message});
+        QTest::qWait(20);
+        QCOMPARE(view.findChild<QMovie *>("visibleChatGif"), old.data());
+        bytes[13] = 0; bytes[14] = 0; bytes[15] = char(255); // First frame changes from red to blue.
+        QVERIFY(gif.open(QIODevice::WriteOnly | QIODevice::Truncate));
+        QCOMPARE(gif.write(bytes), bytes.size());
+        gif.close();
+        media["sha256"] = QString::fromLatin1(QCryptographicHash::hash(bytes, QCryptographicHash::Sha256).toHex());
+        message["media"] = QJsonArray{media};
+        model.upsert(message);
+        QTRY_VERIFY(!old);
+        QTRY_COMPARE(view.findChildren<QMovie *>("visibleChatGif").size(), 1);
+        auto *movie = view.findChild<QMovie *>("visibleChatGif");
+        movie->stop();
+        QVERIFY(movie->jumpToFrame(0));
+        QCOMPARE(movie->currentPixmap().toImage().pixelColor(0, 0), QColor(Qt::blue));
     }
     void delayedMediaLayoutsKeepTheReadingAnchor_data()
     {

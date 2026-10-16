@@ -72,14 +72,15 @@ QSize thumbnailSize(const QJsonObject &media)
     if ((kind != "image" && kind != "gif") || local.isEmpty())
         return {};
     static QCache<QString, QSize> sizes(256);
-    if (const auto *size = sizes.object(local))
+    const auto key = local + ':' + media["id"].toString() + ':' + media["sha256"].toString();
+    if (const auto *size = sizes.object(key))
         return *size;
     QImageReader reader(local);
     const auto size = reader.size();
     if (!size.isValid() || qint64(size.width()) * size.height() > 12 * 1024 * 1024)
         return {};
     const auto scaled = size.scaled(kind == "gif" ? QSize(134, 134) : QSize(240, 180), Qt::KeepAspectRatio);
-    sizes.insert(local, new QSize(scaled));
+    sizes.insert(key, new QSize(scaled));
     return scaled;
 }
 
@@ -149,14 +150,6 @@ class RecordsModel final : public QAbstractListModel
             const auto id = row["id"].toString();
             if (row["group"] != group || id.isEmpty() || id.size() > 512)
                 continue;
-            auto media = row["media"].toArray();
-            for (int i = 0; i < media.size(); ++i)
-            {
-                auto item = media[i].toObject();
-                item.remove("_local");
-                media[i] = item;
-            }
-            row["media"] = media;
             bool duplicate = false;
             for (const auto &existing : rows)
                 duplicate |= existing["id"] == id;
@@ -178,14 +171,15 @@ class RecordsModel final : public QAbstractListModel
             endRemoveRows();
         }
     }
-    void localMedia(const QString &id, const QString &path)
+    void localMedia(const QString &id, const QString &path, const QJsonObject &descriptor = {})
     {
         for (int row = 0; row < rows.size(); ++row)
         {
             auto media = rows[row]["media"].toArray();
             bool changed = false;
             for (int i = 0; i < media.size(); ++i)
-                if (media[i].toObject()["id"] == id)
+                if (media[i].toObject()["id"] == id && media[i].toObject()["_local"].toString() != path &&
+                    (descriptor.isEmpty() || sameMediaDescriptor(media[i].toObject(), descriptor)))
                 {
                     auto item = media[i].toObject();
                     item["_local"] = path;
@@ -204,20 +198,7 @@ class RecordsModel final : public QAbstractListModel
         for (int row = 0; row < rows.size(); ++row)
             if (rows[row]["id"] == message["id"])
             {
-                auto updated = message;
-                auto media = updated["media"].toArray();
-                const auto previous = rows[row]["media"].toArray();
-                for (int i = 0; i < media.size(); ++i)
-                {
-                    auto item = media[i].toObject();
-                    item.remove("_local");
-                    for (const auto &old : previous)
-                        if (old.toObject()["id"] == item["id"] && !old.toObject()["_local"].toString().isEmpty())
-                            item["_local"] = old.toObject()["_local"];
-                    media[i] = item;
-                }
-                updated["media"] = media;
-                rows[row] = updated;
+                rows[row] = message; // The browser hydrates trusted local state before publishing it.
                 emit dataChanged(index(row), index(row));
                 return;
             }
@@ -268,7 +249,8 @@ class RecordDelegate final : public QStyledItemDelegate
             if (!thumbnailSize(item).isEmpty())
             {
                 const auto path = item["_local"].toString();
-                const auto key = "records-image:" + path + ':' + QString::number(rect.width()) + ':' +
+                    const auto key = "records-image:" + path + ':' + item["id"].toString() + ':' +
+                        item["sha256"].toString() + ':' + QString::number(rect.width()) + ':' +
                     QString::number(rect.height());
                 QPixmap pixmap;
                 if (!QPixmapCache::find(key, &pixmap))
@@ -304,8 +286,10 @@ class RecordDelegate final : public QStyledItemDelegate
 }
 
 HistoryBrowser::HistoryBrowser(Transport *service, const QString &group, const QString &name,
-                               const QString &directory, bool canDownload, QWidget *parent)
-    : QDialog(parent, Qt::Window), transport(service), groupId(group), downloadRoot(directory),
+                               const QString &directory, bool canDownload, QWidget *parent,
+                               std::shared_ptr<MediaStorage::LocalFiles> files)
+    : QDialog(parent, Qt::Window), localFiles(files ? std::move(files) : std::make_shared<MediaStorage::LocalFiles>()),
+      transport(service), groupId(group), downloadRoot(directory),
       allowDownload(canDownload)
 {
     setObjectName("historyBrowser");
@@ -411,10 +395,15 @@ HistoryBrowser::HistoryBrowser(Transport *service, const QString &group, const Q
     connect(member, &QComboBox::currentIndexChanged, this, &HistoryBrowser::resetSearch);
     connect(more, &QPushButton::clicked, this, &HistoryBrowser::loadPage);
     connect(&thumbnailTimer, &QTimer::timeout, this, &HistoryBrowser::loadVisibleThumbnails);
-    connect(list->verticalScrollBar(), &QScrollBar::valueChanged, this, [this] { thumbnailTimer.start(); });
+    connect(list->verticalScrollBar(), &QScrollBar::valueChanged, this,
+        [this] { updateCachePins(); thumbnailTimer.start(); });
+    connect(records, &QAbstractItemModel::dataChanged, this, &HistoryBrowser::updateCachePins);
+    connect(records, &QAbstractItemModel::rowsInserted, this, &HistoryBrowser::updateCachePins);
+    connect(records, &QAbstractItemModel::modelReset, this, &HistoryBrowser::updateCachePins);
     loadMembers();
     QTimer::singleShot(0, this, &HistoryBrowser::loadPage);
 }
+HistoryBrowser::~HistoryBrowser() { localFiles->unpin(this); }
 
 void HistoryBrowser::resetSearch()
 {
@@ -494,9 +483,12 @@ void HistoryBrowser::loadPage()
             self->hasMore = pending || (page["has_more"].toBool() && !next.isEmpty() && next != cursor);
             if (!next.isEmpty())
                 self->nextBefore = next;
-            static_cast<RecordsModel *>(self->records)->append(entries, self->groupId);
+            QJsonArray hydrated;
+            for (const auto &entry : entries)
+                hydrated.append(self->localFiles->hydrate(entry.toObject(), self->groupId));
+            static_cast<RecordsModel *>(self->records)->append(hydrated, self->groupId);
             for (const auto &update : self->updates)
-                static_cast<RecordsModel *>(self->records)->update(update);
+                static_cast<RecordsModel *>(self->records)->update(self->localFiles->hydrate(update, self->groupId));
             const auto count = self->records->rowCount();
             self->state->setText(pending ? "本机历史正在读取，可继续加载" :
                 count == 0 ? (self->hasMore ? "本页没有匹配记录，可继续查找更早记录" : "没有匹配的聊天记录") :
@@ -552,16 +544,25 @@ void HistoryBrowser::loadVisibleThumbnails()
             const auto kind = media["kind"].toString();
             if (downloading.size() >= 2)
                 break;
+            const auto known = localFiles->find(groupId, media);
+            if (!known.isEmpty())
+            {
+                rows->localMedia(id, known, media);
+                continue;
+            }
             if ((kind != "image" && kind != "gif") || id.isEmpty() || downloading.contains(id) ||
-                failedThumbnails.contains(id) || !media["_local"].toString().isEmpty() ||
+                failedThumbnails.contains(id) ||
                 media["size"].toInteger() > 8 * 1024 * 1024)
                 continue;
             downloading.insert(id);
             QPointer<HistoryBrowser> self(this);
             const auto requestedGeneration = generation;
+            const auto files = localFiles;
+            const auto group = groupId;
             transport->download(media, MediaStorage::cacheDirectory(),
-                [self, id, requestedGeneration](const QString &path, const QString &error)
+                [self, files, group, media, id, requestedGeneration](const QString &path, const QString &error)
                 {
+                    if (error.isEmpty()) files->remember(group, media, path);
                     if (!self)
                         return;
                     self->downloading.remove(id);
@@ -575,7 +576,7 @@ void HistoryBrowser::loadVisibleThumbnails()
                     }
                     else
                     {
-                        static_cast<RecordsModel *>(self->records)->localMedia(id, path);
+                        static_cast<RecordsModel *>(self->records)->localMedia(id, path, media);
                         self->list->doItemsLayout();
                         emit self->cacheUpdated();
                     }
@@ -590,12 +591,22 @@ QSet<QString> HistoryBrowser::protectedCachePaths() const
     QSet<QString> result;
     if (!valid || !isVisible()) return result;
     const auto rows = static_cast<RecordsModel *>(records);
-    for (int row = 0; row < rows->rows.size(); ++row)
-        if (list->visualRect(records->index(row)).intersects(list->viewport()->rect()))
+    const auto bounds = list->viewport()->rect();
+    const auto first = list->indexAt(QPoint(1, 0));
+    for (int row = qMax(0, first.row()); row < rows->rows.size(); ++row)
+    {
+        const auto rect = list->visualRect(records->index(row));
+        if (rect.top() > bounds.bottom()) break;
+        if (rect.intersects(bounds))
             for (const auto &entry : rows->rows[row]["media"].toArray())
-                result.insert(QFileInfo(entry.toObject()["_local"].toString()).absoluteFilePath());
+            {
+                const auto path = entry.toObject()["_local"].toString();
+                if (!path.isEmpty()) result.insert(QFileInfo(path).absoluteFilePath());
+            }
+    }
     return result;
 }
+void HistoryBrowser::updateCachePins() { localFiles->pin(this, protectedCachePaths()); }
 void HistoryBrowser::discardCached(const QStringList &paths)
 {
     if (!valid) return;
@@ -647,7 +658,12 @@ bool HistoryBrowser::eventFilter(QObject *watched, QEvent *event)
                 activate(list->indexAt(mouse->position().toPoint()), mouse->position().toPoint());
         }
         else if (event->type() == QEvent::Resize || event->type() == QEvent::Show)
+        {
+            updateCachePins();
             thumbnailTimer.start();
+        }
+        else if (event->type() == QEvent::Hide)
+            localFiles->unpin(this);
     }
     return QDialog::eventFilter(watched, event);
 }
@@ -662,7 +678,7 @@ void HistoryBrowser::updateMessage(const QJsonObject &message)
         updates[id] = message;
         while (updateOrder.size() > retainedRecords)
             updates.remove(updateOrder.takeFirst());
-        static_cast<RecordsModel *>(records)->update(message);
+        static_cast<RecordsModel *>(records)->update(localFiles->hydrate(message, groupId));
         list->doItemsLayout();
         thumbnailTimer.start();
     }
@@ -674,6 +690,7 @@ void HistoryBrowser::invalidate()
     ++generation;
     searchTimer.stop();
     thumbnailTimer.stop();
+    localFiles->unpin(this);
     close();
 }
 
@@ -683,6 +700,7 @@ void HistoryBrowser::closeEvent(QCloseEvent *event)
     ++generation;
     searchTimer.stop();
     thumbnailTimer.stop();
+    localFiles->unpin(this);
     QDialog::closeEvent(event);
 }
 

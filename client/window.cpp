@@ -156,6 +156,7 @@ static QIcon svgIcon(const QString &resource)
 Window::Window(bool demo, const QString &tunnelExecutable)
     : transport(this), tunnel(this, tunnelExecutable), attachments(this), demoServer(this), tray(this)
 {
+    localFiles = std::make_shared<MediaStorage::LocalFiles>();
 #ifdef Q_OS_WIN
     demoServer.setCreateProcessArgumentsModifier([](QProcess::CreateProcessArguments *arguments)
                                                  { arguments->flags |= 0x08000000; });
@@ -198,6 +199,7 @@ Window::Window(bool demo, const QString &tunnelExecutable)
             playingVoicePath.clear();
             if (requestedVoiceId.isEmpty())
                 messages->setVoiceState({}, {});
+            updateCachePins();
         }
     });
     connect(voicePlayer, &VoicePlayer::error, this,
@@ -343,7 +345,10 @@ Window::Window(bool demo, const QString &tunnelExecutable)
                 messages->setProperty("locatedHistory", false);
                 loadHistory();
             });
-    connect(messages, &MessageView::viewportChanged, this, [this] { thumbnailTimer.start(); });
+    connect(messages, &MessageView::viewportChanged, this, [this]
+        { updateCachePins(); thumbnailTimer.start(); });
+    connect(model, &QAbstractItemModel::modelReset, this, &Window::updateCachePins);
+    connect(model, &QAbstractItemModel::dataChanged, this, &Window::updateCachePins);
     connect(&demoServer, &QProcess::readyReadStandardError, this,
             [this]
             {
@@ -864,7 +869,11 @@ void Window::showPreferences()
         const auto values = dialog->values();
         if (MediaStorage::isCachePath(values.downloads) ||
             QDir::cleanPath(values.downloads) == QDir::cleanPath(MediaStorage::cacheDirectory())) return;
-        if (downloadRoot != values.downloads) downloaded.clear();
+        if (downloadRoot != values.downloads)
+        {
+            invalidateAuxiliaryWindows();
+            localFiles = std::make_shared<MediaStorage::LocalFiles>();
+        }
         downloadRoot = values.downloads;
         QSettings settings;
         settings.setValue("downloads", downloadRoot);
@@ -894,29 +903,42 @@ void Window::pruneMediaCache(qint64 limit, std::function<void(const QString &)> 
         return;
     }
     QSet<QString> protectedPaths;
-    for (int row = 0; row < model->rowCount(); ++row)
-        if (messages->visualRect(model->index(row)).intersects(messages->viewport()->rect()))
+    const auto bounds = messages->viewport()->rect();
+    const auto first = messages->indexAt(QPoint(1, 0));
+    for (int row = qMax(0, first.row()); row < model->rowCount(); ++row)
+    {
+        const auto rect = messages->visualRect(model->index(row));
+        if (rect.top() > bounds.bottom()) break;
+        if (rect.intersects(bounds))
             for (const auto &entry : model->rows[row]["media"].toArray())
                 protectedPaths.insert(QFileInfo(entry.toObject()["_local"].toString()).absoluteFilePath());
-    if (downloaded.contains(requestedVoiceId)) protectedPaths.insert(QFileInfo(downloaded[requestedVoiceId]).absoluteFilePath());
+    }
+    const auto requestedPath = localFiles->pathForId(voiceGroup, requestedVoiceId);
+    if (!requestedPath.isEmpty()) protectedPaths.insert(requestedPath);
     if (!playingVoicePath.isEmpty()) protectedPaths.insert(QFileInfo(playingVoicePath).absoluteFilePath());
-    for (const auto &id : downloading)
-        if (downloaded.contains(id)) protectedPaths.insert(QFileInfo(downloaded[id]).absoluteFilePath());
     if (historyBrowser) protectedPaths.unite(historyBrowser->protectedCachePaths());
+    updateCachePins();
+    const auto files = localFiles;
     cacheWorking = true;
     if (historyBrowser) historyBrowser->setProperty("cacheMaintenance", true);
     QPointer<Window> self(this);
-    QThreadPool::globalInstance()->start([self, limit, protectedPaths, callback]
+    QThreadPool::globalInstance()->start([self, limit, protectedPaths, files, callback]
     {
-        const auto result = MediaStorage::prune(limit, protectedPaths);
-        QMetaObject::invokeMethod(qApp, [self, result, callback]
+        const auto result = MediaStorage::prune(limit, protectedPaths, files);
+        files->discard(result.removed);
+        QMetaObject::invokeMethod(qApp, [self, files, result, callback]
         {
             if (!self) return;
             self->cacheWorking = false;
-            QStringList ids;
-            for (auto it = self->downloaded.cbegin(); it != self->downloaded.cend(); ++it)
-                if (result.removed.contains(it.value())) ids.append(it.key());
-            for (const auto &id : ids) { self->downloaded.remove(id); self->model->setLocalMedia(id, {}); }
+            if (self->localFiles == files)
+            {
+                QSet<QString> ids;
+                for (const auto &row : self->model->rows)
+                    for (const auto &entry : row["media"].toArray())
+                        if (result.removed.contains(entry.toObject()["_local"].toString()))
+                            ids.insert(entry.toObject()["id"].toString());
+                for (const auto &id : ids) self->model->setLocalMedia(id, {});
+            }
             if (self->historyBrowser)
             {
                 self->historyBrowser->setProperty("cacheMaintenance", false);
@@ -927,6 +949,42 @@ void Window::pruneMediaCache(qint64 limit, std::function<void(const QString &)> 
             if (callback) callback(result.error);
         });
     });
+}
+void Window::updateCachePins()
+{
+    QSet<QString> paths;
+    const auto bounds = messages->viewport()->rect();
+    const auto first = messages->indexAt(QPoint(1, 0));
+    for (int row = qMax(0, first.row()); row < model->rowCount(); ++row)
+    {
+        const auto rect = messages->visualRect(model->index(row));
+        if (rect.top() > bounds.bottom()) break;
+        if (rect.intersects(bounds))
+            for (const auto &entry : model->rows[row]["media"].toArray())
+            {
+                const auto path = entry.toObject()["_local"].toString();
+                if (!path.isEmpty()) paths.insert(QFileInfo(path).absoluteFilePath());
+            }
+    }
+    if (!playingVoicePath.isEmpty()) paths.insert(playingVoicePath);
+    const auto requested = localFiles->pathForId(voiceGroup, requestedVoiceId);
+    if (!requested.isEmpty()) paths.insert(requested);
+    localFiles->pin(this, paths);
+}
+QJsonArray Window::hydrateMessages(const QJsonArray &snapshot) const
+{
+    QJsonArray result;
+    for (const auto &message : snapshot)
+        result.append(localFiles->hydrate(message.toObject(), groupId));
+    return result;
+}
+bool Window::hasCurrentMedia(const QJsonObject &media) const
+{
+    for (const auto &row : model->rows)
+        if (row["group"] == groupId && row["status"] != "recalled")
+            for (const auto &entry : row["media"].toArray())
+                if (sameMediaDescriptor(entry.toObject(), media)) return true;
+    return false;
 }
 
 void Window::showSettings()
@@ -1049,7 +1107,7 @@ void Window::showSettings()
         settings.setValue("connectionMode", mode->currentData());
         p2pSettings = mode->currentData() == "p2p" ? automatic : QJsonObject{};
         settings.setValue("p2p", QJsonDocument(p2pSettings).toJson(QJsonDocument::Compact));
-        downloaded.clear();
+        localFiles = std::make_shared<MediaStorage::LocalFiles>();
     };
     auto *buttons = new QDialogButtonBox(QDialogButtonBox::Save | QDialogButtonBox::Cancel);
     buttons->button(QDialogButtonBox::Save)->setText("保存并连接");
@@ -1232,6 +1290,7 @@ void Window::connectService()
     notificationSyncSeq = 0;
     if (chatPreferences.configure(serverUrl, secret))
     {
+        localFiles = std::make_shared<MediaStorage::LocalFiles>();
         seenMessages.clear();
         seenMessageOrder.clear();
     }
@@ -1393,7 +1452,7 @@ void Window::showHistoryBrowser()
         historyBrowser->activateWindow();
         return;
     }
-    historyBrowser = new HistoryBrowser(&transport, groupId, title->text(), downloadRoot, canDownload, this);
+    historyBrowser = new HistoryBrowser(&transport, groupId, title->text(), downloadRoot, canDownload, this, localFiles);
     connect(historyBrowser, &HistoryBrowser::recordActivated, this, &Window::activateHistoryRecord);
     connect(historyBrowser, &HistoryBrowser::cacheUpdated, this, [this] { cachePruneTimer.start(); });
     connect(historyBrowser, &QDialog::finished, this, [this] { cachePruneTimer.start(); });
@@ -1426,14 +1485,13 @@ void Window::activateHistoryRecord(const QJsonObject &message, const QJsonObject
     showNormal();
     raise();
     activateWindow();
-    pendingRecordId = media["kind"] == "voice" && canDownload ? message["id"].toString() : QString();
+    pendingRecordId = !media.isEmpty() && canDownload && message["status"] != "recalled"
+        ? message["id"].toString() : QString();
     pendingRecordMedia = pendingRecordId.isEmpty() ? QJsonObject{} : media;
     locateQuote({{"id", message["id"]}, {"group", groupId},
                  {"unavailable", message["status"] == "recalled"}});
     if (!pendingRecordId.isEmpty())
         playLocatedRecord(pendingRecordId);
-    else if (!media.isEmpty() && message["status"] != "recalled")
-        fetchMedia(media);
 }
 
 void Window::playLocatedRecord(const QString &id)
@@ -1445,7 +1503,7 @@ void Window::playLocatedRecord(const QString &id)
             for (const auto &value : message["media"].toArray())
             {
                 const auto media = value.toObject();
-                if (media["id"] == pendingRecordMedia["id"] && media["kind"] == "voice")
+                if (sameMediaDescriptor(media, pendingRecordMedia))
                 {
                     pendingRecordId.clear();
                     pendingRecordMedia = {};
@@ -1731,7 +1789,7 @@ void Window::loadHistory(bool older, int pendingAttempt)
             {
                 if (!entries.isEmpty())
                 {
-                    model->prepend(entries);
+                    model->prepend(hydrateMessages(entries));
                     messages->setProperty("locatedHistory", true);
                 }
             }
@@ -1782,7 +1840,7 @@ void Window::loadHistory(bool older, int pendingAttempt)
                     snapshot = retained;
                 }
                 messages->setProperty("locatedHistory", !followLatest);
-                model->replace(snapshot);
+                model->replace(hydrateMessages(snapshot));
                 if (followLatest)
                     messages->scrollToBottom();
             }
@@ -1868,7 +1926,7 @@ void Window::handleEvent(const QJsonObject &event)
         notify(event["text"].toString(), true);
     else if (type == "message")
     {
-        auto message = event["message"].toObject();
+        auto message = localFiles->hydrate(event["message"].toObject(), groupId);
         if (historyBrowser)
             historyBrowser->updateMessage(message);
         if (message["status"] == "recalled" && message["id"] == pendingRecordId)
@@ -2076,7 +2134,7 @@ void Window::cacheMessageDraft(const QJsonObject &message)
     for (const auto &entry : message["media"].toArray())
     {
         const auto media = entry.toObject();
-        const auto path = media["_local"].toString(downloaded.value(media["id"].toString()));
+        const auto path = media["_local"].toString(localFiles->find(groupId, media));
         if (!path.isEmpty() && QFileInfo::exists(path))
             local.addFiles({path});
     }
@@ -2258,7 +2316,7 @@ void Window::locateQuote(const QJsonObject &quote)
                     historyUpdates.clear();
                     messages->setProperty("locatedHistory", true);
                     messages->stopScrollAnimation();
-                    model->replace(context);
+                    model->replace(hydrateMessages(context));
                     refreshReeditLinks();
                     QTimer::singleShot(0, this,
                                        [this, id, group, conversation]
@@ -2385,7 +2443,7 @@ void Window::uploadNext(int index, quint64 generation, const QString &targetGrou
                            failure(error);
                            return;
                        }
-                       model->upsert(value.toObject());
+                       model->upsert(localFiles->hydrate(value.toObject(), targetGroup));
                        messages->scrollToBottom();
                        restoring = true;
                        composer->clear();
@@ -2447,7 +2505,7 @@ void Window::notify(const QString &text, bool error)
 }
 void Window::fetchMedia(const QJsonObject &media, bool saveOnly, bool thumbnail, bool resumed)
 {
-    if (!canDownload)
+    if (!canDownload || !hasCurrentMedia(media))
         return;
     const auto id = media["id"].toString();
     if (saveOnly) saveRequests.insert(id);
@@ -2469,8 +2527,9 @@ void Window::fetchMedia(const QJsonObject &media, bool saveOnly, bool thumbnail,
     }
     if (resumed && voice && requestedVoiceId != id) return;
     if (downloading.contains(id) || (!resumed && queuedMediaIds.contains(id))) return;
-    const bool cached = downloaded.contains(id) && QFileInfo::exists(downloaded[id]);
-    const bool copy = cached && MediaStorage::isCachePath(downloaded[id]) && (saveOnly || (!thumbnail && !voice));
+    const auto local = localFiles->find(groupId, media);
+    const bool cached = !local.isEmpty();
+    const bool copy = cached && MediaStorage::isCachePath(local) && (saveOnly || (!thumbnail && !voice));
     if ((!cached || copy) && (cacheWorking || downloading.size() >= 2))
     {
         if (!thumbnail && mediaQueue.size() < 16)
@@ -2499,23 +2558,25 @@ void Window::fetchMedia(const QJsonObject &media, bool saveOnly, bool thumbnail,
         {
             const bool requestedOpen = openRequests.remove(id);
             saveRequests.remove(id);
-            saveMediaAndMaybeOpen(media, downloaded[id], requestedOpen || !saveOnly);
+            saveMediaAndMaybeOpen(media, local, requestedOpen || !saveOnly);
         }
         else
         {
-            model->setLocalMedia(id, downloaded[id]);
-            if (voice) openMedia(media, downloaded[id]);
+            model->setLocalMedia(id, local, media);
+            if (voice) openMedia(media, local);
         }
         return;
     }
     downloading.insert(id);
     const auto scope = chatPreferences.scope();
+    const auto group = groupId;
+    const auto files = localFiles;
     transport.download(media, (thumbnail || voice) && !saveOnly ? MediaStorage::cacheDirectory() : downloadRoot,
-                       [this, id, media, saveOnly, thumbnail, scope](const QString &path, const QString &error)
+                       [this, id, media, thumbnail, scope, group, files](const QString &path, const QString &error)
                        {
                            downloading.remove(id);
                            QTimer::singleShot(0, this, &Window::drainMediaQueue);
-                           if (scope != chatPreferences.scope()) return;
+                           if (scope != chatPreferences.scope() || localFiles != files || !canDownload) return;
                            transferLabel->clear();
                            if (!error.isEmpty())
                            {
@@ -2529,8 +2590,8 @@ void Window::fetchMedia(const QJsonObject &media, bool saveOnly, bool thumbnail,
                                }
                                return;
                            }
-                           downloaded[id] = path;
-                           model->setLocalMedia(id, path);
+                           files->remember(group, media, path);
+                           if (group == groupId) model->setLocalMedia(id, path, media);
                            const bool requestedOpen = openRequests.remove(id);
                            const bool requestedSave = saveRequests.remove(id);
                            if (requestedOpen || requestedSave)
@@ -2551,7 +2612,7 @@ void Window::saveMediaAndMaybeOpen(const QJsonObject &media, const QString &path
 {
     if (!MediaStorage::isCachePath(path))
     {
-        model->setLocalMedia(media["id"].toString(), path);
+        model->setLocalMedia(media["id"].toString(), path, media);
         if (open || (media["kind"] == "voice" && requestedVoiceId == media["id"].toString())) openMedia(media, path);
         return;
     }
@@ -2576,8 +2637,8 @@ void Window::saveMediaAndMaybeOpen(const QJsonObject &media, const QString &path
             const bool requestedOpen = self->openRequests.remove(id);
             self->saveRequests.remove(id);
             if (!error.isEmpty()) { self->lastError = error; return; }
-            self->downloaded[id] = saved;
-            self->model->setLocalMedia(id, saved);
+            self->localFiles->remember(self->groupId, media, saved);
+            self->model->setLocalMedia(id, saved, media);
             if (open || requestedOpen || (media["kind"] == "voice" && self->requestedVoiceId == id))
                 self->openMedia(media, saved);
         });
@@ -2587,12 +2648,16 @@ void Window::visibleThumbnails()
 {
     if (!canDownload || !connected || isMinimized() || !isVisible())
         return;
-    for (int i = 0; i < model->rowCount(); ++i)
+    const auto bounds = messages->viewport()->rect();
+    const auto first = messages->indexAt(QPoint(1, 0));
+    for (int i = qMax(0, first.row()); i < model->rowCount(); ++i)
     {
         if (model->rows[i]["status"] == "recalled")
             continue;
         auto index = model->index(i);
-        if (!messages->visualRect(index).intersects(messages->viewport()->rect()))
+        const auto rect = messages->visualRect(index);
+        if (rect.top() > bounds.bottom()) break;
+        if (!rect.intersects(bounds))
             continue;
         for (const auto &entry : model->rows[i]["media"].toArray())
         {
@@ -2613,10 +2678,11 @@ void Window::stopVoice()
     if (voicePlayer)
         voicePlayer->stop();
     messages->setVoiceState({}, {});
+    updateCachePins();
 }
 void Window::openMedia(const QJsonObject &media, const QString &path)
 {
-    if (!canDownload)
+    if (!canDownload || !hasCurrentMedia(media))
         return;
     if (media["kind"] == "voice")
     {
@@ -2626,6 +2692,7 @@ void Window::openMedia(const QJsonObject &media, const QString &path)
             return;
         playingVoiceId = id;
         playingVoicePath = path;
+        updateCachePins();
         if (voicePlayer->play(path))
             messages->setVoiceState(id, "playing");
         else

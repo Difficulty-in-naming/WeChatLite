@@ -6,6 +6,9 @@
 #include <QPointer>
 #include <QSet>
 #include <QTimer>
+#include <memory>
+
+namespace MediaStorage { class LocalFiles; }
 
 class Transport;
 class QAbstractListModel;
@@ -23,7 +26,9 @@ class HistoryBrowser : public QDialog
     Q_OBJECT
   public:
     HistoryBrowser(Transport *transport, const QString &group, const QString &name,
-                   const QString &downloadRoot, bool canDownload, QWidget *parent = nullptr);
+                   const QString &downloadRoot, bool canDownload, QWidget *parent = nullptr,
+                   std::shared_ptr<MediaStorage::LocalFiles> localFiles = {});
+    ~HistoryBrowser() override;
     QString group() const { return groupId; }
     void invalidate();
     void updateMessage(const QJsonObject &message);
@@ -45,6 +50,8 @@ class HistoryBrowser : public QDialog
     void loadVisibleThumbnails();
     void activate(const QModelIndex &index, const QPoint &point);
     void updateThemeStyle();
+    void updateCachePins();
+    std::shared_ptr<MediaStorage::LocalFiles> localFiles;
     QPointer<Transport> transport;
     QString groupId, downloadRoot, nextBefore, type = "all";
     QAbstractListModel *records;

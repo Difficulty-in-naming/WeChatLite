@@ -20,6 +20,7 @@ void execChatContextMenu(QMenu *menu, const QPoint &anchor);
 QPixmap chatAvatar(const QJsonObject &entity, int size);
 bool canRecallMessage(const QJsonObject &message, qint64 now);
 QString messageQuoteLabel(const QJsonObject &quote);
+bool sameMediaDescriptor(const QJsonObject &first, const QJsonObject &second);
 
 class MessageModel : public QAbstractListModel
 {
@@ -35,7 +36,7 @@ class MessageModel : public QAbstractListModel
     void replace(const QJsonArray &messages);
     void upsert(const QJsonObject &message);
     void prepend(const QJsonArray &messages);
-    void setLocalMedia(const QString &id, const QString &path);
+    void setLocalMedia(const QString &id, const QString &path, const QJsonObject &descriptor = {});
     void markQuoteUnavailable(const QString &id);
     void setCanReedit(const QString &id, bool value);
 

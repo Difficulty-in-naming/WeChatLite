@@ -55,7 +55,17 @@ for role in client server; do
   cmake "-DAPP=$app" "-DAPP_BINARY=$binary" "-DHELPER_BINARY=$helper" \
     -P scripts/verify-macos-bundle.cmake
   archive="$stage/WeChatLite-$asset-macOS-arm64.dmg"
-  hdiutil create -volname "$name" -srcfolder "$stage/$role" -format UDZO "$archive"
+  # The runner's disk image service can briefly return "Resource busy".
+  for attempt in 1 2 3; do
+    if hdiutil create -ov -volname "$name" -srcfolder "$stage/$role" -format UDZO "$archive"; then
+      break
+    fi
+    if [[ "$attempt" -eq 3 ]]; then
+      echo "Unable to create $asset DMG after three attempts." >&2
+      exit 1
+    fi
+    sleep "$((attempt * 2))"
+  done
   hdiutil verify "$archive"
   destination="$PWD/dist/$role-macos-arm64"
   if [[ -e "$destination" ]]; then

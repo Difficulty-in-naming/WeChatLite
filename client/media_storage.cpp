@@ -5,6 +5,8 @@
 #include <QDirIterator>
 #include <QFile>
 #include <QFileInfo>
+#include <QJsonArray>
+#include <QMutexLocker>
 #include <QSettings>
 #include <QStandardPaths>
 #include <QStorageInfo>
@@ -55,6 +57,98 @@ QFileInfoList files(const QString &root)
 }
 namespace MediaStorage
 {
+namespace
+{
+QString mediaKey(const QString &group, const QString &id) { return group + QChar::Null + id; }
+QString mediaKey(const QString &group, const QJsonObject &media)
+{
+    return mediaKey(group, media["id"].toString()) + QChar::Null + media["sha256"].toString() + QChar::Null +
+           media["kind"].toString() + QChar::Null + QString::number(media["size"].toInteger(-1));
+}
+}
+QString LocalFiles::existing(const QString &key) const
+{
+    const auto *entry = entries.object(key);
+    if (!entry) return {};
+    const QFileInfo info(entry->path);
+    if (!info.isFile() || info.size() != entry->size || info.lastModified() != entry->modified)
+    {
+        entries.remove(key);
+        return {};
+    }
+    return entry->path;
+}
+QString LocalFiles::find(const QString &group, const QJsonObject &media) const
+{
+    QMutexLocker lock(&mutex);
+    const auto key = mediaKey(group, media);
+    const auto *entry = entries.object(key);
+    if (!entry || entry->hash != media["sha256"].toString() || entry->size != media["size"].toInteger(-1) ||
+        entry->kind != media["kind"].toString()) return {};
+    return existing(key);
+}
+QString LocalFiles::pathForId(const QString &group, const QString &id) const
+{
+    QMutexLocker lock(&mutex);
+    if (id.isEmpty()) return {};
+    const auto prefix = mediaKey(group, id) + QChar::Null;
+    for (const auto &key : entries.keys())
+        if (key.startsWith(prefix))
+        {
+            const auto path = existing(key);
+            if (!path.isEmpty()) return path;
+        }
+    return {};
+}
+void LocalFiles::remember(const QString &group, const QJsonObject &media, const QString &path)
+{
+    const QFileInfo info(path);
+    if (group.isEmpty() || media["id"].toString().isEmpty() || media["sha256"].toString().size() != 64 ||
+        !info.isFile() || info.size() != media["size"].toInteger(-1)) return;
+    QMutexLocker lock(&mutex);
+    entries.insert(mediaKey(group, media), new Entry{
+        info.absoluteFilePath(), media["sha256"].toString(), media["kind"].toString(), info.size(), info.lastModified()});
+}
+QJsonObject LocalFiles::hydrate(QJsonObject message, const QString &fallbackGroup) const
+{
+    if (message["status"] == "recalled") { message["media"] = QJsonArray{}; return message; }
+    const auto group = message["group"].toString(fallbackGroup);
+    auto media = message["media"].toArray();
+    for (int i = 0; i < media.size(); ++i)
+    {
+        auto item = media[i].toObject();
+        item["_local"] = find(group, item); // Never trust a path supplied in an HTTP/WS payload.
+        media[i] = item;
+    }
+    message["media"] = media;
+    return message;
+}
+void LocalFiles::discard(const QStringList &paths)
+{
+    const QSet<QString> removed(paths.cbegin(), paths.cend());
+    QMutexLocker lock(&mutex);
+    for (const auto &key : entries.keys())
+        if (removed.contains(entries.object(key)->path)) entries.remove(key);
+}
+void LocalFiles::pin(const void *owner, const QSet<QString> &paths)
+{
+    QMutexLocker lock(&mutex);
+    pins.insert(reinterpret_cast<quintptr>(owner), paths);
+}
+void LocalFiles::unpin(const void *owner)
+{
+    QMutexLocker lock(&mutex);
+    pins.remove(reinterpret_cast<quintptr>(owner));
+}
+bool LocalFiles::removeIfUnpinned(const QString &path, bool &pinned)
+{
+    QMutexLocker lock(&mutex);
+    pinned = false;
+    for (const auto &paths : pins)
+        if (paths.contains(path)) { pinned = true; return false; }
+    // The deletion and live pin updates share this lock, closing the check/delete race.
+    return QFile::remove(path);
+}
 QString cacheDirectory()
 {
     return QDir(QStandardPaths::writableLocation(QStandardPaths::CacheLocation)).filePath("media");
@@ -89,7 +183,7 @@ Usage measure(const QString &downloads, std::function<bool()> cancelled)
     if (!safeRoot(cacheDirectory())) result.error = "缓存目录包含链接，已跳过以保护其他文件。";
     return result;
 }
-Pruned prune(qint64 limit, const QSet<QString> &protectedPaths)
+Pruned prune(qint64 limit, const QSet<QString> &protectedPaths, const std::shared_ptr<LocalFiles> &liveFiles)
 {
     Pruned result;
     const auto root = cacheDirectory();
@@ -105,8 +199,10 @@ Pruned prune(qint64 limit, const QSet<QString> &protectedPaths)
         if (protectedPaths.contains(path) || !safeRoot(file.absolutePath())) continue;
         const QFileInfo current(path);
         if (link(current) || !current.canonicalFilePath().startsWith(QDir(root).canonicalPath() + '/', Qt::CaseInsensitive)) continue;
-        if (QFile::remove(path)) { result.retained -= file.size(); result.removed.append(path); }
-        else result.error = "部分缓存正在使用，已保留。";
+        bool pinned = false;
+        const bool removed = liveFiles ? liveFiles->removeIfUnpinned(path, pinned) : QFile::remove(path);
+        if (removed) { result.retained -= file.size(); result.removed.append(path); }
+        else if (!pinned) result.error = "部分缓存正在使用，已保留。";
     }
     return result;
 }

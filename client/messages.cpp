@@ -80,6 +80,39 @@ static bool messageBefore(const QJsonObject &a, const QJsonObject &b)
     const auto first = a["timestamp"].toInteger(), second = b["timestamp"].toInteger();
     return first != second ? first < second : a["seq"].toInteger() < b["seq"].toInteger();
 }
+bool sameMediaDescriptor(const QJsonObject &first, const QJsonObject &second)
+{
+    return !first["id"].toString().isEmpty() && first["id"] == second["id"] &&
+           first["sha256"] == second["sha256"] && first["size"] == second["size"] && first["kind"] == second["kind"];
+}
+static QJsonObject preserveLocalMedia(QJsonObject message, const QJsonObject &previous)
+{
+    if (message["group"] != previous["group"] || message["id"] != previous["id"] ||
+        message["status"] == "recalled")
+        return message;
+    auto media = message["media"].toArray();
+    for (int i = 0; i < media.size(); ++i)
+    {
+        auto item = media[i].toObject();
+        // Explicit local state is authoritative, including an invalidated empty path.
+        if (item.contains("_local"))
+            continue;
+        for (const auto &entry : previous["media"].toArray())
+        {
+            const auto old = entry.toObject();
+            const auto path = old["_local"].toString();
+            if (sameMediaDescriptor(item, old) &&
+                !path.isEmpty() && QFileInfo(path).isFile())
+            {
+                item["_local"] = path;
+                break;
+            }
+        }
+        media[i] = item;
+    }
+    message["media"] = media;
+    return message;
+}
 QJsonObject MessageModel::normalize(QJsonObject message)
 {
     const auto key = message["group"].toString() + '\n' + message["id"].toString();
@@ -103,13 +136,20 @@ QJsonObject MessageModel::normalize(QJsonObject message)
 }
 void MessageModel::replace(const QJsonArray &messages)
 {
+    QHash<QString, QJsonObject> previous;
+    for (const auto &row : rows)
+        previous.insert(row["group"].toString() + '\n' + row["id"].toString(), row);
     beginResetModel();
     rows.clear();
     for (const auto &message : messages)
         if (message.toObject()["status"] == "recalled")
             normalize(message.toObject());
     for (const auto &message : messages)
-        rows.append(normalize(message.toObject()));
+    {
+        auto row = message.toObject();
+        row = preserveLocalMedia(row, previous.value(row["group"].toString() + '\n' + row["id"].toString()));
+        rows.append(normalize(row));
+    }
     std::stable_sort(rows.begin(), rows.end(), messageBefore);
     while (rows.size() > 300)
         rows.removeFirst();
@@ -127,17 +167,7 @@ void MessageModel::upsert(const QJsonObject &incoming)
             auto updated = message;
             if (updated["status"] == "recalled")
                 updated["_can_reedit"] = rows[row]["_can_reedit"].toBool();
-            const auto local = rows[row]["media"].toArray();
-            auto media = updated["media"].toArray();
-            for (int i = 0; i < media.size(); ++i)
-                for (const auto &old : local)
-                    if (old.toObject()["id"] == media[i].toObject()["id"])
-                    {
-                        auto item = media[i].toObject();
-                        item["_local"] = old.toObject()["_local"];
-                        media[i] = item;
-                    }
-            updated["media"] = media;
+            updated = preserveLocalMedia(updated, rows[row]);
             const bool moves = (row > 0 && messageBefore(updated, rows[row - 1])) ||
                                (row + 1 < rows.size() && messageBefore(rows[row + 1], updated));
             if (moves)
@@ -213,14 +243,15 @@ void MessageModel::setCanReedit(const QString &id, bool value)
             return;
         }
 }
-void MessageModel::setLocalMedia(const QString &id, const QString &path)
+void MessageModel::setLocalMedia(const QString &id, const QString &path, const QJsonObject &descriptor)
 {
     for (int row = 0; row < rows.size(); ++row)
     {
         auto media = rows[row]["media"].toArray();
         bool changed = false;
         for (int i = 0; i < media.size(); ++i)
-            if (media[i].toObject()["id"] == id && media[i].toObject()["_local"].toString() != path)
+            if (media[i].toObject()["id"] == id && media[i].toObject()["_local"].toString() != path &&
+                (descriptor.isEmpty() || sameMediaDescriptor(media[i].toObject(), descriptor)))
             {
                 auto object = media[i].toObject();
                 object["_local"] = path;
@@ -282,7 +313,8 @@ static QSize previewSize(const QJsonObject &media)
         {
             // Downloaded media paths are immutable; avoid reopening their headers on every GIF frame.
             static QCache<QString, QSize> sizes(256);
-            auto *cached = sizes.object(path);
+            const auto key = path + ':' + media["id"].toString() + ':' + media["sha256"].toString();
+            auto *cached = sizes.object(key);
             QSize size;
             if (cached)
                 size = *cached;
@@ -291,7 +323,7 @@ static QSize previewSize(const QJsonObject &media)
                 QImageReader reader(path);
                 size = reader.size();
                 if (size.isValid())
-                    sizes.insert(path, new QSize(size));
+                    sizes.insert(key, new QSize(size));
             }
             if (size.isValid())
             {
@@ -429,9 +461,9 @@ static QPixmap mediaPixmap(const QJsonObject &media, const QString &gifCachePref
         return {};
     QPixmap pixmap;
     if (media["kind"].toString() == "gif" && !gifCachePrefix.isEmpty() &&
-        QPixmapCache::find(gifCachePrefix + path, &pixmap))
+        QPixmapCache::find(gifCachePrefix + path + ':' + media["sha256"].toString(), &pixmap))
         return pixmap;
-    const auto cacheKey = "chat:" + path;
+    const auto cacheKey = "chat:" + path + ':' + media["id"].toString() + ':' + media["sha256"].toString();
     if (!QPixmapCache::find(cacheKey, &pixmap))
     {
         QImageReader reader(path);
@@ -915,8 +947,6 @@ void MessageView::setModel(QAbstractItemModel *next)
     if (!next)
         return;
     modelConnections.append(
-        connect(next, &QAbstractItemModel::modelAboutToBeReset, this, &MessageView::clearGifs));
-    modelConnections.append(
         connect(next, &QAbstractItemModel::modelAboutToBeReset, this, &MessageView::stopScrollAnimation));
     modelConnections.append(
         connect(next, &QAbstractItemModel::layoutAboutToBeChanged, this, &MessageView::clearGifs));
@@ -989,9 +1019,10 @@ void MessageView::updateVisibleGifs()
             if (item["kind"].toString() != "gif" || path.isEmpty() ||
                 !geometry.media[i].translated(geometry.bubble.topLeft()).intersects(bounds))
                 continue;
-            if (!visible.contains(path) && visible.size() >= 4)
+            const auto identity = path + ':' + item["sha256"].toString();
+            if (!visible.contains(identity) && visible.size() >= 4)
                 continue;
-            auto &entry = visible[path];
+            auto &entry = visible[identity];
             entry.media = item;
             if (!entry.indices.contains(index))
                 entry.indices.append(index);
@@ -1003,13 +1034,13 @@ void MessageView::updateVisibleGifs()
             removeGif(path);
     for (auto entry = visible.cbegin(); entry != visible.cend(); ++entry)
     {
-        const auto path = entry.key();
-        if (gifs.contains(path))
+        const auto identity = entry.key();
+        if (gifs.contains(identity))
         {
-            gifs[path].indices = entry->indices;
+            gifs[identity].indices = entry->indices;
             continue;
         }
-        auto *movie = new QMovie(path, "gif", this);
+        auto *movie = new QMovie(entry->media["_local"].toString(), "gif", this);
         movie->setObjectName("visibleChatGif");
         movie->setCacheMode(QMovie::CacheNone);
         movie->setScaledSize(previewSize(entry->media));
@@ -1018,11 +1049,11 @@ void MessageView::updateVisibleGifs()
             delete movie;
             continue;
         }
-        gifs.insert(path, {movie, gifCachePrefix + path, entry->indices});
+        gifs.insert(identity, {movie, gifCachePrefix + identity, entry->indices});
         connect(movie, &QMovie::frameChanged, this,
-                [this, movie, path](int)
+                [this, movie, identity](int)
                 {
-                    const auto animation = gifs.constFind(path);
+                    const auto animation = gifs.constFind(identity);
                     if (animation == gifs.cend() || animation->movie != movie)
                         return;
                     QPixmapCache::insert(animation->cacheKey, movie->currentPixmap());
