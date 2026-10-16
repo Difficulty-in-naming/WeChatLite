@@ -1431,9 +1431,10 @@ void Window::connectService()
 void Window::loadPermissions()
 {
     const auto generation = ++permissionsGeneration;
+    const auto recallGeneration = recallCapabilityGeneration;
     transport.get(
         "/api/status",
-        [this, generation](const QJsonValue &value, const QString &error)
+        [this, generation, recallGeneration](const QJsonValue &value, const QString &error)
         {
             if (generation != permissionsGeneration)
                 return;
@@ -1445,6 +1446,8 @@ void Window::loadPermissions()
             else
             {
                 const auto info = value.toObject();
+                if (recallGeneration == recallCapabilityGeneration)
+                    messages->setRecallCapability(info);
                 const auto permissions = info["permissions"].toObject();
                 canSend = !info.contains("permissions") || permissions["can_send"].toBool();
                 canDownload = !info.contains("permissions") || permissions["can_download"].toBool();
@@ -2005,6 +2008,8 @@ void Window::handleEvent(const QJsonObject &event)
     auto type = event["type"].toString();
     if (type == "status")
     {
+        ++recallCapabilityGeneration;
+        messages->setRecallCapability(event);
         const bool wasReady = ready;
         ready = event["ready"].toBool();
         selfMemberId = ready ? event.value("self_id").toString() : QString();
@@ -2223,6 +2228,8 @@ void Window::updateComposeHeight()
 }
 void Window::recallMessage(const QJsonObject &message)
 {
+    if (!messages->recallSupported())
+        return;
     const auto id = message["id"].toString();
     QJsonObject current;
     for (const auto &row : model->rows)

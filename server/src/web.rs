@@ -1088,6 +1088,15 @@ async fn recall(
     if !existing.outgoing {
         bail_api("只能撤回本人发送的消息")?;
     }
+    {
+        let status = app.status.read().await;
+        if let Some(reason) = crate::model::recall_unavailable(&status) {
+            return Err(Error(
+                anyhow::anyhow!(reason.to_owned()),
+                StatusCode::NOT_IMPLEMENTED,
+            ));
+        }
+    }
     let explicit_retry = existing.recall_status == "failed" && existing.recall_retryable;
     if existing.status == "recalled" || (!existing.recall_status.is_empty() && !explicit_retry) {
         return Ok(Json(public(json!(existing))));
@@ -1537,6 +1546,68 @@ pub async fn import_media(
 mod tests {
     use super::*;
     use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn unsupported_background_recall_is_rejected_before_state_change_or_enqueue() {
+        let temp = tempfile::tempdir().unwrap();
+        let (app, mut receiver) = crate::test_app(temp.path());
+        app.set_status_recall(
+            true,
+            "fixture",
+            "",
+            Some(false),
+            crate::model::RECALL_UNAVAILABLE,
+        )
+        .await;
+        let mut message:ChatMessage=serde_json::from_value(json!({"id":"unsupported","group":"g","sender":"Fixture","text":"original body","timestamp":chrono::Utc::now().timestamp_millis(),"status":"sent","outgoing":true,"source_id":"native-source"})).unwrap();
+        app.store.insert_message(&mut message).unwrap();
+        let router = super::router(app.clone());
+        for retryable in [false, true] {
+            if retryable {
+                let mut pending = app
+                    .store
+                    .begin_recall(&message.id, message.timestamp)
+                    .unwrap()
+                    .0;
+                app.store
+                    .finish_recall(
+                        &message.id,
+                        &pending.recall_attempt,
+                        "failed",
+                        "proved not submitted",
+                        true,
+                    )
+                    .unwrap();
+                pending = app.store.message(&message.id).unwrap().unwrap();
+                assert!(pending.recall_retryable);
+            }
+            let before = app.store.message(&message.id).unwrap().unwrap();
+            let response = router
+                .clone()
+                .oneshot(request(
+                    "POST",
+                    "/api/messages/unsupported/recall",
+                    &app.config.token,
+                    "127.0.0.1:2345",
+                    Body::empty(),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+            assert_eq!(
+                json_body(response).await["error"],
+                crate::model::RECALL_UNAVAILABLE
+            );
+            assert_eq!(
+                serde_json::to_value(app.store.message(&message.id).unwrap().unwrap()).unwrap(),
+                serde_json::to_value(before).unwrap()
+            );
+            assert!(receiver.try_recv().is_err());
+        }
+        let status = principal_status(&app, &Principal::Admin).await;
+        assert_eq!(status["recall_supported"], false);
+        assert_eq!(status["recall_reason"], crate::model::RECALL_UNAVAILABLE);
+    }
 
     fn request(method: &str, uri: &str, token: &str, peer: &str, body: Body) -> Request<Body> {
         let mut request = Request::builder()

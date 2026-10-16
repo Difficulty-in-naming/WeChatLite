@@ -3,12 +3,15 @@ use anyhow::Result;
 use serde_json::Value;
 use std::{collections::BTreeSet, path::PathBuf};
 
+pub const BACKGROUND_RECALL_UNAVAILABLE: &str =
+    "当前微信版本的后台撤回暂不可用；请在原版微信中撤回";
+
 pub struct Actions {
     allowed: BTreeSet<String>,
 }
 impl Actions {
     pub fn new(directory: PathBuf, _wxid: &str) -> Result<Self> {
-        // Retire the old native queue before enabling the UI route.
+        // Revoke the old native queue's grants without loading it or operating the UI.
         let mut previous = NativeClient::new(directory.join("native-actions"));
         previous.restrict(&[])?;
         Ok(Self {
@@ -28,7 +31,9 @@ impl Actions {
             return Err(anyhow::Error::new(DefinitelyNotSubmitted)
                 .context("撤回群未获准或请求信息无效，未操作微信"));
         }
-        crate::chat_activation::recall(info)
+        // Background-only operation is required. Never fall back to native UI
+        // automation or the unverified native recall queue.
+        Err(anyhow::Error::new(DefinitelyNotSubmitted).context(BACKGROUND_RECALL_UNAVAILABLE))
     }
 }
 
@@ -67,6 +72,9 @@ mod tests {
                 .is_some()
         );
         actions.select(&BTreeSet::from([group.to_owned()])).unwrap();
+        let rejected = actions.submit(group, &info, &id).unwrap_err();
+        assert!(rejected.downcast_ref::<DefinitelyNotSubmitted>().is_some());
+        assert_eq!(rejected.to_string(), BACKGROUND_RECALL_UNAVAILABLE);
         for (target, body, request_id) in [
             ("54321@chatroom", info.clone(), id.as_str()),
             (group, json!({}), id.as_str()),

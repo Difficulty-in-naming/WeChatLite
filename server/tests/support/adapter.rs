@@ -125,7 +125,12 @@ pub fn run(mode: &str, directory: &Path) -> Result<()> {
             json!({"type":"groups","groups":[{"id":"fixture-a","name":"Private catalog fixture-a","count":2},{"id":"fixture-b","name":"Private catalog fixture-b","count":2}]}),
         )?;
     }
-    emit(json!({"type":"status","ready":true,"text":"Offline Rust fixture"}))?;
+    let mut status = json!({"type":"status","ready":true,"text":"Offline Rust fixture"});
+    if mode == "recall-disabled" {
+        status["recall_supported"] = false.into();
+        status["recall_reason"] = "当前微信版本的后台撤回暂不可用；请在原版微信中撤回".into();
+    }
+    emit(status)?;
     let mut held: Option<Value> = None;
     let mut counter = 0;
     let mut held_history = Vec::new();

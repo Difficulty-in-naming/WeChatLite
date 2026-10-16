@@ -49,6 +49,18 @@ bool canRecallMessage(const QJsonObject &message, qint64 now)
            !message["source_id"].toString().isEmpty() && !message["id"].toString().isEmpty() &&
            (recall.isEmpty() || retry) && age >= 0 && age < 180000;
 }
+
+void MessageView::setRecallCapability(const QJsonObject &status)
+{
+    recallAvailable = status.value("recall_supported").toBool(true);
+    recallUnavailableReason = status.value("recall_reason").toString();
+    if (recallUnavailableReason.isEmpty() || recallUnavailableReason.size() > 256 ||
+        std::any_of(recallUnavailableReason.cbegin(), recallUnavailableReason.cend(),
+            [](QChar character) { return character.category() == QChar::Other_Control; }))
+        recallUnavailableReason = "后台撤回暂不可用，请在微信中撤回";
+    if (recallUnavailableReason == "当前微信版本的后台撤回暂不可用；请在原版微信中撤回")
+        recallUnavailableReason = "后台撤回暂不可用，请在微信中撤回";
+}
 QString messageQuoteLabel(const QJsonObject &quote)
 {
     if (quote["unavailable"].toBool())
@@ -1711,9 +1723,19 @@ QMenu *MessageView::contextMenuFor(const QModelIndex &index, bool avatar)
     {
         if (!menu->actions().isEmpty())
             menu->addSeparator();
-        auto *recall = menu->addAction("撤回", this, [this, message] { emit recallRequested(message); });
-        recall->setObjectName("recallMessage");
-        recall->setProperty("chatIcon", "recall");
+        if (recallAvailable)
+        {
+            auto *recall = menu->addAction("撤回", this, [this, message]
+                { if (recallAvailable) emit recallRequested(message); });
+            recall->setObjectName("recallMessage");
+            recall->setProperty("chatIcon", "recall");
+        }
+        else
+        {
+            auto *unavailable = menu->addAction(recallUnavailableReason);
+            unavailable->setObjectName("recallUnavailable");
+            unavailable->setEnabled(false);
+        }
     }
     const auto error = message["recall_error"].toString(message["error"].toString());
     if (!error.isEmpty())

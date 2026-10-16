@@ -416,7 +416,7 @@ async fn run_stream<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                         "status"=>{
                             ready=value["ready"].as_bool().unwrap_or(false);
                             pending=true;
-                            app.set_status_identity(ready,value["text"].as_str().unwrap_or("微信状态未知"),value["self_id"].as_str().unwrap_or("")).await;
+                            app.set_status_recall(ready,value["text"].as_str().unwrap_or("微信状态未知"),value["self_id"].as_str().unwrap_or(""),value["recall_supported"].as_bool(),value["recall_reason"].as_str().unwrap_or("")).await;
                         },
                         "groups"=>{
                             let groups:Vec<Group>=serde_json::from_value(value["groups"].clone())?;
@@ -532,6 +532,11 @@ async fn run_stream<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                             else if recalling.insert((message.id.clone(),String::new())) {
                                 write_command(app,input,json!({"op":"recall_check","recall_attempt":"","message":message})).await?;
                             }
+                            continue;
+                        }
+                        let unavailable={let status=app.status.read().await;crate::model::recall_unavailable(&status).map(str::to_owned)};
+                        if let Some(reason)=unavailable {
+                            for event in app.db(move|s|s.finish_recall(&message.id,&message.recall_attempt,"failed",&reason,true)).await?{app.publish(event);}
                             continue;
                         }
                         let selected=app.forwarding.read().await;
@@ -704,6 +709,83 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn recall_capability_is_forwarded_and_preserved_on_disconnect_but_legacy_status_resets_it()
+     {
+        let temp = tempfile::tempdir().unwrap();
+        let (app, receiver) = crate::test_app(temp.path());
+        let mut events = app.events.subscribe();
+        let (task, mut output, _input) = fixture(app.clone(), receiver).await;
+        emit(&mut output,json!({"type":"status","ready":true,"recall_supported":false,"recall_reason":"请在原版微信中撤回"})).await;
+        let status = events.recv().await.unwrap();
+        assert_eq!(status["recall_supported"], false);
+        assert_eq!(status["recall_reason"], "请在原版微信中撤回");
+        app.set_status(false, "fixture disconnected").await;
+        assert_eq!(app.status.read().await["recall_supported"], false);
+        emit(&mut output, json!({"type":"status","ready":true})).await;
+        recall_barrier(&mut output, &mut events).await;
+        assert!(app.status.read().await.get("recall_supported").is_none());
+        emit(&mut output,json!({"type":"status","ready":true,"recall_supported":false,"recall_reason":"x".repeat(257)})).await;
+        recall_barrier(&mut output, &mut events).await;
+        assert_eq!(
+            app.status.read().await["recall_reason"],
+            crate::model::RECALL_UNAVAILABLE
+        );
+        app.shutdown.send_replace(true);
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn queued_recall_is_never_sent_when_adapter_declares_background_recall_unavailable() {
+        let temp = tempfile::tempdir().unwrap();
+        let (app, receiver) = crate::test_app(temp.path());
+        let mut source = message("unsupported-recall");
+        source.status = "sent".into();
+        source.source_id = "native-source".into();
+        source.timestamp = chrono::Utc::now().timestamp_millis();
+        app.store.insert_message(&mut source).unwrap();
+        let mut events = app.events.subscribe();
+        let (task, mut output, mut input) = fixture(app.clone(), receiver).await;
+        emit(
+            &mut output,
+            json!({"type":"status","ready":true,"recall_supported":false}),
+        )
+        .await;
+        recall_barrier(&mut output, &mut events).await;
+        let pending = app
+            .store
+            .begin_recall(&source.id, source.timestamp)
+            .unwrap()
+            .0;
+        app.commands
+            .send(json!({"op":"recall","message":pending}))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let event = events.recv().await.unwrap();
+                if event["message"]["id"] == source.id
+                    && event["message"]["recall_status"] == "failed"
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(60), input.next())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            app.store.message(&source.id).unwrap().unwrap().recall_error,
+            crate::model::RECALL_UNAVAILABLE
+        );
+        app.shutdown.send_replace(true);
+        task.await.unwrap().unwrap();
     }
 
     #[tokio::test]

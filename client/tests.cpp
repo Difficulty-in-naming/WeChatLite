@@ -1463,6 +1463,41 @@ class ClientTests : public QObject
         QVERIFY(!menu->findChild<QAction *>("recallMessage"));
         delete menu;
     }
+    void unsupportedRecallDisablesMenuAndStaleActionsButKeepsCopyQuoteAndLegacyCompatibility()
+    {
+        MessageModel model;
+        model.replace({QJsonObject{{"id", "unavailable"}, {"text", "Fixture text"},
+            {"outgoing", true}, {"status", "sent"}, {"source_id", "fixture-source"},
+            {"timestamp", QDateTime::currentMSecsSinceEpoch()}}});
+        MessageView view;
+        view.setModel(&model);
+        QSignalSpy recalls(&view, &MessageView::recallRequested);
+        auto *oldMenu = view.contextMenuFor(model.index(0), false);
+        auto *oldAction = oldMenu->findChild<QAction *>("recallMessage");
+        QVERIFY(oldAction);
+        view.setRecallCapability({{"recall_supported", false},
+            {"recall_reason", "当前微信版本的后台撤回暂不可用；请在原版微信中撤回"}});
+        oldAction->trigger();
+        QCOMPARE(recalls.count(), 0);
+        delete oldMenu;
+        auto *menu = view.contextMenuFor(model.index(0), false);
+        QVERIFY(!menu->findChild<QAction *>("recallMessage"));
+        auto *reason = menu->findChild<QAction *>("recallUnavailable");
+        QVERIFY(reason && !reason->isEnabled());
+        QCOMPARE(reason->text(), "后台撤回暂不可用，请在微信中撤回");
+        QVERIFY(menu->findChild<QAction *>("copyMessage"));
+        QVERIFY(menu->findChild<QAction *>("quoteMessage"));
+        delete menu;
+        for (const auto &status : {QJsonObject{{"recall_supported", true}}, QJsonObject{}})
+        {
+            view.setRecallCapability(status);
+            QVERIFY(view.recallSupported());
+            menu = view.contextMenuFor(model.index(0), false);
+            QVERIFY(menu->findChild<QAction *>("recallMessage"));
+            QVERIFY(!menu->findChild<QAction *>("recallUnavailable"));
+            delete menu;
+        }
+    }
     void menusHaveARealTransparentSoftShadowAndLightBorder()
     {
         MessageModel model;

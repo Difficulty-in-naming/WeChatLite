@@ -71,6 +71,7 @@ async fn main() -> std::process::ExitCode {
         case!(actions::locate_requires_current_group_selection_and_never_returns_recalled_content),
         case!(actions::quote_canonical_snapshot_cross_group_forgery_and_withdrawal),
         case!(actions::recall_requires_token_selection_owner_confirmation_and_time_window),
+        case!(actions::unsupported_background_recall_is_advertised_in_http_ws_and_never_queued),
         case!(actions::native_quote_and_reply_have_independent_utf8_capacity_before_enqueue),
         case!(actions::pending_recall_survives_restart_as_check_and_never_reissues_action),
         case!(actions::failed_or_uncertain_confirmation_preserves_body_and_does_not_retry),

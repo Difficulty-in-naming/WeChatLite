@@ -103,6 +103,9 @@ pub struct Step {
 }
 
 pub trait Backend {
+    fn recall_supported(&self) -> bool {
+        true
+    }
     fn self_id(&self) -> String {
         String::new()
     }
@@ -915,7 +918,11 @@ impl<A: Backend> Engine<A> {
         })
     }
     pub fn status(&self) -> Value {
-        json!({"type":"status","ready":true,"self_id":self.access.self_id(),"text":format!("已连接本机 Windows 微信 · Rust 适配器 · 已选择 {} 个群转发",self.watched.len())})
+        let recall_supported = self.access.recall_supported();
+        json!({"type":"status","ready":true,"self_id":self.access.self_id(),
+            "recall_supported":recall_supported,
+            "recall_reason":if recall_supported { "" } else { crate::actions::BACKGROUND_RECALL_UNAVAILABLE },
+            "text":format!("已连接本机 Windows 微信 · Rust 适配器 · 已选择 {} 个群转发",self.watched.len())})
     }
     fn authorize(&mut self, group: &str) -> Result<()> {
         ensure!(

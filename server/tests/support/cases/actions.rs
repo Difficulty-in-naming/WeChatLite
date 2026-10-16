@@ -1,5 +1,41 @@
 use super::super::*;
 
+pub async fn unsupported_background_recall_is_advertised_in_http_ws_and_never_queued() -> Result<()>
+{
+    let relay = Relay::new("recall-disabled").await?;
+    relay.api.select(&["fixture-a"]).await?;
+    let status = relay.api.get("/api/status").await?;
+    assert_eq!(status["recall_supported"], false);
+    let mut socket = relay.api.ws(0, None).await?;
+    let events = sync(&mut socket).await?;
+    let ws_status = events
+        .iter()
+        .find(|event| event["type"] == "status")
+        .unwrap();
+    assert_eq!(ws_status["recall_supported"], false);
+    assert_eq!(ws_status["recall_reason"], status["recall_reason"]);
+    let original = relay
+        .confirmed("Original remains readable", json!({}))
+        .await?;
+    let id = original["id"].as_str().unwrap();
+    let before = relay.stored(id)?.unwrap();
+    relay
+        .api
+        .deny(
+            &format!("/api/messages/{id}/recall"),
+            Some(json!({})),
+            None,
+            501,
+        )
+        .await?;
+    let saved = relay.stored(id)?.unwrap();
+    assert_eq!(saved["text"], "Original remains readable");
+    assert_eq!(saved, before);
+    assert!(relay.commands("recall")?.is_empty());
+    assert!(relay.commands("recall_check")?.is_empty());
+    Ok(())
+}
+
 pub async fn locate_requires_current_group_selection_and_never_returns_recalled_content()
 -> Result<()> {
     let relay = Relay::new("forwarding").await?;

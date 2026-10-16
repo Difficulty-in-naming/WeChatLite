@@ -458,15 +458,6 @@ pub fn verify_wechat() -> Result<()> {
     platform::main_process().map(|_| ())
 }
 
-pub fn verified_ui_process() -> Result<(u32, usize)> {
-    let (pid, modules) = platform::main_process()?;
-    let client = modules
-        .iter()
-        .find(|module| module.name == "weixin.dll")
-        .context("微信主模块不可用")?;
-    Ok((pid, client.base))
-}
-
 pub fn request_id(key: &str) -> String {
     hex::encode(Sha256::digest(key.as_bytes()))
 }

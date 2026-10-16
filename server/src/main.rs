@@ -265,9 +265,28 @@ impl App {
         let _ = self.events.send(web::public(value));
     }
     async fn set_status(&self, ready: bool, text: &str) {
-        self.set_status_identity(ready, text, "").await;
+        let previous = self.status.read().await.clone();
+        self.set_status_recall(
+            ready,
+            text,
+            "",
+            previous["recall_supported"].as_bool(),
+            previous["recall_reason"].as_str().unwrap_or(""),
+        )
+        .await;
     }
     async fn set_status_identity(&self, ready: bool, text: &str, identity: &str) {
+        self.set_status_recall(ready, text, identity, None, "")
+            .await;
+    }
+    async fn set_status_recall(
+        &self,
+        ready: bool,
+        text: &str,
+        identity: &str,
+        recall_supported: Option<bool>,
+        recall_reason: &str,
+    ) {
         let identity = if ready
             && identity.len() <= 1024
             && identity.trim() == identity
@@ -278,7 +297,25 @@ impl App {
         } else {
             ""
         };
-        let status = json!({"type":"status", "ready":ready, "text":text, "demo":self.demo,"self_id":identity});
+        let mut status = json!({"type":"status", "ready":ready, "text":text, "demo":self.demo,"self_id":identity});
+        if let Some(supported) = if self.demo {
+            Some(true)
+        } else {
+            recall_supported
+        } {
+            status["recall_supported"] = supported.into();
+            let reason = if supported {
+                ""
+            } else if !recall_reason.trim().is_empty()
+                && recall_reason.chars().count() <= 256
+                && !recall_reason.chars().any(char::is_control)
+            {
+                recall_reason
+            } else {
+                model::RECALL_UNAVAILABLE
+            };
+            status["recall_reason"] = reason.into();
+        }
         *self.status.write().await = status.clone();
         self.publish(status);
     }

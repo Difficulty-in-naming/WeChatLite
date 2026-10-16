@@ -146,6 +146,61 @@ class DesktopTests : public QObject
     Window *window = nullptr;
     QJsonArray demoGroups;
   private slots:
+    void recallCapabilityUsesHttpAndLiveStatusWithoutLateHttpReenablingIt()
+    {
+        RecordsApiFixture api;
+        QVERIFY(api.server.listen(QHostAddress::LocalHost, 0));
+        QSettings settings;
+        const QStringList keys{"serverUrl", "token", "certificatePin", "p2p"};
+        QHash<QString, QVariant> previous;
+        for (const auto &key : keys) previous[key] = settings.value(key);
+        const auto restore = qScopeGuard([previous]
+        {
+            QSettings settings;
+            for (auto it = previous.cbegin(); it != previous.cend(); ++it)
+                if (it.value().isValid()) settings.setValue(it.key(), it.value()); else settings.remove(it.key());
+        });
+        settings.setValue("serverUrl", api.url());
+        settings.setValue("token", "offline-recall-capability-at-least-24");
+        settings.remove("certificatePin"); settings.remove("p2p");
+        bool holdStatus = false;
+        QPointer<QTcpSocket> held;
+        api.handler = [&](QTcpSocket *socket, const QUrl &url)
+        {
+            const auto path = url.path();
+            if (path == "/api/events") return;
+            if (path == "/api/status")
+            {
+                if (holdStatus) { held = socket; return; }
+                RecordsApiFixture::respond(socket, QJsonObject{{"ready", true}, {"recall_supported", false},
+                    {"permissions", QJsonObject{{"can_send", true}, {"can_download", true}}}});
+            }
+            else if (path == "/api/groups" || path.endsWith("/members"))
+                RecordsApiFixture::respond(socket, QJsonArray{});
+            else RecordsApiFixture::respond(socket, QJsonObject{});
+        };
+        Window probe(false);
+        auto *transport = probe.findChild<Transport *>();
+        auto *view = probe.findChild<MessageView *>();
+        QVERIFY(transport && view);
+        QTRY_VERIFY(api.count("/api/groups") > 0);
+        transport->connectionChanged(true);
+        QTRY_VERIFY(!view->recallSupported());
+        transport->event({{"type", "status"}, {"ready", true}, {"recall_supported", true}});
+        QVERIFY(view->recallSupported());
+        holdStatus = true;
+        transport->connectionChanged(true);
+        QTRY_VERIFY(held);
+        transport->event({{"type", "status"}, {"ready", true}, {"recall_supported", false}});
+        QVERIFY(!view->recallSupported());
+        QSignalSpy disconnected(held.data(), &QTcpSocket::disconnected);
+        RecordsApiFixture::respond(held, QJsonObject{{"permissions", QJsonObject{{"can_send", true}, {"can_download", true}}}});
+        QTRY_COMPARE(disconnected.count(), 1);
+        QTest::qWait(30);
+        QVERIFY(!view->recallSupported());
+        transport->event({{"type", "status"}, {"ready", true}});
+        QVERIFY(view->recallSupported());
+    }
     void initTestCase()
     {
         QStandardPaths::setTestModeEnabled(true);

@@ -107,6 +107,8 @@ class MessageView : public StableListView
     bool locateMessage(const QString &id);
     void setVoiceState(const QString &id, const QString &state);
     QString selectedText() const;
+    void setRecallCapability(const QJsonObject &status);
+    bool recallSupported() const { return recallAvailable; }
   signals:
     void mediaClicked(const QJsonObject &media, bool saveOnly);
     void mentionRequested(const QJsonObject &member);
@@ -155,6 +157,8 @@ class MessageView : public StableListView
     QList<QMetaObject::Connection> modelConnections;
     QPointer<QWidget> observedWindow;
     QString gifCachePrefix;
+    bool recallAvailable = true;
+    QString recallUnavailableReason;
 };
 class GroupDelegate : public QStyledItemDelegate
 {

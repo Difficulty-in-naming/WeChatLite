@@ -60,8 +60,10 @@ Actions API version 1:
 | `POST /record-status` | `group`, decimal-string `server_id`, integer `create_time` seconds, integer `local_id` | `ready`, `group`, `server_id`, `create_time`, `local_id`. Checks the existing cache only, without constructing, copying, expiring, destroying or queuing native objects. No pointers are returned. |
 | `GET /result?request_id=<id>&group=<group>` | The original request ID and group | `server_id`, `request_id`, boolean `executed`, `processed`, `success`. Unknown or mismatched requests return 404. |
 
-This legacy module is not the forwarding adapter's recall implementation; recall
-uses the original WeChat UI menu. Loading the optional diagnostic module creates
+This legacy module is not an enabled forwarding recall implementation. There is
+currently no verified background recall path, and the bridge does not fall back
+to foreground UI automation. Users can recall manually in original WeChat.
+Loading the optional diagnostic module creates
 hooks with record observation disabled. The same resident module supports `/stop` followed by `/start`; hooks are never
 unloaded while callbacks might use them. Configuration is reread every second
 and synchronously before every action. Deselected groups' copied records are
@@ -86,7 +88,7 @@ and the documented checks only; it does not confirm a native recall is safe or
 that a recall has occurred. Polling rereads token/account/group grants without
 calling native constructors, copy/destructors or the action queue.
 
-The bridge must use WeChat's original UI menu for an actual recall.
+Users must currently use WeChat's original UI menu manually for an actual recall.
 Default-constructing a DB message and supplying its visible fields is not an
 approved substitute for that path. In particular, native quote construction and
 nonempty DB-clone slots do not prove the associated runtime contexts required
@@ -106,7 +108,8 @@ the message content.
 Only an exact successfully parsed request whose ID has never been reserved and
 whose `(group, server_id)` has never been submitted can additionally carry
 `definite_not_submitted=true` on a validation rejection. Callers may use that
-explicit proof for a later user-requested retry through the original WeChat UI.
+explicit proof to distinguish a rejection from an uncertain historical attempt;
+it does not enable background recall or authorize UI automation.
 An old ID with a changed locator, a new ID for an already submitted message,
 malformed input, native worker failure or an unknown result never carries that
 proof. Repeated or uncertain submissions must still use their saved receipt.

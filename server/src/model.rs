@@ -1,5 +1,19 @@
 use serde::{Deserialize, Serialize};
 
+pub const RECALL_UNAVAILABLE: &str = "当前微信版本的后台撤回暂不可用；请在原版微信中撤回";
+
+pub fn recall_unavailable(status: &serde_json::Value) -> Option<&str> {
+    if status["recall_supported"] != false {
+        return None;
+    }
+    Some(
+        status["recall_reason"]
+            .as_str()
+            .filter(|reason| !reason.is_empty())
+            .unwrap_or(RECALL_UNAVAILABLE),
+    )
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Group {
     pub id: String,

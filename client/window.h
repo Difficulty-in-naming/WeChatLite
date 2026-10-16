@@ -169,6 +169,7 @@ class Window : public QMainWindow
     QSet<QString> pendingPosters, failedPosters;
     quint64 sendGeneration = 0, groupsGeneration = 0, conversationGeneration = 0, historyGeneration = 0;
     quint64 permissionsGeneration = 0;
+    quint64 recallCapabilityGeneration = 0;
     bool busy = false, ready = false, connected = false, loading = false, restoring = false, quitting = false,
          hasOlder = true, canSend = true, canDownload = true;
 };
