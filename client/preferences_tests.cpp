@@ -373,7 +373,7 @@ class PreferencesTests final : public QObject
         QCOMPARE(usage.cache, qint64(0));
     }
 
-    void measuringAndPruningNeverFollowDirectoryLinks()
+    void chosenDownloadRootResolvesAliasButNestedLinksAreSkipped()
     {
         const auto outside = currentFiles->filePath("outside");
         const auto outsideFile = QDir(outside).filePath("must-stay.bin");
@@ -396,10 +396,15 @@ class PreferencesTests final : public QObject
         const auto usage = MediaStorage::measure(downloads);
         QCOMPARE(usage.downloads, qint64(7));
         QCOMPARE(usage.cache, qint64(11));
-        QCOMPARE(MediaStorage::measure(downloadLink).downloads, qint64(0));
+        // A user-selected root can be an alias (including macOS /var). Only
+        // nested links are excluded; measuring the chosen root is read-only.
+        const auto aliasUsage = MediaStorage::measure(downloadLink);
+        QCOMPARE(aliasUsage.downloads, qint64(4096));
+        QCOMPARE(aliasUsage.cache, qint64(11));
         MediaStorage::prune(0, {});
         QCOMPARE(read(outsideFile), QByteArray(4096, 'x'));
         QCOMPARE(read(QDir(downloads).filePath("own.bin")), QByteArray(7, 'd'));
+        QVERIFY(!QFileInfo::exists(cacheFiles->filePath("own.bin")));
     }
 
     void cleanup()
