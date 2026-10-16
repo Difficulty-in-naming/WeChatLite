@@ -572,22 +572,6 @@ impl Backend for Local {
         );
         let server = self.server_id(group, &row)?;
         ensure!(!server.is_empty(), "原微信消息未确认");
-        if text(&row, "type") == "文本" {
-            let raw = self.db.raw_message(
-                group,
-                locator["local_id"].as_i64().context("撤回来源编号无效")?,
-                text(&locator, "shard"),
-            )?;
-            let source =
-                crate::quotes::prepare_recall_source(group, &row, &raw, &self.db.wxid, now)?;
-            ensure!(source["server_id"] == server, "微信撤回原消息定位发生变化");
-            let quotes = self
-                .quotes
-                .as_mut()
-                .with_context(|| format!("微信撤回记录准备组件不可用：{}", self.quotes_error))?;
-            quotes.connect(&self.allowed)?;
-            quotes.prepare_recall(group, &source, now)?;
-        }
         Ok(
             json!({"server_id":server,"create_time":stamp,"local_id":locator["local_id"],"locator":locator}),
         )

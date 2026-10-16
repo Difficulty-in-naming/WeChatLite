@@ -498,15 +498,17 @@ std::map<std::string, std::pair<std::string, json>> quoteAttempts;
 #ifdef ACTION_SELFTEST
 unsigned quoteQueueCalls = 0;
 bool quoteQueueFailure = false;
-unsigned recallPrepareBuilds = 0, recallPrepareCopies = 0;
-std::function<void()> recallPrepareBeforeCopy, recallPrepareAfterCopy;
 #endif
 bool validUtf8(const std::string& value, size_t maximum, bool empty = false) {
     return (empty || !value.empty()) && value.size() <= maximum && value.find('\0') == std::string::npos &&
         (value.empty() || MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value.data(), static_cast<int>(value.size()), nullptr, 0));
 }
-QuoteSource parseQuoteSource(const json& body) {
-    QuoteSource source; const auto& value = body.at("source");
+QuoteRequest parseQuote(const json& body) {
+    QuoteRequest request;
+    request.id = body.at("request_id").get<std::string>();
+    request.reply = body.at("text").get<std::string>();
+    request.atList = body.value("atlist", std::string());
+    auto& source = request.source; const auto& value = body.at("source");
     source.group = body.at("group").get<std::string>();
     if (value.at("group") != source.group) throw Rejected("quoted source belongs to another group; no request submitted");
     if (!value.at("type").is_number_integer() || value.at("type") != 1)
@@ -517,30 +519,20 @@ QuoteSource parseQuoteSource(const json& body) {
     source.content = value.at("content").get<std::string>();
     const auto server = value.at("server_id").get<std::string>();
     const auto local = value.at("local_id").get<uint64_t>(), time = value.at("create_time").get<uint64_t>();
-    if (!std::regex_match(source.group, std::regex("[0-9]{5,24}@chatroom")) ||
+    if (!std::regex_match(source.group, std::regex("[0-9]{5,24}@chatroom")) || !isHex(request.id) ||
         !std::regex_match(server, std::regex("[1-9][0-9]{0,19}")) ||
         !value.at("local_id").is_number_integer() || !value.at("create_time").is_number_integer() ||
         !local || local > UINT32_MAX || !time || time > UINT32_MAX || time > static_cast<uint64_t>(std::time(nullptr)) ||
-        !validUtf8(source.content, 24000))
-        throw Rejected("invalid native source content or locator");
+        !validUtf8(request.reply, 24000) || !validUtf8(source.content, 24000) ||
+        request.atList.size() > 4096 || (!request.atList.empty() && !std::regex_match(request.atList,
+            std::regex("[A-Za-z0-9_-]{1,128}(,[A-Za-z0-9_-]{1,128})*"))))
+        throw Rejected("invalid native quote message, source locator or mention list");
     try { source.server = std::stoull(server); } catch (...) { throw Rejected("invalid quoted server identifier"); }
     source.local = static_cast<uint32_t>(local); source.time = static_cast<uint32_t>(time);
     if (!std::regex_match(source.chat, std::regex("[A-Za-z0-9_-]{1,128}")) ||
         !((source.from == initialSelf && source.to == source.group && source.chat == initialSelf) ||
           (source.from == source.group && source.to == initialSelf)))
         throw Rejected("quoted source participants do not match the selected group/current account");
-    return source;
-}
-QuoteRequest parseQuote(const json& body) {
-    QuoteRequest request;
-    request.source = parseQuoteSource(body);
-    request.id = body.at("request_id").get<std::string>();
-    request.reply = body.at("text").get<std::string>();
-    request.atList = body.value("atlist", std::string());
-    if (!isHex(request.id) || !validUtf8(request.reply, 24000) || request.atList.size() > 4096 ||
-        (!request.atList.empty() && !std::regex_match(request.atList,
-            std::regex("[A-Za-z0-9_-]{1,128}(,[A-Za-z0-9_-]{1,128})*"))))
-        throw Rejected("invalid native quote reply or mention list");
     return request;
 }
 void assignNative(void* object, size_t offset, const std::string& value) {
@@ -563,11 +555,9 @@ std::string nativeText(const void* object, size_t offset, size_t maximum = 24000
     return {bytes, static_cast<size_t>(value->length)};
 }
 std::string queueQuote(const QuoteRequest& request, bool submit,
-    const std::function<void(const std::string&)>& prepared = {},
-    const std::function<void()>& sourceReady = {}) {
+    const std::function<void(const std::string&)>& prepared = {}) {
 #ifdef ACTION_SELFTEST
     (void)request;
-    if (sourceReady) { ++recallPrepareBuilds; sourceReady(); ++recallPrepareCopies; }
     if (submit) {
         if (prepared) prepared("00000000-0000-4000-8000-000000000001");
         ++quoteQueueCalls; if (quoteQueueFailure) throw std::runtime_error("simulated unknown queue outcome");
@@ -603,7 +593,6 @@ std::string queueQuote(const QuoteRequest& request, bool submit,
         nativeText(record.bytes, 0x50) != item.chat || nativeText(record.bytes, 0xE0) != item.content ||
         !*reinterpret_cast<void**>(record.bytes + 0x2C0) || !*reinterpret_cast<void**>(record.bytes + 0x2C8))
         throw Rejected("native quoted source conversion mismatch; no request submitted");
-    if (sourceReady) sourceReady();
     Shared message; QuoteExtras extra;
     native<Shared*(*)(Shared*, const void*, const std::string*, const QuoteExtras*)>(kQuoteFactory)
         (&message, record.bytes, &request.reply, &extra);
@@ -617,10 +606,6 @@ std::string queueQuote(const QuoteRequest& request, bool submit,
         nativeText(payload, 0xB0, 128) != item.group || nativeText(payload, 0x758) != request.reply ||
         nativeText(payload, 0x778, 4096) != request.atList || payload[0x688] != 1 ||
         recordKey(payload + 0x248) != RecordKey{item.group, item.server} ||
-        localId(payload + 0x248) != item.local || stamp(payload + 0x248) != item.time ||
-        nativeText(payload + 0x248, 0x10) != item.from || nativeText(payload + 0x248, 0x50) != item.chat ||
-        nativeText(payload + 0x248, 0xE0) != item.content ||
-        !*reinterpret_cast<void**>(payload + 0x248 + 0x2C0) || !*reinterpret_cast<void**>(payload + 0x248 + 0x2C8) ||
         !std::regex_match(uuid, std::regex("[a-fA-F0-9-]{36}")))
         throw Rejected("native quote factory result mismatch; no request submitted");
     if (submit) {
@@ -634,47 +619,6 @@ std::string queueQuote(const QuoteRequest& request, bool submit,
     }
     return uuid;
 #endif
-}
-QuoteSource parseRecallPreparation(const json& body) {
-    auto source = parseQuoteSource(body);
-    if (source.from != initialSelf || source.to != source.group || source.chat != initialSelf)
-        throw Rejected("recall preparation requires the current account's own source");
-    if (!validAge(source.time, std::time(nullptr)))
-        throw Rejected("recall source is outside the three minute window");
-    return source;
-}
-void checkRecallPreparationAccess(const QuoteSource& source) {
-    refreshSetting();
-    std::lock_guard lock(recordsMutex);
-    if (!enabled || !hooksReady || !failure.empty() || !allowed.contains(source.group))
-        throw Rejected("native recall preparation disabled or group not selected");
-    if (!validAge(source.time, std::time(nullptr)))
-        throw Rejected("recall source is outside the three minute window");
-}
-std::pair<int,json> prepareRecallResponse(const std::string& body) {
-    try {
-        const auto source = parseRecallPreparation(json::parse(body));
-        checkRecallPreparationAccess(source);
-        QuoteRequest probe; probe.source = source; probe.reply = "native recall source preparation";
-        // Construct and release a temporary native reference without queuing it. The
-        // verified factory's 24EB6D0 helper copy-constructs Record+248 through 1A5B50,
-        // so the separate, existing Actions observer retains the original own record.
-        // No module's mutex is held across this native copy or its observer callback.
-        queueQuote(probe, false, {}, [&] {
-#ifdef ACTION_SELFTEST
-            if (recallPrepareBeforeCopy) recallPrepareBeforeCopy();
-#endif
-            checkRecallPreparationAccess(source);
-        });
-#ifdef ACTION_SELFTEST
-        if (recallPrepareAfterCopy) recallPrepareAfterCopy();
-#endif
-        checkRecallPreparationAccess(source);
-        return {200, {{"status","prepared"},{"group",source.group},{"server_id",std::to_string(source.server)},
-            {"local_id",source.local},{"create_time",source.time}}};
-    } catch (const std::exception& error) {
-        return {400, {{"status","rejected"},{"error",error.what()}}};
-    }
 }
 std::string quoteFingerprint(const QuoteRequest& request) {
     const auto& value = request.source;
@@ -739,13 +683,6 @@ void initializeQuoteProfile() {
     check(kDbToRecord,{0x55,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x56,0x57,0x53,0x48,0x83,0xEC,0x68});
     check(kDbDtor,{0x56,0x57,0x48,0x83,0xEC,0x28,0x48,0x89,0xCE});
     check(kQuoteFactory,{0x55,0x41,0x57,0x41,0x56,0x41,0x54,0x56,0x57,0x53,0x48,0x83,0xEC,0x40});
-    // Fresh reference objects take the native copy-constructor branch. These
-    // callsites are in the hash-gated Weixin image, independent of the Actions
-    // DLL's compiler, callback RVA and already installed observation hook.
-    check(0x3995A29,{0x48,0x81,0xC1,0xF0,0x01,0,0,0x48,0x89,0xDA,0xE8,0x98,0x5C,0xB5,0xFE});
-    check(0x24EB6D0,{0x56,0x57,0x48,0x83,0xEC,0x28,0x48,0x89,0xCF,0x48,0x8D,0x71,0x58,
-        0x80,0xB9,0x98,0x04,0,0,0x01,0x75,0x0A});
-    check(0x24EB6F0,{0x48,0x89,0xF1,0xE8,0x58,0xA4,0xCB,0xFD,0xC6,0x87,0x98,0x04,0,0,0x01});
     check(kStringGrow,{0x41,0x57,0x41,0x56,0x41,0x54,0x56,0x57,0x53});
     check(kSendBatch,{0x55,0x41,0x56,0x56,0x57,0x53,0x48,0x81,0xEC,0xE0,0x01,0,0});
     check(0x6F4C70,{0x55,0x56,0x57,0x53,0x48,0x83,0xEC,0x38});
@@ -773,7 +710,7 @@ void routes(httplib::Server& api) {
         std::lock_guard lock(recordsMutex);
 #ifdef WECHAT_QUOTE_ONLY
         auto health = json({{"pid",GetCurrentProcessId()},{"version","4.1.15.13"},{"api_version",1},
-            {"capabilities",json::array({"quote_text","recall_prepare"})},{"source_types",json::array({1})},
+            {"capabilities",json::array({"quote_text"})},{"source_types",json::array({1})},
             {"enabled",enabled.load()},{"selected_groups",allowed.size()},{"hooks_installed",false}});
 #else
         auto health = json({{"pid", GetCurrentProcessId()}, {"version", "4.1.15.13"}, {"api_version", 1},
@@ -793,11 +730,6 @@ void routes(httplib::Server& api) {
         stop(); response.set_content("{\"disabled\":true,\"record_memory_released\":true}", "application/json");
     });
 #ifdef WECHAT_QUOTE_ONLY
-    api.Post("/prepare-recall", [](const auto& request, auto& response) {
-        if (!authorized(request, response)) return;
-        const auto [code,result] = prepareRecallResponse(request.body);
-        response.status = code; response.set_content(result.dump(), "application/json");
-    });
     api.Post("/quote", [](const auto& request, auto& response) {
         if (!authorized(request, response)) return;
         const auto [code,result] = quoteResponse(request.body);
@@ -938,61 +870,6 @@ int main() {
     invalid=message;invalid["text"]=std::string("a\0b",3);assert(rejects([&]{parseQuote(invalid);}));
     invalid=message;invalid["source"]["content"]=std::string(24001,'x');assert(rejects([&]{parseQuote(invalid);}));
     invalid=message;invalid["text"]=std::string("\xC0\xAF",2);assert(rejects([&]{parseQuote(invalid);})); // 5. Strict UTF-8/size/NUL bounds.
-    // Preparation only materializes a fresh, confirmed own DB source for the
-    // existing observer. It creates neither a quote receipt nor an action attempt.
-    auto prepare=json({{"group",group},{"source",message["source"]}});
-    prepare["source"]["create_time"]=static_cast<uint64_t>(std::time(nullptr))-1;
-    const auto ready=prepareRecallResponse(prepare.dump());
-    assert(ready.first==200&&ready.second["status"]=="prepared"&&ready.second["group"]==group&&
-        ready.second["server_id"]=="42"&&ready.second["local_id"]==7&&
-        ready.second["create_time"]==prepare["source"]["create_time"]);
-    assert(prepareRecallResponse(prepare.dump()).second==ready.second);
-    assert(recallPrepareBuilds==2&&recallPrepareCopies==2&&quoteQueueCalls==0&&quoteAttempts.empty()&&attempts.empty());
-    const auto copiedBefore=recallPrepareCopies;
-    auto invalidPrepare=prepare;invalidPrepare["source"]["group"]=otherGroup;
-    assert(prepareRecallResponse(invalidPrepare.dump()).first==400);
-    invalidPrepare=prepare;invalidPrepare["source"]["fromusr"]=group;invalidPrepare["source"]["tousr"]=initialSelf;
-    assert(prepareRecallResponse(invalidPrepare.dump()).first==400);
-    invalidPrepare=prepare;invalidPrepare["source"]["chatusr"]="wxid_another_account";
-    assert(prepareRecallResponse(invalidPrepare.dump()).first==400);
-    for(auto type:{3,43,47,49,57}){invalidPrepare=prepare;invalidPrepare["source"]["type"]=type;
-        assert(prepareRecallResponse(invalidPrepare.dump()).first==400);}
-    for(auto field:{"local_id","create_time"}){invalidPrepare=prepare;invalidPrepare["source"][field]=0;
-        assert(prepareRecallResponse(invalidPrepare.dump()).first==400);}
-    invalidPrepare=prepare;invalidPrepare["source"]["local_id"]=uint64_t(UINT32_MAX)+1;
-    assert(prepareRecallResponse(invalidPrepare.dump()).first==400);
-    invalidPrepare=prepare;invalidPrepare["source"]["server_id"]="0";
-    assert(prepareRecallResponse(invalidPrepare.dump()).first==400);
-    invalidPrepare=prepare;invalidPrepare["source"]["server_id"]="18446744073709551616";
-    assert(prepareRecallResponse(invalidPrepare.dump()).first==400);
-    invalidPrepare=prepare;invalidPrepare["source"]["create_time"]=static_cast<uint64_t>(std::time(nullptr))+1;
-    assert(prepareRecallResponse(invalidPrepare.dump()).first==400);
-    invalidPrepare=prepare;invalidPrepare["source"]["create_time"]=static_cast<uint64_t>(std::time(nullptr))-180;
-    assert(prepareRecallResponse(invalidPrepare.dump()).first==400);
-    assert(validAge(1000,1179)&&!validAge(1000,1180)&&!validAge(1000,999));
-    for(const auto& content:{std::string(),std::string("a\0b",3),std::string("\xC0\xAF",2),std::string(24001,'x')}){
-        invalidPrepare=prepare;invalidPrepare["source"]["content"]=content;
-        assert(rejects([&]{parseRecallPreparation(invalidPrepare);}));}
-    assert(prepareRecallResponse("not JSON").first==400&&recallPrepareCopies==copiedBefore);
-    config["groups"]=json::array();save();assert(prepareRecallResponse(prepare.dump()).first==400);
-    config["groups"]=json::array({group});save();startObservation();stop();
-    assert(prepareRecallResponse(prepare.dump()).first==400);startObservation();
-    config["self_wxid"]="wxid_another_account";save();assert(prepareRecallResponse(prepare.dump()).first==400);
-    config["self_wxid"]=initialSelf;config["token"]=std::string(64,'f');save();
-    assert(prepareRecallResponse(prepare.dump()).first==400);config["token"]=authToken;save();startObservation();
-    failure="ABI unavailable";assert(prepareRecallResponse(prepare.dump()).first==400);failure.clear();
-    hooksReady=false;assert(prepareRecallResponse(prepare.dump()).first==400);hooksReady=true;
-    recallPrepareBeforeCopy=[&]{config["groups"]=json::array();save();};
-    assert(prepareRecallResponse(prepare.dump()).first==400&&recallPrepareCopies==copiedBefore);
-    recallPrepareBeforeCopy={};config["groups"]=json::array({group});save();startObservation();
-    recallPrepareAfterCopy=[&]{config["groups"]=json::array();save();};
-    assert(prepareRecallResponse(prepare.dump()).first==400&&recallPrepareCopies==copiedBefore+1);
-    recallPrepareAfterCopy={};config["groups"]=json::array({group});save();startObservation();
-    httplib::Request prepareAuth;httplib::Response prepareAuthResponse;
-    assert(!authorized(prepareAuth,prepareAuthResponse)&&prepareAuthResponse.status==401);
-    prepareAuth.headers.emplace("Authorization","Bearer "+authToken);assert(authorized(prepareAuth,prepareAuthResponse));
-    assert(quoteQueueCalls==0&&quoteAttempts.empty()&&attempts.empty());
-    std::cout<<"PASS recall preparation: same-group own source, strict locator/UTF-8/180s, hot authorization before/after copy; quote/send/recall queues all 0\n";
     auto maximum=message;maximum["text"]=std::string(24000,'x');maximum["source"]["content"]=std::string(24000,'y');
     assert(parseQuote(maximum).reply.size()==24000&&parseQuote(maximum).source.content.size()==24000);
     maximum["text"]=std::string(24001,'x');assert(rejects([&]{parseQuote(maximum);}));

@@ -1,8 +1,7 @@
 This directory builds two independent modules for the version-verified Windows
 bridge: `WeChatActions.dll` recalls a recent own message using an observed native
 record; `WeChatQuote.dll` creates a native type-57 text reference using verified
-same-group database fields, and can prepare a recent own text source for the
-existing Actions observer without sending anything. Quote installs no observation hooks. Neither module
+same-group database fields. Quote installs no observation hooks. Neither module
 loads itself into any process; the Rust adapter performs WeChat version/hash
 checks and explicit loading. The external `nen/work/WeChat-Hook` checkout is
 unchanged. The existing Actions binary retains its independent fingerprint.
@@ -69,10 +68,8 @@ released. A changed account or token disables actions and clears records.
 A source must have a complete native record observed in this process, belong
 to the current account and currently selected group, have a nonzero server ID,
 and match the requested local ID and creation time. Time must satisfy
-`0 <= now - create_time < 180` seconds. Actions does not reconstruct native records
-from database fields. For a recent own plain-text source, the separate Quote
-module can exercise the verified native constructor/copy path described below,
-allowing observation without opening that group in WeChat. Records absent from observation are rejected before submission,
+`0 <= now - create_time < 180` seconds. No native record is reconstructed from
+database fields. Records absent from observation are rejected before submission,
 with an explicit reason. At most 32 copied records are retained, and they expire
 after three minutes. The module exposes no message bodies.
 
@@ -101,11 +98,10 @@ Quote API version 1:
 
 | Route | Request | Response |
 | --- | --- | --- |
-| `GET /health` | None | `pid`, `version="4.1.15.13"`, `capabilities=["quote_text","recall_prepare"]`, `source_types=[1]`, `hooks_installed=false`, `enabled`, `selected_groups`; optional `error` prevents use. |
+| `GET /health` | None | `pid`, `version="4.1.15.13"`, `capabilities=["quote_text"]`, `source_types=[1]`, `hooks_installed=false`, `enabled`, `selected_groups`; optional `error` prevents use. |
 | `POST /start` | `{}` | Revalidate config and run the native record/clone layout probe without sending; return `enabled=true`. |
 | `POST /stop` | `{}` | Disable further submissions; the resident module is not unloaded. |
 | `POST /quote` | `group`, `source`, nonempty reply `text`, optional comma-separated `atlist`, 64-hex `request_id` | A stable `queued` receipt with `source_server_id`, `request_id`, `uuid`; ambiguous submission returns `uncertain`. |
-| `POST /prepare-recall` | `group`, `source` in the same verified format, with `type=1`, the current account as sender, and age below 180 seconds | `status="prepared"`, `group`, `server_id`, `local_id`, `create_time`. This is native source preparation only, never recall or delivery confirmation. |
 | `GET /result?request_id=<id>&group=<group>` | The original request ID and selected group | Existing local queue receipt only; unknown or mismatched IDs return 404. This never confirms delivery. |
 
 `source` contains `group`, `type=1`, confirmed decimal-string `server_id`, integer
@@ -124,40 +120,6 @@ actual direct appmsg type-57 title and referenced server/from/actor/content in
 the database. Real reference `displayname` may be empty. XML line-ending
 normalization is a confirmation concern and must not mutate the original text
 passed to the native factory.
-
-Recall preparation reuses the same DB-message constructor, DB-to-record
-conversion and type-57 factory with submission disabled. The temporary reference
-is immediately released. In the exact hash-gated Weixin image, factory callsite
-`0x3995A33` invokes `0x24EB6D0`; its fresh-object branch at `0x24EB6F3` invokes the
-native record copy constructor `0x1A5B50` into the reference's `+0x248` slot.
-The existing Actions copy hook can retain that complete native record. Both
-callsites and the fresh-object branch have additional byte fingerprints, and
-the constructed record's IDs, participants, content and owned DB-clone slots
-`+0x2C0/+0x2C8` are checked by the existing conversion path. No new hook, guessed
-object layout, account/group navigation, keystroke or clipboard operation is used.
-This works with the existing fingerprinted Actions binary and independently
-built Actions binaries; it does not depend on their private callback addresses.
-
-The preparation endpoint requires its independent local token, selected group,
-enabled verified constructors, strict UTF-8 content up to 24,000 bytes, and exact
-nonzero confirmed server/local/time fields. Only
-`fromusr=self,tousr=group,chatusr=self` is accepted. Configuration and age are
-checked before construction, immediately before the native copy path, and after
-destruction; the Quote mutex is not held across the native observer callback.
-The Rust adapter must freshly read and cross-check the same-group DB locator
-for every part before requesting any recall. Media sources keep the existing
-observed-record path; their layouts are not synthesized. A `prepared` response
-does not guarantee the bounded Actions cache retained a record, so the existing
-Actions API still validates its own enabled state, permissions, exact native
-locator, three-minute window and idempotent receipt before any queue call.
-Unknown recall outcomes remain uncertain, and actual `revokemsg` confirmation
-is still required before messages are cleared.
-
-The offline preparation regressions check repeated construction, malformed and
-foreign sources, unsupported types, exact time bounds, account/token changes,
-disabled constructors, stop/restart, and revocation both before and after the
-copy. Its native stub records construction/copy counts while proving zero
-quote/send-batch queue calls, zero recall attempts and zero new quote receipts.
 
 Offline build/test commands perform no runtime integration with WeChat. Real
 native quote/recall/reedit acceptance is recorded separately in the public

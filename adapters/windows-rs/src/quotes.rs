@@ -19,7 +19,6 @@ const MAX_DB_TEXT: usize = MAX_TEXT + 131; // 128-byte actor, colon and CRLF.
 pub struct Quotes {
     client: NativeClient,
     directory: PathBuf,
-    self_id: String,
     connected: bool,
     allowed: BTreeSet<String>,
 }
@@ -57,7 +56,6 @@ impl Quotes {
         Ok(Self {
             client,
             directory,
-            self_id: wxid.to_owned(),
             connected: false,
             allowed: BTreeSet::new(),
         })
@@ -110,33 +108,6 @@ impl Quotes {
         }
         self.allowed = groups.clone();
         self.connected = true;
-        Ok(())
-    }
-
-    /// Construct and copy a verified own text record for the independent Actions observer.
-    /// This endpoint has no send/recall queue side effect and its receipt is not a recall result.
-    pub fn prepare_recall(&mut self, group: &str, source: &Value, now: f64) -> Result<()> {
-        ensure!(
-            self.connected && self.allowed.contains(group),
-            "该群尚未获准准备微信撤回记录"
-        );
-        validate_recall_source(group, source, &self.self_id, now)?;
-        let health = self.client.request("/health", None)?;
-        ensure!(
-            quote_health(&health, self.client.pid, true)
-                && health["capabilities"]
-                    .as_array()
-                    .is_some_and(|caps| caps.iter().any(|cap| cap == "recall_prepare")),
-            "微信撤回记录准备组件尚未就绪"
-        );
-        let response = self.client.request(
-            "/prepare-recall",
-            Some(&json!({"group":group,"source":source})),
-        )?;
-        ensure!(
-            valid_prepared_record(&response, group, source),
-            "微信撤回原消息记录未获确认，未提交撤回"
-        );
         Ok(())
     }
 
@@ -385,49 +356,6 @@ pub fn prepare_source(group: &str, row: &Value, raw: &Value, wxid: &str) -> Resu
     )
 }
 
-pub fn prepare_recall_source(
-    group: &str,
-    row: &Value,
-    raw: &Value,
-    wxid: &str,
-    now: f64,
-) -> Result<Value> {
-    let source = prepare_source(group, row, raw, wxid)?;
-    validate_recall_source(group, &source, wxid, now)?;
-    Ok(source)
-}
-
-fn validate_recall_source(group: &str, source: &Value, wxid: &str, now: f64) -> Result<()> {
-    ensure!(
-        group_id(group) && member_id(wxid) && source["group"] == group && source["type"] == 1,
-        "微信撤回记录不属于当前群或不支持该类型"
-    );
-    ensure!(
-        source["fromusr"] == wxid && source["tousr"] == group && source["chatusr"] == wxid,
-        "只能准备当前账号自己的微信撤回记录"
-    );
-    ensure!(
-        server_id(&source["server_id"])? == text(source, "server_id"),
-        "微信撤回消息编号尚未确认"
-    );
-    positive_u32(&source["local_id"], "本地编号")?;
-    let stamp = positive_u32(&source["create_time"], "时间")? as f64;
-    ensure!(
-        now.is_finite() && now >= stamp && now - stamp < 180.0,
-        "已超过3分钟撤回时限或原消息时间无效"
-    );
-    ensure!(bounded_text(text(source, "content")), "微信撤回原文无效");
-    Ok(())
-}
-
-fn valid_prepared_record(value: &Value, group: &str, source: &Value) -> bool {
-    value["status"] == "prepared"
-        && value["group"] == group
-        && ["server_id", "local_id", "create_time"]
-            .iter()
-            .all(|field| !source[field].is_null() && value[field] == source[field])
-}
-
 fn validate_expected(group: &str, expected: &Value) -> Result<()> {
     ensure!(
         text(expected, "kind") == "quote" && group_id(group),
@@ -643,60 +571,6 @@ mod tests {
         assert_eq!(source["tousr"], GROUP);
         row["server_id"] = json!(42);
         assert!(prepare_source(GROUP, &row, &raw, SELF).is_err());
-    }
-    #[test]
-    fn recall_preparation_requires_fresh_confirmed_own_text_and_an_exact_locator() {
-        let (row, raw) = rows(true, "\u{1f642} 保留原文\r\n");
-        let source = prepare_recall_source(GROUP, &row, &raw, SELF, 1001.0).unwrap();
-        assert_eq!(source["content"], row["content"]);
-        for now in [1000.0, 1179.999] {
-            assert!(validate_recall_source(GROUP, &source, SELF, now).is_ok());
-        }
-        for now in [999.0, 1180.0, f64::NAN, f64::INFINITY] {
-            assert!(validate_recall_source(GROUP, &source, SELF, now).is_err());
-        }
-        let (incoming, incoming_raw) = rows(false, "wxid_member:\n原文");
-        assert!(prepare_recall_source(GROUP, &incoming, &incoming_raw, SELF, 1001.0).is_err());
-        for (field, value) in [
-            ("group", json!("555555@chatroom")),
-            ("fromusr", json!("wxid_other")),
-            ("tousr", json!("wxid_other")),
-            ("chatusr", json!("wxid_other")),
-            ("server_id", json!("0")),
-            ("server_id", json!("00042")),
-            ("local_id", json!(0)),
-            ("type", json!(3)),
-            ("content", json!("bad\0body")),
-        ] {
-            let mut changed = source.clone();
-            changed[field] = value;
-            assert!(
-                validate_recall_source(GROUP, &changed, SELF, 1001.0).is_err(),
-                "{field}"
-            );
-        }
-        let mut changed = raw.clone();
-        changed["sort_seq"] = json!(100);
-        assert!(prepare_recall_source(GROUP, &row, &changed, SELF, 1001.0).is_err());
-    }
-    #[test]
-    fn a_prepared_record_receipt_cannot_be_confused_with_a_queue_or_recall_result() {
-        let (row, raw) = rows(true, "原文");
-        let source = prepare_recall_source(GROUP, &row, &raw, SELF, 1001.0).unwrap();
-        let response = json!({"status":"prepared","group":GROUP,"server_id":"42","local_id":7,"create_time":1000});
-        assert!(valid_prepared_record(&response, GROUP, &source));
-        for (field, value) in [
-            ("status", json!("queued")),
-            ("status", json!("recalled")),
-            ("group", json!("555555@chatroom")),
-            ("server_id", json!("43")),
-            ("local_id", json!(8)),
-            ("create_time", json!(1001)),
-        ] {
-            let mut changed = response.clone();
-            changed[field] = value;
-            assert!(!valid_prepared_record(&changed, GROUP, &source), "{field}");
-        }
     }
     #[test]
     fn incoming_envelope_is_only_first_lf_or_crlf_and_authority_is_preserved() {
@@ -947,7 +821,6 @@ mod tests {
         let mut quotes = Quotes {
             client: NativeClient::new(temp.path().join("native-quotes")),
             directory: temp.path().to_owned(),
-            self_id: SELF.to_owned(),
             connected: false,
             allowed: BTreeSet::from([GROUP.to_owned()]),
         };
