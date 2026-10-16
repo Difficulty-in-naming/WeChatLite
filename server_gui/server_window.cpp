@@ -94,6 +94,7 @@ ServerWindow::ServerWindow(const QString &path, bool demonstration, QWidget *par
     auto *overview = new QWidget;
     auto *overviewLayout = new QVBoxLayout(overview);
     auto *form = new QFormLayout;
+    form->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
     state = new QLabel("已停止");
     state->setObjectName("serverState");
     bridge = new QLabel("尚未启动");

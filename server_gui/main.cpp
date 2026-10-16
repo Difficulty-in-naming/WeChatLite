@@ -7,11 +7,13 @@
 #include <QMessageBox>
 #include <QSettings>
 #include <QStandardPaths>
+#include <QStyleHints>
 #include <QTimer>
 
 int main(int argc, char **argv)
 {
     QApplication app(argc, argv);
+    app.styleHints()->setColorScheme(Qt::ColorScheme::Light);
     QCoreApplication::setOrganizationName("WeChatLite");
     QCoreApplication::setApplicationName("WeChatLiteServer");
     QCoreApplication::setApplicationVersion("0.3.0");
