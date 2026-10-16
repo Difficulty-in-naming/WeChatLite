@@ -321,9 +321,21 @@ pub async fn adapter_reconnect_recovers_startup_and_never_retries_unconfirmed_se
     relay.api.select(&["fixture-a"]).await?;
     let original = message("fixture-a", "disconnect before confirmation");
     let id = original["id"].as_str().unwrap();
-    let reconnect_started = Instant::now();
     relay.api.post("/api/messages", original.clone()).await?;
     relay.state(id, "uncertain").await?;
+    let disconnected = eventually(|| async {
+        let status = relay.api.get("/api/status").await?;
+        Ok((status["ready"] == false).then_some(status))
+    })
+    .await?;
+    // The supervisor reports the same delay it sleeps; process startup time is independent.
+    assert!(
+        disconnected["text"]
+            .as_str()
+            .unwrap_or("")
+            .ends_with("；2 秒后自动重试"),
+        "a recovered connection did not reset backoff: {disconnected}"
+    );
     eventually(|| async {
         let ready = relay.api.get("/api/status").await?["ready"] == true;
         let started = adapter_lifecycle(&relay)?
@@ -333,10 +345,6 @@ pub async fn adapter_reconnect_recovers_startup_and_never_retries_unconfirmed_se
         Ok((ready && started == 3).then_some(()))
     })
     .await?;
-    assert!(
-        reconnect_started.elapsed() < Duration::from_secs(4),
-        "a recovered connection did not reset backoff"
-    );
     assert_eq!(
         relay.api.post("/api/messages", original.clone()).await?["status"],
         "uncertain"
