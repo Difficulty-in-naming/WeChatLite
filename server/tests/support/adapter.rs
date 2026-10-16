@@ -49,9 +49,51 @@ fn announcement(directory: &Path, command: &Value) -> Result<()> {
         json!({"type":"announcement","request_id":command["request_id"],"group":command["group"],"available":available,"set":set,"text":if set{"Offline announcement"}else{""},"author_id":if set{"offline-author"}else{""},"author":if set{"Offline author"}else{""},"avatar":"","updated_at":if set{Some(1700000000123i64)}else{None},"path":"private-not-public"}),
     )
 }
+
+struct ActiveAdapter<'a>(&'a Path);
+impl Drop for ActiveAdapter<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut log) = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.0.join("adapter-lifecycle.jsonl"))
+        {
+            let _ = log.write_all(
+                format!("{{\"event\":\"exit\",\"pid\":{}}}\n", std::process::id()).as_bytes(),
+            );
+        }
+        let _ = std::fs::remove_dir(self.0.join("adapter-active"));
+    }
+}
+
 pub fn run(mode: &str, directory: &Path) -> Result<()> {
     if mode == "startup-sentinel" {
         std::fs::write(directory, b"unexpected-start")?;
+        return Ok(());
+    }
+    let _active = if mode.starts_with("reconnect") {
+        if std::fs::create_dir(directory.join("adapter-active")).is_err() {
+            std::fs::write(directory.join("adapter-overlap"), b"overlapping child")?;
+            anyhow::bail!("another fixture adapter is still active");
+        }
+        let mut log = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(directory.join("adapter-lifecycle.jsonl"))?;
+        log.write_all(
+            format!("{{\"event\":\"start\",\"pid\":{}}}\n", std::process::id()).as_bytes(),
+        )?;
+        Some(ActiveAdapter(directory))
+    } else {
+        None
+    };
+    if mode == "reconnect" && !directory.join("adapter-first-failed").exists() {
+        std::fs::write(directory.join("adapter-first-failed"), b"offline at login")?;
+        emit(json!({"type":"status","ready":false,"text":"Offline before native app starts"}))?;
+        // Disconnect the protocol while cleanup is still running: the supervisor must reap this child.
+        io::stdout().write_all(b"invalid fixture protocol\n")?;
+        io::stdout().flush()?;
+        std::thread::sleep(std::time::Duration::from_millis(2300));
         return Ok(());
     }
     if mode == "shutdown" {
@@ -148,6 +190,10 @@ pub fn run(mode: &str, directory: &Path) -> Result<()> {
             "send" => {
                 let row = &command["message"];
                 let id = row["id"].as_str().unwrap();
+                if mode.starts_with("reconnect") && row["text"] == "disconnect before confirmation"
+                {
+                    return Ok(());
+                }
                 if row["text"].as_str().unwrap_or("").starts_with("hold") {
                     held = Some(row.clone());
                 } else {

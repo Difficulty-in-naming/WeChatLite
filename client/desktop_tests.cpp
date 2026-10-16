@@ -2326,7 +2326,10 @@ class DesktopTests : public QObject
         QTRY_VERIFY_WITH_TIMEOUT(!preferences->findChild<QLabel *>("preferencesUsageCache")->text().contains("正在统计"), 5000);
         auto *pool = QThreadPool::globalInstance();
         const auto previousThreads = pool->maxThreadCount();
+        QTRY_VERIFY_WITH_TIMEOUT(!transport->hasActiveDownloads(), 5000);
         QVERIFY(pool->waitForDone(5000));
+        // Worker completion posts its state reset back to the GUI thread.
+        QCoreApplication::sendPostedEvents(nullptr, QEvent::MetaCall);
         pool->setMaxThreadCount(1);
         QSemaphore entered, release;
         pool->start([&] { entered.release(); release.acquire(); });

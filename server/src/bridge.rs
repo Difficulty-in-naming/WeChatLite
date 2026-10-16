@@ -113,11 +113,35 @@ pub async fn start(app: Arc<App>, mut receiver: mpsc::Receiver<Value>) -> Result
         )));
     }
     Ok(tokio::spawn(async move {
-        if let Err(error) = run_process(&app, &mut receiver).await {
-            if !*app.shutdown.borrow() {
-                app.set_status(false, &format!("本机微信连接中断：{error}"))
-                    .await;
+        let delays = [2, 5, 10, 30];
+        let mut attempt = 0;
+        loop {
+            if *app.shutdown.borrow() || receiver.is_closed() {
+                return;
             }
+            // run_process reaps the previous child before another adapter may be started.
+            let result = run_process(&app, &mut receiver).await;
+            if *app.shutdown.borrow() || receiver.is_closed() {
+                return;
+            }
+            if app.status.read().await["ready"] == true {
+                attempt = 0;
+            }
+            let delay = Duration::from_secs(delays[attempt]);
+            let reason = result
+                .err()
+                .map(|error| error.to_string())
+                .unwrap_or_else(|| "适配器已退出".into());
+            app.set_status(
+                false,
+                &format!("本机微信未连接：{reason}；{} 秒后自动重试", delay.as_secs()),
+            )
+            .await;
+            tokio::select! {
+                _ = crate::wait_for_shutdown(app.shutdown.subscribe()) => return,
+                _ = tokio::time::sleep(delay) => {},
+            }
+            attempt = (attempt + 1).min(delays.len() - 1);
         }
     }))
 }

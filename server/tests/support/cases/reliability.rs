@@ -283,3 +283,110 @@ pub async fn unconfirmed_send_restart_is_uncertain_and_not_retried() -> Result<(
     );
     Ok(())
 }
+
+fn adapter_lifecycle(relay: &Relay) -> Result<Vec<Value>> {
+    std::fs::read_to_string(relay.dir.path().join("adapter-lifecycle.jsonl"))?
+        .lines()
+        .map(|line| serde_json::from_str(line).map_err(Into::into))
+        .collect()
+}
+
+fn assert_single_adapter(relay: &Relay, starts: usize, running: bool) -> Result<()> {
+    let events = adapter_lifecycle(relay)?;
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["event"] == "start")
+            .count(),
+        starts
+    );
+    let mut active = None;
+    for event in events {
+        if event["event"] == "start" {
+            assert!(active.is_none(), "adapter processes overlapped");
+            active = Some(event["pid"].clone());
+        } else {
+            assert_eq!(active.take(), Some(event["pid"].clone()));
+        }
+    }
+    assert_eq!(active.is_some(), running);
+    assert!(!relay.dir.path().join("adapter-overlap").exists());
+    Ok(())
+}
+
+pub async fn adapter_reconnect_recovers_startup_and_never_retries_unconfirmed_send() -> Result<()> {
+    let mut relay = Relay::new("reconnect").await?;
+    assert_single_adapter(&relay, 2, true)?;
+    assert_eq!(relay.api.get("/api/groups").await?, json!([]));
+    relay.api.select(&["fixture-a"]).await?;
+    let original = message("fixture-a", "disconnect before confirmation");
+    let id = original["id"].as_str().unwrap();
+    let reconnect_started = Instant::now();
+    relay.api.post("/api/messages", original.clone()).await?;
+    relay.state(id, "uncertain").await?;
+    eventually(|| async {
+        let ready = relay.api.get("/api/status").await?["ready"] == true;
+        let started = adapter_lifecycle(&relay)?
+            .iter()
+            .filter(|event| event["event"] == "start")
+            .count();
+        Ok((ready && started == 3).then_some(()))
+    })
+    .await?;
+    assert!(
+        reconnect_started.elapsed() < Duration::from_secs(4),
+        "a recovered connection did not reset backoff"
+    );
+    assert_eq!(
+        relay.api.post("/api/messages", original.clone()).await?["status"],
+        "uncertain"
+    );
+    relay
+        .confirmed("message after adapter recovery", json!({}))
+        .await?;
+    assert_eq!(
+        relay
+            .commands("send")?
+            .iter()
+            .filter(|command| command["message"]["id"] == id)
+            .count(),
+        1
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&std::fs::read(
+            relay.dir.path().join("initial-policy.json")
+        )?)?,
+        json!(["fixture-a"])
+    );
+    assert_eq!(
+        relay.api.get("/api/local/forwarding").await?["selected"],
+        json!(["fixture-a"])
+    );
+    assert_single_adapter(&relay, 3, true)?;
+    relay.stop().await?;
+    assert_single_adapter(&relay, 3, false)?;
+    Ok(())
+}
+
+pub async fn adapter_reconnect_shutdown_interrupts_backoff_without_another_child() -> Result<()> {
+    let mut relay = Relay::new("reconnect-shutdown").await?;
+    relay.api.select(&["fixture-a"]).await?;
+    let original = message("fixture-a", "disconnect before confirmation");
+    let id = original["id"].as_str().unwrap();
+    relay.api.post("/api/messages", original.clone()).await?;
+    relay.state(id, "uncertain").await?;
+    eventually(|| async {
+        Ok((relay.api.get("/api/status").await?["ready"] == false).then_some(()))
+    })
+    .await?;
+    let start = Instant::now();
+    relay.stop().await?;
+    assert!(
+        start.elapsed() < Duration::from_millis(1500),
+        "shutdown waited for retry delay"
+    );
+    tokio::time::sleep(Duration::from_millis(2200)).await;
+    assert_single_adapter(&relay, 1, false)?;
+    assert_eq!(relay.stored(id)?.unwrap()["status"], "uncertain");
+    Ok(())
+}

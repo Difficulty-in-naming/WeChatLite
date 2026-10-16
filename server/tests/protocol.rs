@@ -84,6 +84,8 @@ async fn main() -> std::process::ExitCode {
         case!(records::announcements_are_readonly_authorized_and_distinguish_unset_from_unavailable),
         case!(records::announcement_timeout_deduplicates_waiters_and_ignores_the_old_generation),
         case!(reliability::unconfirmed_send_restart_is_uncertain_and_not_retried),
+        case!(reliability::adapter_reconnect_recovers_startup_and_never_retries_unconfirmed_send),
+        case!(reliability::adapter_reconnect_shutdown_interrupts_backoff_without_another_child),
     ];
     let mut options = args.iter();
     let mut filter = None;
