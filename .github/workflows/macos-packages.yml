@@ -29,9 +29,9 @@ jobs:
         run: |
           set -euo pipefail
           test "$(uname -m)" = arm64
-          rustup toolchain install stable --profile minimal
-          rustup override set stable
-          python3 -m pip install --disable-pip-version-check aqtinstall==3.3.0 cmake==3.31.8
+          rustup toolchain install 1.95.0 --profile minimal
+          rustup override set 1.95.0
+          python3 -m pip install --disable-pip-version-check aqtinstall==3.3.0 cmake==3.31.6
           python3 -m aqt install-qt mac desktop 6.8.3 clang_64 \
             --archives qtbase qtsvg qttools --modules qtwebsockets --outputdir "$PWD/.qt"
           echo "QT_PREFIX=$PWD/.qt/6.8.3/macos" >> "$GITHUB_ENV"
