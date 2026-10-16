@@ -22,6 +22,7 @@
 #include <QPushButton>
 #include <QSslCertificate>
 #include <QSplitter>
+#include <QTimer>
 #include <QVBoxLayout>
 
 ClientPermissions::ClientPermissions(const QString &path, QWidget *parent)
@@ -413,9 +414,10 @@ void ClientPermissions::showCredential(const QString &clientName, const QString 
     file.open(QIODevice::ReadOnly);
     const auto config = QJsonDocument::fromJson(file.readAll()).object();
     QUrl endpoint("http://" + config.value("listen").toString());
-    const auto certificates = QSslCertificate::fromPath(
-        QFileInfo(configPath).dir().absoluteFilePath(config.value("tls_cert").toString()));
-    const bool tls = !config.value("tls_cert").toString().isEmpty();
+    const auto certificatePath = config.value("tls_cert").toString();
+    const bool tls = !certificatePath.isEmpty();
+    const auto certificates = tls ? QSslCertificate::fromPath(
+        QFileInfo(configPath).dir().absoluteFilePath(certificatePath)) : QList<QSslCertificate>{};
     QString pin;
     if (tls && !certificates.isEmpty())
     {
@@ -462,10 +464,49 @@ void ClientPermissions::showCredential(const QString &clientName, const QString 
         endpoint.setHost(address == QHostAddress::AnyIPv4 ? "127.0.0.1" : "::1");
     }
     urls->addItem(endpoint.toString());
-    form->addRow("客户端可达的服务器地址", urls);
-    urls->setEnabled(p2p.isEmpty());
-    connect(mode, &QComboBox::currentIndexChanged, &dialog,
-        [mode, urls] { urls->setEnabled(mode->currentData().toString() == "direct"); });
+    QStringList directAddresses;
+    for (int i = 0; i < urls->count(); ++i)
+        directAddresses.append(urls->itemText(i));
+    QString directAddress = urls->currentText();
+    auto *addressLabel = new QLabel;
+    addressLabel->setObjectName("clientCredentialAddressLabel");
+    auto *editRelay = new QPushButton("修改中转设置");
+    editRelay->setObjectName("clientCredentialEditRelay");
+    auto *addressRow = new QHBoxLayout;
+    addressRow->addWidget(urls, 1);
+    addressRow->addWidget(editRelay);
+    form->addRow(addressLabel, addressRow);
+    auto *addressHint = new QLabel;
+    addressHint->setObjectName("clientCredentialAddressHint");
+    addressHint->setWordWrap(true);
+    form->addRow(QString(), addressHint);
+    const auto updateAddress = [mode, urls, addressLabel, addressHint, editRelay, p2p,
+                                directAddresses, &directAddress]
+    {
+        if (!urls->lineEdit()->isReadOnly())
+            directAddress = urls->currentText();
+        const bool automatic = mode->currentData().toString() == "p2p";
+        urls->clear();
+        if (automatic)
+            urls->addItem(p2p.value("relay_url").toString());
+        else
+        {
+            urls->addItems(directAddresses);
+            urls->setCurrentText(directAddress);
+        }
+        urls->lineEdit()->setReadOnly(automatic);
+        addressLabel->setText(automatic ? "公网中转地址" : "客户端可达的服务器地址");
+        addressHint->setText(automatic ? "此地址来自服务端配置，修改后服务端和客户端需使用同一入口。" :
+            "填写客户端可直接访问的微信电脑地址；此处不能填写只提供 P2P 中转的服务器地址。");
+        editRelay->setVisible(automatic);
+    };
+    connect(mode, &QComboBox::currentIndexChanged, &dialog, updateAddress);
+    connect(editRelay, &QPushButton::clicked, &dialog, [this, &dialog]
+    {
+        dialog.accept();
+        QTimer::singleShot(0, this, [this] { emit editConnectionRequested(); });
+    });
+    updateAddress();
     auto *secret = new QLineEdit(token);
     secret->setObjectName("clientCredentialToken");
     secret->setReadOnly(true);

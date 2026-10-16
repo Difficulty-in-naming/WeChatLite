@@ -15,6 +15,7 @@
 #include <QJsonDocument>
 #include <QLabel>
 #include <QMenu>
+#include <QMessageBox>
 #include <QNetworkInterface>
 #include <QPainter>
 #include <QPlainTextEdit>
@@ -201,10 +202,9 @@ ServerWindow::ServerWindow(const QString &path, bool demonstration, QWidget *par
     connect(start, &QPushButton::clicked, this, &ServerWindow::startService);
     connect(stop, &QPushButton::clicked, this, &ServerWindow::stopService);
     connect(settings, &QPushButton::clicked, this, [this]
-    {
-        if (service.state() == QProcess::NotRunning && editLocalService(this, configPath))
-            feedback->setText("连接配置已保存，启动服务后生效。");
-    });
+        { configureService(); });
+    connect(clients, &ClientPermissions::editConnectionRequested, this,
+        [this] { configureService(true); });
     connect(folder, &QPushButton::clicked, this, [this]
     {
         QFile file(configPath);
@@ -393,6 +393,31 @@ void ServerWindow::stopService()
     stop->setEnabled(false);
     state->setText("正在停止…");
     admin.shutdownLocalServer(&service);
+}
+
+void ServerWindow::configureService(bool showAutomatic)
+{
+    if (service.state() != QProcess::NotRunning)
+    {
+        if (QMessageBox::question(this, "修改中转设置",
+            "修改中转地址需要暂时停止服务，客户端会短暂断开。"
+            "已有密钥、群和权限会保留；保存后请重新启动服务。是否继续？",
+            QMessageBox::Yes | QMessageBox::No, QMessageBox::No) != QMessageBox::Yes)
+            return;
+        if (service.state() == QProcess::NotRunning)
+        {
+            configureService(showAutomatic);
+            return;
+        }
+        connect(&service, &QProcess::finished, this, [this, showAutomatic]
+        {
+            QTimer::singleShot(0, this, [this, showAutomatic] { configureService(showAutomatic); });
+        }, Qt::SingleShotConnection);
+        stopService();
+        return;
+    }
+    if (editLocalService(this, configPath, showAutomatic))
+        feedback->setText("连接配置已保存，启动服务后生效。请为客户端重新复制连接信息。");
 }
 
 void ServerWindow::pollStatus()

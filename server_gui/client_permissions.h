@@ -17,6 +17,9 @@ class ClientPermissions : public QWidget
     explicit ClientPermissions(const QString &configPath, QWidget *parent = nullptr);
     void refresh();
 
+  signals:
+    void editConnectionRequested();
+
   private:
     void selectClient();
     void newClient();

@@ -47,9 +47,12 @@ bool store(const QString &path, const QByteArray &contents, const QDateTime &mod
     if (!QDir().mkpath(QFileInfo(path).absolutePath()))
         return false;
     QFile file(path);
-    if (!file.open(QIODevice::WriteOnly) || file.write(contents) != contents.size())
+    if (!file.open(QIODevice::WriteOnly) || file.write(contents) != contents.size() || !file.flush())
         return false;
-    return !modified.isValid() || file.setFileTime(modified, QFileDevice::FileModificationTime);
+    if (modified.isValid() && !file.setFileTime(modified, QFileDevice::FileModificationTime))
+        return false;
+    file.close();
+    return !modified.isValid() || QFileInfo(path).lastModified() == modified;
 }
 
 QByteArray read(const QString &path)
@@ -322,6 +325,7 @@ class PreferencesTests final : public QObject
         QVERIFY(store(active, QByteArray(128, 'c'), baseTime.addSecs(2)));
         QVERIFY(store(partial, QByteArray(256, 'd'), baseTime.addSecs(3)));
         QVERIFY(store(userFile, QByteArray(512, 'u')));
+        QVERIFY(QFileInfo(oldest).lastModified() < QFileInfo(newer).lastModified());
         const QSet<QString> protectedPaths{active, partial};
         const auto first = MediaStorage::prune(96 + 128 + 256, protectedPaths);
         QCOMPARE(first.removed, QStringList{oldest});

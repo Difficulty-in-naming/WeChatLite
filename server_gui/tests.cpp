@@ -9,6 +9,7 @@
 #include <QClipboard>
 #include <QComboBox>
 #include <QDialog>
+#include <QDialogButtonBox>
 #include <QFile>
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -18,6 +19,7 @@
 #include <QMessageBox>
 #include <QPushButton>
 #include <QSaveFile>
+#include <QSignalSpy>
 #include <QSslCertificate>
 #include <QSslKey>
 #include <QSslSocket>
@@ -28,6 +30,7 @@
 #include <QTimer>
 #include <QUuid>
 #include <memory>
+#include <functional>
 
 namespace
 {
@@ -157,11 +160,16 @@ bool writeFixtureConfiguration(const QString &directory, const AdminFixture &fix
     if (!certificate.open(QIODevice::WriteOnly) || certificate.write(TestTlsIdentity::selfSignedPem) <= 0)
         return false;
     certificate.close();
+    QFile key(directory + "/key.pem");
+    if (!key.open(QIODevice::WriteOnly) || key.write(TestTlsIdentity::selfSignedKey) <= 0)
+        return false;
+    key.close();
     p2p.insert("enabled", true);
     QFile config(directory + "/server.json");
     return config.open(QIODevice::WriteOnly) && config.write(QJsonDocument(QJsonObject{
         {"listen", "127.0.0.1:" + QString::number(fixture.serverPort())}, {"token", fixture.secret},
-        {"tls_cert", certificate.fileName()}, {"p2p", p2p}}).toJson()) > 0;
+        {"data", directory + "/data"}, {"tls_cert", certificate.fileName()}, {"tls_key", key.fileName()},
+        {"keep", "fixture setting preserved"}, {"p2p", p2p}}).toJson()) > 0;
 }
 
 // Modal handlers must always close their dialog, including failure paths: otherwise
@@ -169,11 +177,13 @@ bool writeFixtureConfiguration(const QString &directory, const AdminFixture &fix
 class CredentialInteraction final : public QObject
 {
   public:
-    enum class Action { Copy, Cancel, Forbid };
+    enum class Action { Copy, Cancel, EditRelay, Forbid };
     bool complete = false, timedOut = false, confirmed = false, defaultNo = false;
     bool hiddenByDefault = false, revealWorks = false;
-    QString error, title;
+    QString error, title, addressText, addressLabel;
+    bool addressReadOnly = false;
     QJsonObject connection;
+    std::function<QString(QDialog &)> inspect;
 
     explicit CredentialInteraction(QWidget &parent) : owner(parent)
     {
@@ -218,33 +228,49 @@ class CredentialInteraction final : public QObject
             auto *dialog = owner.findChild<QDialog *>("clientCredentialDialog");
             if (!dialog || !dialog->isVisible())
                 return;
-            stop(); // Clipboard callbacks may dispatch nested platform events.
+            poll.stop(); // Clipboard callbacks may dispatch nested platform events; keep the deadline armed.
             title = dialog->windowTitle();
             auto *copy = dialog->findChild<QPushButton *>("clientCredentialCopy");
             auto *secret = dialog->findChild<QLineEdit *>("clientCredentialToken");
             auto *reveal = dialog->findChild<QCheckBox *>("clientCredentialReveal");
+            auto *urls = dialog->findChild<QComboBox *>("clientCredentialUrl");
+            auto *label = dialog->findChild<QLabel *>("clientCredentialAddressLabel");
             if (action == Action::Forbid)
                 error = "An operation unexpectedly displayed a credential";
-            else if (!copy || !secret || !reveal || !copy->isEnabled())
+            else if (!copy || !secret || !reveal || !urls || !urls->lineEdit() || !label || !copy->isEnabled())
                 error = "Credential controls are missing or disabled";
             else
             {
+                addressText = urls->currentText();
+                addressLabel = label->text();
+                addressReadOnly = urls->lineEdit()->isReadOnly();
+                if (inspect)
+                    error = inspect(*dialog);
                 hiddenByDefault = !reveal->isChecked() && secret->isReadOnly() &&
                     secret->echoMode() == QLineEdit::Password;
                 reveal->click();
                 const bool visible = secret->echoMode() == QLineEdit::Normal;
                 reveal->click();
                 revealWorks = visible && secret->echoMode() == QLineEdit::Password;
-                if (action == Action::Copy)
+                if (action == Action::Copy && error.isEmpty())
                 {
                     copy->click();
                     connection = QJsonDocument::fromJson(QApplication::clipboard()->text().toUtf8()).object();
                 }
+                if (action == Action::EditRelay && error.isEmpty())
+                {
+                    auto *edit = dialog->findChild<QPushButton *>("clientCredentialEditRelay");
+                    if (!edit || !edit->isVisible() || !edit->isEnabled())
+                        error = "Relay settings entry is missing or disabled";
+                    else
+                        edit->click();
+                }
             }
+            stop();
             complete = true;
             if (action == Action::Cancel || !error.isEmpty())
                 dialog->reject();
-            else
+            else if (action != Action::EditRelay)
                 dialog->accept();
         });
     }
@@ -257,6 +283,10 @@ class CredentialInteraction final : public QObject
         complete = timedOut = confirmed = defaultNo = hiddenByDefault = revealWorks = false;
         error.clear();
         title.clear();
+        addressText.clear();
+        addressLabel.clear();
+        addressReadOnly = false;
+        inspect = {};
         connection = {};
         poll.start();
         deadline.start();
@@ -396,7 +426,81 @@ class ServerGuiTests : public QObject
         QVERIFY2(error.isEmpty(), qPrintable(error));
         QVERIFY(!value.toObject().value("permissions").toObject().value("can_send").toBool(true));
         QVERIFY(!value.toObject().value("permissions").toObject().value("can_download").toBool(true));
-        window.stopService();
+        auto *permissions = window.findChild<ClientPermissions *>("clientPermissions");
+        QVERIFY(permissions);
+        credential.arm(CredentialInteraction::Action::Forbid, QMessageBox::No);
+        permissions->editConnectionRequested();
+        QTRY_VERIFY_WITH_TIMEOUT(credential.complete || credential.timedOut, 5000);
+        QVERIFY2(credential.error.isEmpty(), qPrintable(credential.error));
+        QVERIFY(credential.confirmed && credential.defaultNo);
+        QVERIFY(window.findChild<QPushButton *>("serverStop")->isEnabled());
+        QVERIFY(!window.findChild<QDialog *>("serviceConnectionSettings"));
+
+        // The owned demo can finish while the consent message box is open. Agreeing
+        // afterward must open settings immediately rather than wait for a past signal.
+        QFile beforeMaintenance(path);
+        QVERIFY(beforeMaintenance.open(QIODevice::ReadOnly));
+        const auto configBeforeMaintenance = beforeMaintenance.readAll();
+        beforeMaintenance.close();
+        bool stoppedDuringConsent = false, acceptedAfterStop = false, openedAutomatic = false, maintenanceTimedOut = false;
+        QTimer consent, settings, deadline;
+        consent.setInterval(20);
+        settings.setInterval(20);
+        deadline.setSingleShot(true);
+        deadline.setInterval(10000);
+        connect(&consent, &QTimer::timeout, &window, [&]
+        {
+            auto *question = window.findChild<QMessageBox *>();
+            if (!question || !question->isVisible())
+                return;
+            if (!stoppedDuringConsent)
+            {
+                stoppedDuringConsent = true;
+                window.stopService();
+                return;
+            }
+            if (window.findChild<QLabel *>("serverState")->text() != "已停止")
+                return;
+            auto *yes = question->button(QMessageBox::Yes);
+            if (!yes)
+                return;
+            consent.stop();
+            acceptedAfterStop = true;
+            yes->click();
+        });
+        connect(&settings, &QTimer::timeout, &window, [&]
+        {
+            auto *dialog = window.findChild<QDialog *>("serviceConnectionSettings");
+            if (!dialog || !dialog->isVisible())
+                return;
+            auto *settingsTabs = dialog->findChild<QTabWidget *>("serviceConnectionTabs");
+            openedAutomatic = settingsTabs && settingsTabs->currentIndex() == 1;
+            settings.stop();
+            dialog->reject();
+        });
+        connect(&deadline, &QTimer::timeout, &window, [&]
+        {
+            maintenanceTimedOut = true;
+            consent.stop();
+            settings.stop();
+            if (auto *question = window.findChild<QMessageBox *>())
+                question->reject();
+            if (auto *dialog = window.findChild<QDialog *>("serviceConnectionSettings"))
+                dialog->reject();
+        });
+        consent.start();
+        settings.start();
+        deadline.start();
+        permissions->editConnectionRequested();
+        QTRY_VERIFY_WITH_TIMEOUT(openedAutomatic || maintenanceTimedOut, 5000);
+        deadline.stop();
+        consent.stop();
+        settings.stop();
+        QVERIFY(!maintenanceTimedOut && stoppedDuringConsent && acceptedAfterStop && openedAutomatic);
+        QCOMPARE(window.findChild<QLabel *>("serverState")->text(), QString("已停止"));
+        QFile afterMaintenance(path);
+        QVERIFY(afterMaintenance.open(QIODevice::ReadOnly));
+        QCOMPARE(afterMaintenance.readAll(), configBeforeMaintenance);
     }
 
     void localAdminRejectsSpecificLanBindAndMissingCertificate()
@@ -639,6 +743,9 @@ class ServerGuiTests : public QObject
         QTRY_VERIFY_WITH_TIMEOUT(interaction.complete || interaction.timedOut, 5000);
         QVERIFY2(interaction.error.isEmpty(), qPrintable(interaction.error));
         QVERIFY(interaction.hiddenByDefault && interaction.revealWorks);
+        QCOMPARE(interaction.addressLabel, QString("公网中转地址"));
+        QCOMPARE(interaction.addressText, relayEntry().value("relay_url").toString());
+        QVERIFY(interaction.addressReadOnly);
         QCOMPARE(fixture.p2pReads, beforeFirstCopy + 1);
         QCOMPARE(interaction.connection.value("token").toString(), fixture.clientToken);
         QCOMPARE(interaction.connection.value("serverUrl").toString(), "p2p://" + fixture.serverId);
@@ -659,6 +766,8 @@ class ServerGuiTests : public QObject
         QTest::mouseClick(copy, Qt::LeftButton);
         QTRY_VERIFY_WITH_TIMEOUT(interaction.complete || interaction.timedOut, 5000);
         QVERIFY2(interaction.error.isEmpty(), qPrintable(interaction.error));
+        QCOMPARE(interaction.addressText, changedEntry.value("relay_url").toString());
+        QVERIFY(interaction.addressReadOnly);
         QCOMPARE(fixture.p2pReads, beforeSecondCopy + 1);
         QCOMPARE(fixture.credentialReads, 3);
         QCOMPARE(interaction.connection.value("token").toString(), fixture.clientToken);
@@ -678,6 +787,179 @@ class ServerGuiTests : public QObject
         QCOMPARE(fixture.updated, 0);
         QCOMPARE(fixture.rotated, 0);
         QCOMPARE(fixture.rejectedAuthorization, 0);
+    }
+
+    void automaticCredentialDistinguishesRelayAndDirectAddressesAndRequestsEditing()
+    {
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        AdminFixture fixture;
+        fixture.seedClient();
+        QVERIFY(fixture.listen(QHostAddress::LocalHost, 0));
+        QVERIFY(writeFixtureConfiguration(directory.path(), fixture));
+        ClientPermissions editor(directory.filePath("server.json"));
+        CredentialInteraction interaction(editor);
+        QSignalSpy editRequested(&editor, &ClientPermissions::editConnectionRequested);
+        editor.show();
+        editor.refresh();
+        auto *open = editor.findChild<QPushButton *>("clientAccessCredential");
+        QTRY_VERIFY_WITH_TIMEOUT(open && open->isEnabled(), 5000);
+        QJsonObject directConnection;
+        const QString directAddress = "https://192.0.2.47:9876";
+        interaction.arm(CredentialInteraction::Action::Copy);
+        interaction.inspect = [&](QDialog &dialog) -> QString
+        {
+            auto *mode = dialog.findChild<QComboBox *>("clientCredentialMode");
+            auto *urls = dialog.findChild<QComboBox *>("clientCredentialUrl");
+            auto *label = dialog.findChild<QLabel *>("clientCredentialAddressLabel");
+            auto *edit = dialog.findChild<QPushButton *>("clientCredentialEditRelay");
+            auto *copy = dialog.findChild<QPushButton *>("clientCredentialCopy");
+            if (!mode || !urls || !urls->lineEdit() || !label || !edit || !copy)
+                return "Credential address controls are missing";
+            if (mode->currentData().toString() != "p2p" || !urls->isEnabled() || !urls->lineEdit()->isReadOnly() ||
+                urls->currentText() != relayEntry().value("relay_url").toString() ||
+                label->text() != "公网中转地址" || !edit->isVisible())
+                return "Automatic mode must display its configured relay URL";
+            mode->setCurrentIndex(mode->findData("direct"));
+            if (urls->lineEdit()->isReadOnly() || !urls->isEnabled() || edit->isVisible() ||
+                label->text() != "客户端可达的服务器地址")
+                return "Direct mode must provide an editable client-reachable address";
+            urls->setEditText(directAddress);
+            copy->click();
+            directConnection = QJsonDocument::fromJson(QApplication::clipboard()->text().toUtf8()).object();
+            mode->setCurrentIndex(mode->findData("p2p"));
+            if (!urls->lineEdit()->isReadOnly() ||
+                urls->currentText() != relayEntry().value("relay_url").toString())
+                return "Switching to automatic mode must restore the relay URL";
+            mode->setCurrentIndex(mode->findData("direct"));
+            if (urls->currentText() != directAddress)
+                return "Switching modes lost the typed direct address";
+            mode->setCurrentIndex(mode->findData("p2p"));
+            return {};
+        };
+        QTest::mouseClick(open, Qt::LeftButton);
+        QTRY_VERIFY_WITH_TIMEOUT(interaction.complete || interaction.timedOut, 5000);
+        QVERIFY2(interaction.error.isEmpty(), qPrintable(interaction.error));
+        QCOMPARE(directConnection.value("mode").toString(), QString("direct"));
+        QCOMPARE(directConnection.value("serverUrl").toString(), directAddress);
+        QCOMPARE(directConnection.value("token").toString(), fixture.clientToken);
+        QVERIFY(!directConnection.contains("p2p"));
+        QCOMPARE(interaction.connection.value("mode").toString(), QString("p2p"));
+        QCOMPARE(interaction.connection.value("serverUrl").toString(), "p2p://" + fixture.serverId);
+        QCOMPARE(interaction.connection.value("p2p").toObject().value("relay_url"), relayEntry().value("relay_url"));
+
+        const QString sentinel = "edit-relay-does-not-copy-or-rotate";
+        QApplication::clipboard()->setText(sentinel);
+        interaction.arm(CredentialInteraction::Action::EditRelay);
+        QTest::mouseClick(open, Qt::LeftButton);
+        QTRY_VERIFY_WITH_TIMEOUT(interaction.complete || interaction.timedOut, 5000);
+        QVERIFY2(interaction.error.isEmpty(), qPrintable(interaction.error));
+        QTRY_COMPARE(editRequested.size(), 1);
+        QVERIFY(!editor.findChild<QDialog *>("clientCredentialDialog"));
+        QCOMPARE(QApplication::clipboard()->text(), sentinel);
+        QCOMPARE(fixture.created, 0);
+        QCOMPARE(fixture.updated, 0);
+        QCOMPARE(fixture.rotated, 0);
+        QCOMPARE(fixture.rejectedAuthorization, 0);
+    }
+
+    void automaticSettingsEditAddressPreservesCredentialsAndCancelDoesNotWrite()
+    {
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        AdminFixture fixture;
+        QVERIFY(fixture.listen(QHostAddress::LocalHost, 0));
+        QVERIFY(writeFixtureConfiguration(directory.path(), fixture));
+        const auto path = directory.filePath("server.json");
+        const auto readConfig = [&]
+        {
+            QFile file(path);
+            return file.open(QIODevice::ReadOnly) ? file.readAll() : QByteArray();
+        };
+        const auto originalBytes = readConfig();
+        const auto original = QJsonDocument::fromJson(originalBytes).object();
+        QWidget owner;
+        bool timedOut = false, startsAutomatic = false, editable = false, invalidRejected = false;
+        QString failure;
+        QTimer deadline;
+        deadline.setSingleShot(true);
+        deadline.setInterval(10000);
+        connect(&deadline, &QTimer::timeout, &owner, [&]
+        {
+            timedOut = true;
+            if (auto *dialog = owner.findChild<QDialog *>("serviceConnectionSettings"))
+            {
+                if (auto *message = dialog->findChild<QMessageBox *>())
+                    message->reject();
+                dialog->reject();
+            }
+        });
+        QTimer::singleShot(0, &owner, [&]
+        {
+            auto *dialog = owner.findChild<QDialog *>("serviceConnectionSettings");
+            auto *tabs = dialog ? dialog->findChild<QTabWidget *>("serviceConnectionTabs") : nullptr;
+            auto *url = dialog ? dialog->findChild<QLineEdit *>("serviceRelayUrl") : nullptr;
+            if (!dialog || !tabs || !url)
+            {
+                failure = "Automatic settings controls are missing";
+                if (dialog)
+                    dialog->reject();
+                return;
+            }
+            startsAutomatic = tabs->currentIndex() == 1;
+            editable = !url->isReadOnly() && url->isEnabled();
+            url->setText("https://cancelled-relay.invalid:54443/");
+            dialog->reject();
+        });
+        deadline.start();
+        const bool cancelAccepted = editLocalService(&owner, path, true);
+        deadline.stop();
+        QVERIFY2(!timedOut && failure.isEmpty(), qPrintable(failure));
+        QVERIFY(!cancelAccepted && startsAutomatic && editable);
+        QCOMPARE(readConfig(), originalBytes);
+
+        const QString editedUrl = "https://updated-relay.invalid:54443/";
+        QTimer::singleShot(0, &owner, [&]
+        {
+            auto *dialog = owner.findChild<QDialog *>("serviceConnectionSettings");
+            auto *url = dialog ? dialog->findChild<QLineEdit *>("serviceRelayUrl") : nullptr;
+            auto *save = dialog ? dialog->findChild<QPushButton *>("serviceConnectionSave") : nullptr;
+            auto *status = dialog ? dialog->findChild<QLabel *>("serviceP2pEntryStatus") : nullptr;
+            if (!dialog || !url || !save || !status)
+            {
+                failure = "Automatic settings save controls are missing";
+                if (dialog)
+                    dialog->reject();
+                return;
+            }
+            invalidRejected = true;
+            const QStringList invalid{"http://192.0.2.2:54443/", "https://relay.invalid/not-root",
+                "https://person@relay.invalid/", "https://relay.invalid:0/"};
+            for (const auto &candidate : invalid)
+            {
+                url->setText(candidate);
+                save->click();
+                invalidRejected &= dialog->isVisible() && !status->text().isEmpty() && readConfig() == originalBytes;
+                if (!invalidRejected)
+                {
+                    failure = "An invalid public relay address was accepted or changed the saved config";
+                    dialog->reject();
+                    return;
+                }
+            }
+            url->setText("  " + editedUrl + "  ");
+            save->click();
+        });
+        deadline.start();
+        const bool saveAccepted = editLocalService(&owner, path, true);
+        deadline.stop();
+        QVERIFY2(!timedOut && failure.isEmpty(), qPrintable(failure));
+        QVERIFY(saveAccepted && invalidRejected);
+        auto expected = original;
+        auto p2p = original.value("p2p").toObject();
+        p2p["relay_url"] = editedUrl;
+        expected["p2p"] = p2p;
+        QCOMPARE(QJsonDocument::fromJson(readConfig()).object(), expected);
     }
 
     void legacySecretNeverRotatesImplicitlyAndConfirmedRotationPreservesPolicy()

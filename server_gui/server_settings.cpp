@@ -245,7 +245,7 @@ void ForwardingSettings::apply()
         5000);
 }
 
-bool editLocalService(QWidget *parent, const QString &configPath)
+bool editLocalService(QWidget *parent, const QString &configPath, bool showAutomatic)
 {
     QString directory = QFileInfo(configPath).absolutePath();
     QDir().mkpath(directory);
@@ -336,7 +336,13 @@ bool editLocalService(QWidget *parent, const QString &configPath)
     layout->addLayout(form);
     auto updateFingerprint = [&]
     {
-        auto certs = QSslCertificate::fromPath(certificate->text());
+        const auto certificatePath = certificate->text().trimmed();
+        if (certificatePath.isEmpty())
+        {
+            fingerprint->clear();
+            return;
+        }
+        auto certs = QSslCertificate::fromPath(certificatePath);
         fingerprint->setText(
             certs.isEmpty() ? ""
                             : QString::fromLatin1(certs.first().digest(QCryptographicHash::Sha256).toHex()));
@@ -405,6 +411,8 @@ bool editLocalService(QWidget *parent, const QString &configPath)
     auto automatic = config.value("p2p").toObject();
     auto *automaticPage = new QWidget;
     tabs->addTab(automaticPage, "自动连接");
+    if (showAutomatic)
+        tabs->setCurrentWidget(automaticPage);
     auto *automaticLayout = new QVBoxLayout(automaticPage);
     automaticLayout->setContentsMargins(24, 24, 24, 24);
     automaticLayout->setSpacing(16);
@@ -420,7 +428,7 @@ bool editLocalService(QWidget *parent, const QString &configPath)
     auto *entryForm = new QFormLayout;
     auto *relayUrl = new QLineEdit(automatic.value("relay_url").toString());
     relayUrl->setObjectName("serviceRelayUrl");
-    relayUrl->setReadOnly(true);
+    relayUrl->setPlaceholderText("https://relay.example.invalid:54443/");
     auto *relayToken = new QLineEdit(automatic.value("relay_token").toString());
     relayToken->setObjectName("serviceRelayToken");
     relayToken->setReadOnly(true);
@@ -435,11 +443,17 @@ bool editLocalService(QWidget *parent, const QString &configPath)
     relayCa->setObjectName("serviceRelayCa");
     relayCa->setReadOnly(true);
     relayCa->setMaximumHeight(125);
-    entryForm->addRow("公网入口", relayUrl);
+    entryForm->addRow("公网中转地址", relayUrl);
     entryForm->addRow("入口接入凭据", relayToken);
     entryForm->addRow("QUIC 端口", relayPort);
     entryForm->addRow("入口 CA 证书", relayCa);
     automaticLayout->addLayout(entryForm);
+    auto *relayHelp = new QLabel("修改地址会保存到服务端配置，并用于之后复制的自动连接信息；"
+        "入口接入凭据、CA 证书和 QUIC 端口保持不变。若新中转的凭据或证书不同，"
+        "请粘贴完整公网入口信息。保存后重新启动服务生效。");
+    relayHelp->setObjectName("serviceRelayHelp");
+    relayHelp->setWordWrap(true);
+    automaticLayout->addWidget(relayHelp);
     auto *pasteEntry = new QPushButton("粘贴公网入口信息");
     pasteEntry->setObjectName("servicePasteP2pEntry");
     automaticLayout->addWidget(pasteEntry, 0, Qt::AlignLeft);
@@ -497,6 +511,7 @@ bool editLocalService(QWidget *parent, const QString &configPath)
                 return;
             }
             bool loopback = address.isLoopback();
+            automatic["relay_url"] = relayUrl->text().trimmed();
             if (automaticEnabled->isChecked())
             {
                 QString error;

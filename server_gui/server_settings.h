@@ -27,4 +27,4 @@ class ForwardingSettings : public QWidget
 };
 
 bool configureLocalAdmin(Transport &transport, const QString &configPath, QString &error);
-bool editLocalService(QWidget *parent, const QString &configPath);
+bool editLocalService(QWidget *parent, const QString &configPath, bool showAutomatic = false);
