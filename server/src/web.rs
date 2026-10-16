@@ -99,6 +99,8 @@ fn build_router(app: Arc<App>, entry: EntryPoint) -> Router {
             .route("/local/clients", get(local_clients).post(create_client))
             .route("/local/clients/{id}", post(update_client))
             .route("/local/clients/{id}/revoke", post(revoke_client))
+            .route("/local/clients/{id}/credential", get(client_credential))
+            .route("/local/clients/{id}/rotate", post(rotate_client))
             .route("/local/p2p", get(local_p2p))
             .route(
                 "/local/forwarding",
@@ -170,14 +172,52 @@ async fn authenticate(app: &App, token: &str, address: Option<SocketAddr>) -> Ap
         }
         return Ok(Principal::Admin);
     }
-    let clients = app.clients.read().await;
-    for record in clients.values() {
-        if bool::from(supplied.as_bytes().ct_eq(record.token_hash.as_bytes()))
-            && record.access.enabled
-            && !record.access.revoked
-        {
+    let legacy = {
+        let clients = app.clients.read().await;
+        clients.values().find_map(|record| {
+            (bool::from(supplied.as_bytes().ct_eq(record.token_hash.as_bytes()))
+                && record.access.enabled
+                && !record.access.revoked)
+                .then(|| {
+                    (
+                        record.access.id.clone(),
+                        record.access.revision,
+                        record.token.is_some(),
+                    )
+                })
+        })
+    };
+    if let Some((id, revision, remembered)) = legacy {
+        if remembered {
+            return Ok(Principal::Client { id, revision });
+        }
+        // Serialize the one-time legacy upgrade with rotation/revocation and recheck after
+        // acquiring the write lock. Normal authenticated requests never write to SQLite.
+        let mut clients = app.clients.write().await;
+        if let Some(record) = clients.get_mut(&id).filter(|record| {
+            bool::from(supplied.as_bytes().ct_eq(record.token_hash.as_bytes()))
+                && record.access.enabled
+                && !record.access.revoked
+        }) {
+            if record.token.is_none() {
+                let remembered = app
+                    .db({
+                        let id = id.clone();
+                        let supplied = supplied.clone();
+                        let token = token.to_owned();
+                        move |store| store.remember_client_token(&id, &supplied, &token)
+                    })
+                    .await?;
+                if !remembered {
+                    return Err(Error(
+                        anyhow::anyhow!("访问密钥无效或已停用"),
+                        StatusCode::UNAUTHORIZED,
+                    ));
+                }
+                record.token = Some(token.to_owned());
+            }
             return Ok(Principal::Client {
-                id: record.access.id.clone(),
+                id,
                 revision: record.access.revision,
             });
         }
@@ -337,7 +377,7 @@ async fn create_client(
     Extension(principal): Extension<Principal>,
     ConnectInfo(address): ConnectInfo<SocketAddr>,
     Json(request): Json<ClientRequest>,
-) -> ApiResult<Json<Value>> {
+) -> ApiResult<Response> {
     check_admin(&principal, address)?;
     let now = chrono::Utc::now().timestamp_millis();
     let mut access = ClientAccess {
@@ -361,12 +401,74 @@ async fn create_client(
     let record = ClientRecord {
         access,
         token_hash: access::token_hash(&token),
+        token: Some(token.clone()),
     };
     let mut clients = app.clients.write().await;
     let access = persist_client(&app, record.clone(), true).await?;
     clients.insert(access.id.clone(), record);
     app.clients_changed.send_replace(());
-    Ok(Json(json!({"client":access,"token":token})))
+    Ok(credential_response(access, Some(token)))
+}
+fn credential_response(access: ClientAccess, token: Option<String>) -> Response {
+    (
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(json!({"client":access,"token":token})),
+    )
+        .into_response()
+}
+async fn client_credential(
+    State(app): State<Arc<App>>,
+    Extension(principal): Extension<Principal>,
+    ConnectInfo(address): ConnectInfo<SocketAddr>,
+    Path(id): Path<String>,
+) -> ApiResult<Response> {
+    check_admin(&principal, address)?;
+    let clients = app.clients.read().await;
+    let record = clients
+        .get(&id)
+        .ok_or_else(|| Error(anyhow::anyhow!("客户端不存在"), StatusCode::NOT_FOUND))?;
+    if record.access.revoked {
+        return Err(Error(
+            anyhow::anyhow!("已撤销的密钥无法获取或轮换"),
+            StatusCode::FORBIDDEN,
+        ));
+    }
+    Ok(credential_response(
+        record.access.clone(),
+        record.token.clone(),
+    ))
+}
+async fn rotate_client(
+    State(app): State<Arc<App>>,
+    Extension(principal): Extension<Principal>,
+    ConnectInfo(address): ConnectInfo<SocketAddr>,
+    Path(id): Path<String>,
+) -> ApiResult<Response> {
+    check_admin(&principal, address)?;
+    let mut clients = app.clients.write().await;
+    let mut record = clients
+        .get(&id)
+        .cloned()
+        .ok_or_else(|| Error(anyhow::anyhow!("客户端不存在"), StatusCode::NOT_FOUND))?;
+    if record.access.revoked {
+        return Err(Error(
+            anyhow::anyhow!("已撤销的密钥无法获取或轮换"),
+            StatusCode::FORBIDDEN,
+        ));
+    }
+    let token = format!(
+        "wxcl_{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    );
+    record.token_hash = access::token_hash(&token);
+    record.token = Some(token.clone());
+    record.access.updated_at = chrono::Utc::now().timestamp_millis();
+    record.access.revision += 1;
+    let access = persist_client(&app, record.clone(), false).await?;
+    clients.insert(id, record);
+    app.clients_changed.send_replace(());
+    Ok(credential_response(access, Some(token)))
 }
 async fn update_client(
     State(app): State<Arc<App>>,
@@ -397,6 +499,7 @@ async fn revoke_client(
     let mut record = clients.get(&id).cloned().context("客户端不存在")?;
     record.access.revoked = true;
     record.access.enabled = false;
+    record.token = None;
     record.access.updated_at = chrono::Utc::now().timestamp_millis();
     record.access.revision += 1;
     let access = persist_client(&app, record.clone(), false).await?;
@@ -1438,6 +1541,7 @@ mod tests {
                 revision: 1,
             },
             token_hash: access::token_hash("fixture-independent-secret"),
+            token: None,
         }
     }
 
@@ -1752,6 +1856,8 @@ mod tests {
             ("POST", "/api/local/clients"),
             ("POST", "/api/local/clients/fixture-key"),
             ("POST", "/api/local/clients/fixture-key/revoke"),
+            ("GET", "/api/local/clients/fixture-key/credential"),
+            ("POST", "/api/local/clients/fixture-key/rotate"),
             ("GET", "/api/local/forwarding"),
             ("POST", "/api/local/forwarding"),
             ("POST", "/api/shutdown"),
@@ -1785,6 +1891,181 @@ mod tests {
         assert_eq!(status["authenticated_client"]["admin"], false);
         assert_eq!(status["permissions"]["groups"], json!(["g"]));
         assert!(status.get("online_clients").is_none());
+    }
+
+    #[tokio::test]
+    async fn credentials_require_real_loopback_admin_and_never_leak_through_policy_responses() {
+        let temp = tempfile::tempdir().unwrap();
+        let (app, _receiver) = crate::test_app(temp.path());
+        grant(&app).await;
+        let router = router(app.clone());
+        for (method, path) in [
+            ("GET", "/api/local/clients/fixture-key/credential"),
+            ("POST", "/api/local/clients/fixture-key/rotate"),
+        ] {
+            for (token, peer) in [
+                ("fixture-independent-secret", "127.0.0.1:12345"),
+                (app.config.token.as_str(), "192.0.2.3:12345"),
+            ] {
+                let mut denied = request(method, path, token, peer, Body::from("{}"));
+                denied
+                    .headers_mut()
+                    .insert("x-forwarded-for", "127.0.0.1".parse().unwrap());
+                denied
+                    .headers_mut()
+                    .insert("x-admin", "true".parse().unwrap());
+                assert_eq!(
+                    router.clone().oneshot(denied).await.unwrap().status(),
+                    StatusCode::FORBIDDEN
+                );
+            }
+        }
+        let secret = "fixture-independent-secret";
+        let hash = access::token_hash(secret);
+        for (path, token) in [
+            ("/api/local/clients", app.config.token.as_str()),
+            ("/api/status", app.config.token.as_str()),
+            ("/api/status", secret),
+        ] {
+            let response = router
+                .clone()
+                .oneshot(request(
+                    "GET",
+                    path,
+                    token,
+                    "127.0.0.1:12345",
+                    Body::empty(),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let text = json_body(response).await.to_string();
+            assert!(!text.contains(secret) && !text.contains(&hash) && !text.contains("token"));
+        }
+        let response = router
+            .clone()
+            .oneshot(request(
+                "GET",
+                "/api/local/clients/fixture-key/credential",
+                &app.config.token,
+                "[::1]:12345",
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        assert_eq!(json_body(response).await["token"], secret);
+        let response = router
+            .oneshot(request(
+                "GET",
+                "/api/local/clients/missing/credential",
+                &app.config.token,
+                "127.0.0.1:12345",
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn legacy_auth_learns_once_without_revision_change_or_accepting_rejected_tokens() {
+        let temp = tempfile::tempdir().unwrap();
+        let (app, _receiver) = crate::test_app(temp.path());
+        grant(&app).await;
+        assert!(app.store.clients().unwrap()["fixture-key"].token.is_none());
+        assert!(
+            authenticate(&app, "not-the-client-token", None)
+                .await
+                .is_err()
+        );
+        assert!(app.store.clients().unwrap()["fixture-key"].token.is_none());
+        {
+            let mut clients = app.clients.write().await;
+            let record = clients.get_mut("fixture-key").unwrap();
+            record.access.enabled = false;
+            app.store.save_client(record, false).unwrap();
+        }
+        assert!(
+            authenticate(&app, "fixture-independent-secret", None)
+                .await
+                .is_err()
+        );
+        assert!(app.store.clients().unwrap()["fixture-key"].token.is_none());
+        app.clients
+            .write()
+            .await
+            .get_mut("fixture-key")
+            .unwrap()
+            .access
+            .enabled = true;
+        app.store.save_client(&access_record(), false).unwrap();
+        let principal = authenticate(&app, "fixture-independent-secret", None)
+            .await
+            .unwrap();
+        assert!(matches!(principal, Principal::Client { revision: 1, .. }));
+        assert_eq!(
+            app.store.clients().unwrap()["fixture-key"].token.as_deref(),
+            Some("fixture-independent-secret")
+        );
+        assert_eq!(app.clients.read().await["fixture-key"].access.revision, 1);
+        // A repeated valid request must take the in-memory path, with no secret-table write.
+        let audit = rusqlite::Connection::open(temp.path().join("test.sqlite")).unwrap();
+        audit.execute_batch("CREATE TRIGGER reject_repeated_secret_insert BEFORE INSERT ON access_client_secrets BEGIN SELECT RAISE(ABORT,'unexpected repeated secret write'); END;
+            CREATE TRIGGER reject_repeated_secret_update BEFORE UPDATE ON access_client_secrets BEGIN SELECT RAISE(ABORT,'unexpected repeated secret write'); END;").unwrap();
+        assert!(
+            authenticate(&app, "fixture-independent-secret", None)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn racing_legacy_learning_with_rotation_or_revocation_cannot_restore_the_old_token() {
+        for (operation, auth_first) in [
+            ("rotate", true),
+            ("rotate", false),
+            ("revoke", true),
+            ("revoke", false),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let (app, _receiver) = crate::test_app(temp.path());
+            grant(&app).await;
+            let auth = authenticate(&app, "fixture-independent-secret", None);
+            let change = router(app.clone()).oneshot(request(
+                "POST",
+                &format!("/api/local/clients/fixture-key/{operation}"),
+                &app.config.token,
+                "127.0.0.1:12345",
+                Body::from("{}"),
+            ));
+            let response = if auth_first {
+                tokio::join!(auth, change).1.unwrap()
+            } else {
+                tokio::join!(change, auth).0.unwrap()
+            };
+            assert_eq!(response.status(), StatusCode::OK);
+            let changed = json_body(response).await;
+            assert!(
+                authenticate(&app, "fixture-independent-secret", None)
+                    .await
+                    .is_err()
+            );
+            let persisted = app.store.clients().unwrap();
+            let current = &persisted["fixture-key"];
+            if operation == "rotate" {
+                assert_eq!(current.token.as_deref(), changed["token"].as_str());
+                assert_ne!(current.token.as_deref(), Some("fixture-independent-secret"));
+                assert!(
+                    authenticate(&app, current.token.as_deref().unwrap(), None)
+                        .await
+                        .is_ok()
+                );
+            } else {
+                assert!(current.token.is_none() && current.access.revoked);
+            }
+        }
     }
 
     #[tokio::test]

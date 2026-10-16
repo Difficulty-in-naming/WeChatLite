@@ -13,6 +13,27 @@ pub struct Store {
 
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .mode(0o600)
+                .open(path)?;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            for suffix in ["-wal", "-shm"] {
+                let mut sidecar = path.as_os_str().to_os_string();
+                sidecar.push(suffix);
+                match std::fs::set_permissions(sidecar, std::fs::Permissions::from_mode(0o600)) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        }
         let db = Connection::open(path)?;
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA cache_size=-4096;
             CREATE TABLE IF NOT EXISTS groups(id TEXT PRIMARY KEY, body TEXT NOT NULL);
@@ -28,6 +49,7 @@ impl Store {
             CREATE UNIQUE INDEX IF NOT EXISTS messages_source ON messages(group_id,source_id) WHERE source_id!='';
             CREATE TABLE IF NOT EXISTS events(seq INTEGER PRIMARY KEY AUTOINCREMENT, body TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS access_clients(id TEXT PRIMARY KEY, token_hash TEXT UNIQUE NOT NULL, body TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS access_client_secrets(client_id TEXT PRIMARY KEY, token TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS history_sources(group_id TEXT NOT NULL, source_id TEXT NOT NULL, PRIMARY KEY(group_id,source_id));
             CREATE TABLE IF NOT EXISTS history_imports(group_id TEXT NOT NULL, seq INTEGER NOT NULL, PRIMARY KEY(group_id,seq));
             CREATE TABLE IF NOT EXISTS state(key TEXT PRIMARY KEY, body TEXT NOT NULL);")?;
@@ -51,19 +73,40 @@ impl Store {
 
     pub fn clients(&self) -> Result<Clients> {
         let conn = self.db.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT body,token_hash FROM access_clients ORDER BY id")?;
+        let mut stmt = conn.prepare(
+            "SELECT c.body,c.token_hash,s.token FROM access_clients c LEFT JOIN access_client_secrets s ON s.client_id=c.id ORDER BY c.id",
+        )?;
         stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
         })?
         .map(|row| {
-            let (body, token_hash) = row?;
+            let (body, token_hash, token) = row?;
             let access: crate::access::ClientAccess = serde_json::from_str(&body)?;
-            Ok((access.id.clone(), ClientRecord { access, token_hash }))
+            let token = token
+                .filter(|value| !access.revoked && crate::access::token_hash(value) == token_hash);
+            Ok((
+                access.id.clone(),
+                ClientRecord {
+                    access,
+                    token_hash,
+                    token,
+                },
+            ))
         })
         .collect()
     }
 
     pub fn save_client(&self, record: &ClientRecord, create: bool) -> Result<Vec<Value>> {
+        if let Some(token) = &record.token {
+            ensure!(
+                crate::access::token_hash(token) == record.token_hash,
+                "客户端密钥校验失败"
+            );
+        }
         let mut conn = self.db.lock().unwrap();
         let tx = conn.transaction()?;
         let old: Option<String> = tx
@@ -102,7 +145,18 @@ impl Store {
                 bail!("只能授权本机微信中存在的群");
             }
         }
-        tx.execute("INSERT INTO access_clients(id,token_hash,body) VALUES(?1,?2,?3) ON CONFLICT(id) DO UPDATE SET body=excluded.body", params![record.access.id,record.token_hash,serde_json::to_string(&record.access)?])?;
+        tx.execute("INSERT INTO access_clients(id,token_hash,body) VALUES(?1,?2,?3) ON CONFLICT(id) DO UPDATE SET token_hash=excluded.token_hash,body=excluded.body", params![record.access.id,record.token_hash,serde_json::to_string(&record.access)?])?;
+        if let Some(token) = record.token.as_ref().filter(|_| !record.access.revoked) {
+            tx.execute(
+                "INSERT INTO access_client_secrets(client_id,token) VALUES(?1,?2) ON CONFLICT(client_id) DO UPDATE SET token=excluded.token",
+                params![record.access.id, token],
+            )?;
+        } else {
+            tx.execute(
+                "DELETE FROM access_client_secrets WHERE client_id=?1",
+                [&record.access.id],
+            )?;
+        }
         let pending = {
             let mut stmt = tx.prepare("SELECT body FROM messages WHERE status='queued' AND json_extract(body,'$.access_client')=?1")?;
             stmt.query_map([&record.access.id], |row| row.get::<_, String>(0))?
@@ -128,6 +182,28 @@ impl Store {
         }
         tx.commit()?;
         Ok(events)
+    }
+
+    // Used once after successful legacy authentication. The hash and durable policy are
+    // checked in the INSERT itself so a rotated, disabled, or revoked token cannot be revived.
+    pub fn remember_client_token(
+        &self,
+        id: &str,
+        expected_hash: &str,
+        token: &str,
+    ) -> Result<bool> {
+        ensure!(
+            crate::access::token_hash(token) == expected_hash,
+            "客户端密钥校验失败"
+        );
+        let changed = self.db.lock().unwrap().execute(
+            "INSERT INTO access_client_secrets(client_id,token)
+             SELECT id,?3 FROM access_clients WHERE id=?1 AND token_hash=?2
+               AND json_extract(body,'$.enabled')=1 AND json_extract(body,'$.revoked')=0
+             ON CONFLICT(client_id) DO UPDATE SET token=excluded.token",
+            params![id, expected_hash, token],
+        )?;
+        Ok(changed == 1)
     }
 
     pub fn groups(&self) -> Result<Vec<Group>> {
@@ -946,6 +1022,162 @@ pub fn check_recall(message: &ChatMessage, now: i64) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn client(id: &str, token: &str, remember: bool) -> ClientRecord {
+        ClientRecord {
+            access: crate::access::ClientAccess {
+                id: id.into(),
+                name: "Fixture".into(),
+                enabled: true,
+                revoked: false,
+                groups: Default::default(),
+                can_send: false,
+                can_download: false,
+                created_at: 1,
+                updated_at: 1,
+                revision: 1,
+            },
+            token_hash: crate::access::token_hash(token),
+            token: remember.then(|| token.into()),
+        }
+    }
+    #[test]
+    fn credentials_persist_atomically_without_entering_public_policy() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("credentials.sqlite");
+        let store = Store::open(&path).unwrap();
+        let mut record = client("client-one", "fixture-client-token", true);
+        store.save_client(&record, true).unwrap();
+        let duplicate = client("client-two", "fixture-client-token", true);
+        assert!(store.save_client(&duplicate, true).is_err());
+        assert_eq!(store.clients().unwrap().len(), 1);
+        assert_eq!(
+            store
+                .db
+                .lock()
+                .unwrap()
+                .query_row("SELECT count(*) FROM access_client_secrets", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        record.token = Some("mismatched-token".into());
+        record.access.name = "Not committed".into();
+        assert!(store.save_client(&record, false).is_err());
+        // Fail after the policy/hash UPDATE to prove the credential write shares its transaction.
+        store.db.lock().unwrap().execute_batch("CREATE TRIGGER reject_credential_update BEFORE UPDATE ON access_client_secrets BEGIN SELECT RAISE(ABORT,'fixture secret write failure'); END;").unwrap();
+        record.token = Some("fixture-valid-new-token".into());
+        record.token_hash = crate::access::token_hash(record.token.as_deref().unwrap());
+        assert!(store.save_client(&record, false).is_err());
+        drop(store);
+        let reopened = Store::open(&path).unwrap();
+        let clients = reopened.clients().unwrap();
+        let restored = &clients["client-one"];
+        assert_eq!(restored.token.as_deref(), Some("fixture-client-token"));
+        assert_eq!(restored.access.name, "Fixture");
+        assert_eq!(
+            restored.token_hash,
+            crate::access::token_hash("fixture-client-token")
+        );
+        assert!(
+            !serde_json::to_string(&restored.access)
+                .unwrap()
+                .contains("token")
+        );
+    }
+
+    #[test]
+    fn legacy_credential_cas_cannot_revive_rotated_disabled_or_revoked_tokens() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(&temp.path().join("legacy.sqlite")).unwrap();
+        let old = "fixture-legacy-token";
+        let new = "fixture-rotated-token";
+        let mut record = client("legacy", old, false);
+        store.save_client(&record, true).unwrap();
+        assert!(store.clients().unwrap()["legacy"].token.is_none());
+        assert!(
+            store
+                .remember_client_token("legacy", &record.token_hash, "invalid")
+                .is_err()
+        );
+        assert!(
+            !store
+                .remember_client_token("missing", &record.token_hash, old)
+                .unwrap()
+        );
+        assert!(
+            store
+                .remember_client_token("legacy", &record.token_hash, old)
+                .unwrap()
+        );
+        assert_eq!(store.clients().unwrap()["legacy"].access.revision, 1);
+        let old_hash = record.token_hash.clone();
+        record.token_hash = crate::access::token_hash(new);
+        record.token = Some(new.into());
+        record.access.revision += 1;
+        store.save_client(&record, false).unwrap();
+        assert!(
+            !store
+                .remember_client_token("legacy", &old_hash, old)
+                .unwrap()
+        );
+        assert_eq!(
+            store.clients().unwrap()["legacy"].token.as_deref(),
+            Some(new)
+        );
+        record.access.revoked = true;
+        record.access.enabled = false;
+        record.token = None;
+        store.save_client(&record, false).unwrap();
+        assert!(
+            !store
+                .remember_client_token("legacy", &record.token_hash, new)
+                .unwrap()
+        );
+        assert!(store.clients().unwrap()["legacy"].token.is_none());
+        let mut disabled = client("disabled", "fixture-disabled-token", false);
+        disabled.access.enabled = false;
+        store.save_client(&disabled, true).unwrap();
+        assert!(
+            !store
+                .remember_client_token("disabled", &disabled.token_hash, "fixture-disabled-token")
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .db
+                .lock()
+                .unwrap()
+                .query_row("SELECT count(*) FROM access_client_secrets", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn credential_database_and_journals_use_private_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("private.sqlite");
+        let store = Store::open(&path).unwrap();
+        store
+            .save_client(&client("private", "fixture-private-token", true), true)
+            .unwrap();
+        for suffix in ["", "-wal", "-shm"] {
+            let name = format!("{}{suffix}", path.display());
+            std::fs::set_permissions(&name, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        let _second = Store::open(&path).unwrap();
+        for suffix in ["", "-wal", "-shm"] {
+            let name = format!("{}{suffix}", path.display());
+            assert_eq!(
+                std::fs::metadata(&name).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
     fn message(id: &str) -> ChatMessage {
         serde_json::from_value(json!({"id":id,"group":"g","sender":"小林","text":"你好","timestamp":0,"status":"queued"})).unwrap()
     }

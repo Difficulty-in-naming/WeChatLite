@@ -227,12 +227,25 @@ pub async fn deselection_cancels_queued_send_and_confirms_submitted_send_without
     );
     Ok(())
 }
-pub async fn create_once_hash_storage_defaults_and_restart_preserve_global_policy() -> Result<()> {
+pub async fn recoverable_credentials_defaults_and_restart_preserve_global_policy() -> Result<()> {
     let mut relay = Relay::new("forwarding").await?;
     relay.api.select(&["fixture-a"]).await?;
     let key = relay.api.key(json!({})).await?;
     let token = key["token"].as_str().unwrap();
     let client = &key["client"];
+    let credential_path = format!(
+        "/api/local/clients/{}/credential",
+        client["id"].as_str().unwrap()
+    );
+    for _ in 0..2 {
+        let response = relay
+            .api
+            .raw(Method::GET, &credential_path, None, None, None)
+            .await?;
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        assert_eq!(response.json::<Value>().await?, key);
+    }
     assert_eq!(client["groups"], json!([]));
     assert_eq!(client["can_send"], false);
     assert_eq!(client["can_download"], false);
@@ -261,6 +274,12 @@ pub async fn create_once_hash_storage_defaults_and_restart_preserve_global_polic
         )?;
         assert_eq!(hash, format!("{:x}", Sha256::digest(token.as_bytes())));
         assert!(!body.contains(token));
+        let secret: String = connection.query_row(
+            "SELECT token FROM access_client_secrets WHERE client_id=?1",
+            [client["id"].as_str().unwrap()],
+            |row| row.get(0),
+        )?;
+        assert_eq!(secret, token);
     }
     relay
         .api
@@ -296,6 +315,9 @@ pub async fn create_once_hash_storage_defaults_and_restart_preserve_global_polic
         json!(["fixture-a"])
     );
     let clients = relay.api.get("/api/local/clients").await?;
+    let retrieved = relay.api.get(&credential_path).await?;
+    assert_eq!(retrieved["token"], token);
+    assert_eq!(retrieved["client"], clients["clients"][0]);
     assert_eq!(clients["clients"][0]["name"], "Renamed");
     assert_eq!(
         clients["clients"][0]["groups"],
@@ -304,6 +326,202 @@ pub async fn create_once_hash_storage_defaults_and_restart_preserve_global_polic
     assert_eq!(
         ids(&relay.api.get_as("/api/groups", token).await?),
         BTreeSet::from(["fixture-a".into()])
+    );
+    Ok(())
+}
+
+pub async fn credential_rotation_preserves_policy_invalidates_old_sessions_and_revocation_erases_secret()
+-> Result<()> {
+    let mut relay = Relay::new("forwarding").await?;
+    relay.api.select(&["fixture-a"]).await?;
+    let key = relay
+        .api
+        .key(json!({"name":"Rotate fixture", "groups":["fixture-a","fixture-b"], "can_send":true}))
+        .await?;
+    let other = relay
+        .api
+        .key(json!({"name":"Unaffected", "groups":["fixture-a"]}))
+        .await?;
+    let id = key["client"]["id"].as_str().unwrap();
+    let old_token = key["token"].as_str().unwrap();
+    let root = format!("/api/local/clients/{id}");
+    let mut socket = relay.api.ws(-1, Some(old_token)).await?;
+    let mut unaffected = relay.api.ws(-1, other["token"].as_str()).await?;
+    sync(&mut socket).await?;
+    sync(&mut unaffected).await?;
+    let rotated = relay.api.post(&format!("{root}/rotate"), json!({})).await?;
+    let token = rotated["token"].as_str().unwrap();
+    assert_ne!(token, old_token);
+    for field in [
+        "id",
+        "name",
+        "groups",
+        "enabled",
+        "can_send",
+        "can_download",
+        "created_at",
+    ] {
+        assert_eq!(rotated["client"][field], key["client"][field], "{field}");
+    }
+    assert_eq!(
+        rotated["client"]["revision"].as_u64().unwrap(),
+        key["client"]["revision"].as_u64().unwrap() + 1
+    );
+    closed(&mut socket).await?;
+    relay
+        .api
+        .deny("/api/status", None, Some(old_token), 401)
+        .await?;
+    assert!(relay.api.ws(-1, Some(old_token)).await.is_err());
+    assert_eq!(
+        relay.api.get(&format!("{root}/credential")).await?["token"],
+        token
+    );
+    assert_eq!(
+        relay.api.get_as("/api/status", token).await?["permissions"],
+        json!({"groups":["fixture-a"],"can_send":true,"can_download":false})
+    );
+    relay
+        .api
+        .post_as(
+            "/api/groups/fixture-a/activate",
+            json!({}),
+            other["token"].as_str().unwrap(),
+        )
+        .await?;
+    loop {
+        if recv(&mut unaffected).await?["type"] == "message" {
+            break;
+        }
+    }
+    unaffected.close(None).await?;
+    for value in [
+        relay.api.get("/api/local/clients").await?,
+        relay.api.get_as("/api/status", token).await?,
+    ] {
+        let text = value.to_string();
+        assert!(!text.contains(token) && !text.contains(old_token) && !text.contains("token_hash"));
+    }
+    relay.stop().await?;
+    relay.start().await?;
+    assert_eq!(
+        relay.api.get(&format!("{root}/credential")).await?["token"],
+        token
+    );
+    relay.api.update(&rotated, json!({"enabled":false})).await?;
+    let disabled_rotation = relay.api.post(&format!("{root}/rotate"), json!({})).await?;
+    assert_eq!(disabled_rotation["client"]["enabled"], false);
+    let latest_token = disabled_rotation["token"].as_str().unwrap();
+    assert_ne!(latest_token, token);
+    relay
+        .api
+        .deny("/api/status", None, Some(token), 401)
+        .await?;
+    relay
+        .api
+        .deny("/api/status", None, Some(latest_token), 401)
+        .await?;
+    relay
+        .api
+        .update(&disabled_rotation, json!({"enabled":true}))
+        .await?;
+    let mut socket = relay.api.ws(-1, Some(latest_token)).await?;
+    sync(&mut socket).await?;
+    relay.api.post(&format!("{root}/revoke"), json!({})).await?;
+    closed(&mut socket).await?;
+    relay
+        .api
+        .deny(&format!("{root}/credential"), None, None, 403)
+        .await?;
+    relay
+        .api
+        .deny(&format!("{root}/rotate"), Some(json!({})), None, 403)
+        .await?;
+    relay
+        .api
+        .deny("/api/status", None, Some(latest_token), 401)
+        .await?;
+    let connection = Connection::open_with_flags(
+        relay.dir.path().join("state/relay.sqlite"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?;
+    assert_eq!(
+        connection.query_row(
+            "SELECT count(*) FROM access_client_secrets WHERE client_id=?1",
+            [id],
+            |row| row.get::<_, i64>(0)
+        )?,
+        0
+    );
+    drop(connection);
+    relay.stop().await?;
+    relay.start().await?;
+    relay
+        .api
+        .deny(&format!("{root}/credential"), None, None, 403)
+        .await?;
+    relay
+        .api
+        .deny(&format!("{root}/rotate"), Some(json!({})), None, 403)
+        .await?;
+    Ok(())
+}
+
+pub async fn legacy_hash_only_key_learns_original_token_after_successful_authentication_and_restart()
+-> Result<()> {
+    let mut relay = Relay::new("forwarding").await?;
+    relay.api.select(&["fixture-a"]).await?;
+    relay.stop().await?;
+    let token = "fixture-installed-legacy-client-secret";
+    let hash = format!("{:x}", Sha256::digest(token.as_bytes()));
+    let access = json!({"id":"legacy-fixture", "name":"Legacy fixture", "enabled":true, "revoked":false,
+        "groups":["fixture-a"],"can_send":false,"can_download":false,"created_at":1,"updated_at":1,"revision":7});
+    let path = relay.dir.path().join("state/relay.sqlite");
+    {
+        let connection = Connection::open(&path)?;
+        connection.execute(
+            "INSERT INTO access_clients(id,token_hash,body) VALUES(?1,?2,?3)",
+            params!["legacy-fixture", hash, access.to_string()],
+        )?;
+    }
+    relay.start().await?;
+    let endpoint = "/api/local/clients/legacy-fixture/credential";
+    let before = relay.api.get(endpoint).await?;
+    assert!(before["token"].is_null());
+    assert_eq!(before["client"], access);
+    relay
+        .api
+        .deny("/api/status", None, Some("rejected-legacy-token"), 401)
+        .await?;
+    assert!(relay.api.get(endpoint).await?["token"].is_null());
+    assert_eq!(
+        relay.api.get_as("/api/status", token).await?["authenticated_client"]["id"],
+        "legacy-fixture"
+    );
+    let learned = relay.api.get(endpoint).await?;
+    assert_eq!(learned["token"], token);
+    assert_eq!(learned["client"], access);
+    relay.stop().await?;
+    relay.start().await?;
+    assert_eq!(relay.api.get(endpoint).await?, learned);
+    assert_eq!(relay.api.get(endpoint).await?, learned);
+    assert!(
+        !relay
+            .api
+            .get("/api/local/clients")
+            .await?
+            .to_string()
+            .contains(token)
+    );
+    let connection =
+        Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    assert_eq!(
+        connection.query_row(
+            "SELECT token FROM access_client_secrets WHERE client_id='legacy-fixture'",
+            [],
+            |row| row.get::<_, String>(0)
+        )?,
+        token
     );
     Ok(())
 }
@@ -332,6 +550,8 @@ pub async fn client_key_never_gains_local_administrator_and_spoofed_headers_do_n
             Some(json!({"can_send":true})),
         ),
         (format!("/api/local/clients/{id}/revoke"), Some(json!({}))),
+        (format!("/api/local/clients/{id}/credential"), None),
+        (format!("/api/local/clients/{id}/rotate"), Some(json!({}))),
         ("/api/shutdown".into(), Some(json!({}))),
     ] {
         relay.api.deny(&path, body, Some(token), 403).await?;

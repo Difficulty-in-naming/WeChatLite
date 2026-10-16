@@ -38,8 +38,12 @@ ClientPermissions::ClientPermissions(const QString &path, QWidget *parent)
     newButton->setObjectName("clientAccessNew");
     refreshButton = new QPushButton("刷新列表");
     refreshButton->setObjectName("clientAccessRefresh");
+    credentialButton = new QPushButton("复制连接信息");
+    credentialButton->setObjectName("clientAccessCredential");
+    credentialButton->setEnabled(false);
     actions->addWidget(newButton);
     actions->addWidget(refreshButton);
+    actions->addWidget(credentialButton);
     actions->addStretch();
     layout->addLayout(actions);
     auto *split = new QSplitter;
@@ -73,7 +77,11 @@ ClientPermissions::ClientPermissions(const QString &path, QWidget *parent)
     applyButton->setObjectName("clientAccessApply");
     revokeButton = new QPushButton("永久撤销密钥");
     revokeButton->setObjectName("clientAccessRevoke");
+    rotateButton = new QPushButton("更换密钥");
+    rotateButton->setObjectName("clientAccessRotate");
+    rotateButton->setEnabled(false);
     buttons->addWidget(applyButton);
+    buttons->addWidget(rotateButton);
     buttons->addWidget(revokeButton);
     editLayout->addLayout(buttons);
     split->addWidget(editor);
@@ -90,6 +98,17 @@ ClientPermissions::ClientPermissions(const QString &path, QWidget *parent)
     connect(list, &QListWidget::currentRowChanged, this, &ClientPermissions::selectClient);
     connect(applyButton, &QPushButton::clicked, this, &ClientPermissions::apply);
     connect(revokeButton, &QPushButton::clicked, this, &ClientPermissions::revoke);
+    connect(credentialButton, &QPushButton::clicked, this, &ClientPermissions::existingCredential);
+    connect(rotateButton, &QPushButton::clicked, this, &ClientPermissions::rotateCredential);
+}
+
+void ClientPermissions::updateCredentialActions()
+{
+    const bool selected = !selectedId.isEmpty() && list->currentItem();
+    const bool revoked = selected && list->currentItem()->data(Qt::UserRole).toJsonObject().value("revoked").toBool();
+    credentialButton->setEnabled(!working && available && selected && !revoked);
+    rotateButton->setEnabled(!working && available && selected && !revoked);
+    editor->setEnabled(!working && available && !revoked);
 }
 
 void ClientPermissions::setWorking(bool value)
@@ -98,7 +117,7 @@ void ClientPermissions::setWorking(bool value)
     refreshButton->setEnabled(!value);
     newButton->setEnabled(!value && available);
     list->setEnabled(!value);
-    editor->setEnabled(!value && available);
+    updateCredentialActions();
 }
 
 void ClientPermissions::refresh()
@@ -166,7 +185,7 @@ void ClientPermissions::refresh()
                 newClient();
             else
                 selectClient();
-            status->setText(QString("共 %1 个客户端。新建时只显示一次接入密钥，请复制给对应客户端。").arg(list->count()));
+            status->setText(QString("共 %1 个客户端。选中客户端后可随时复制连接信息或查看密钥。").arg(list->count()));
         }, 5000);
     }, 5000);
 }
@@ -186,13 +205,18 @@ void ClientPermissions::newClient()
         groups->item(i)->setCheckState(Qt::Unchecked);
     applyButton->setText("创建接入密钥");
     revokeButton->setEnabled(false);
+    updateCredentialActions();
     name->setFocus();
 }
 
 void ClientPermissions::selectClient()
 {
     if (!list->currentItem())
+    {
+        selectedId.clear();
+        updateCredentialActions();
         return;
+    }
     const auto client = list->currentItem()->data(Qt::UserRole).toJsonObject();
     selectedId = client.value("id").toString();
     name->setText(client.value("name").toString());
@@ -206,6 +230,7 @@ void ClientPermissions::selectClient()
     applyButton->setText("保存权限（立即生效）");
     editor->setEnabled(!client.value("revoked").toBool());
     revokeButton->setEnabled(!client.value("revoked").toBool());
+    updateCredentialActions();
 }
 
 void ClientPermissions::apply()
@@ -251,16 +276,39 @@ void ClientPermissions::apply()
         refresh();
     }, 5000);
     };
-    QFile file(configPath);
-    file.open(QIODevice::ReadOnly);
-    const auto config = QJsonDocument::fromJson(file.readAll()).object();
-    const auto p2p = config.value("p2p").toObject();
-    if (!create || !p2p.value("enabled").toBool())
+    if (!create)
     {
         submit({});
         return;
     }
-    transport.get("/api/local/p2p", [this, submit, p2p, config](const QJsonValue &value, const QString &error)
+    withConnectionInfo(submit);
+}
+
+void ClientPermissions::withConnectionInfo(std::function<void(const QJsonObject &)> callback)
+{
+    QFile file(configPath);
+    if (!file.open(QIODevice::ReadOnly))
+    {
+        setWorking(false);
+        status->setText("无法读取服务端连接配置。");
+        return;
+    }
+    QJsonParseError parse;
+    const auto document = QJsonDocument::fromJson(file.readAll(), &parse);
+    if (parse.error != QJsonParseError::NoError || !document.isObject())
+    {
+        setWorking(false);
+        status->setText("服务端连接配置格式错误。");
+        return;
+    }
+    const auto config = document.object();
+    const auto p2p = config.value("p2p").toObject();
+    if (!p2p.value("enabled").toBool())
+    {
+        callback({});
+        return;
+    }
+    transport.get("/api/local/p2p", [this, callback, p2p, config](const QJsonValue &value, const QString &error)
     {
         auto connection = p2p;
         connection.remove("enabled");
@@ -272,11 +320,74 @@ void ClientPermissions::apply()
             !ConnectionInfo::relaySettings(connection, validation, true) || certificates.isEmpty())
         {
             setWorking(false);
-            status->setText("自动连接尚未就绪，未创建密钥。请检查公网入口、TLS 配置并启动服务后重试。");
+            status->setText("自动连接尚未就绪。请检查公网入口、TLS 配置并启动服务后重试；尚未创建或更换密钥。");
             return;
         }
-        submit(connection);
+        callback(connection);
     }, 5000);
+}
+
+void ClientPermissions::existingCredential()
+{
+    if (working || !available || selectedId.isEmpty() || !credentialButton->isEnabled())
+        return;
+    const auto id = selectedId;
+    setWorking(true);
+    withConnectionInfo([this, id](const QJsonObject &p2p)
+    {
+        transport.get("/api/local/clients/" + id + "/credential",
+            [this, p2p](const QJsonValue &value, const QString &error)
+        {
+            setWorking(false);
+            if (!error.isEmpty())
+            {
+                status->setText(error);
+                return;
+            }
+            const auto token = value.toObject().value("token").toString();
+            if (token.isEmpty())
+            {
+                status->setText("此旧版密钥尚未保存原文。让原客户端重新连接后会自动补存；"
+                    "也可点击“更换密钥”生成新的连接信息，原群与权限设置保留。");
+                return;
+            }
+            showCredential(value.toObject().value("client").toObject().value("name").toString(), token, p2p);
+        }, 5000);
+    });
+}
+
+void ClientPermissions::rotateCredential()
+{
+    if (working || !available || selectedId.isEmpty() || !rotateButton->isEnabled())
+        return;
+    if (QMessageBox::question(this, "更换客户端密钥",
+        "更换后，原密钥立即失效，已连接的客户端需要粘贴新的连接信息。"
+        "客户端名称、群及权限设置保持不变。是否继续？",
+        QMessageBox::Yes | QMessageBox::No, QMessageBox::No) != QMessageBox::Yes)
+        return;
+    const auto id = selectedId;
+    setWorking(true);
+    withConnectionInfo([this, id](const QJsonObject &p2p)
+    {
+        transport.post("/api/local/clients/" + id + "/rotate", {},
+            [this, p2p](const QJsonValue &value, const QString &error)
+        {
+            setWorking(false);
+            if (!error.isEmpty())
+            {
+                status->setText(error);
+                return;
+            }
+            const auto token = value.toObject().value("token").toString();
+            if (token.isEmpty())
+            {
+                status->setText("服务端未返回密钥，请点击“复制连接信息”重新读取。");
+                return;
+            }
+            showCredential(value.toObject().value("client").toObject().value("name").toString(), token, p2p);
+            refresh();
+        }, 5000);
+    });
 }
 
 void ClientPermissions::revoke()
@@ -316,7 +427,7 @@ void ClientPermissions::showCredential(const QString &clientName, const QString 
     dialog.setWindowTitle("客户端接入信息 · " + clientName);
     dialog.resize(650, 310);
     auto *layout = new QVBoxLayout(&dialog);
-    auto *hint = new QLabel("密钥只在此处显示一次，服务端仅保存校验摘要。请复制给这个客户端，勿分发管理员密钥。"
+    auto *hint = new QLabel("此客户端的密钥已保存在本机，关闭窗口后仍可在“客户端权限”中再次查看或复制。"
         "\n客户端打开连接设置，点击“粘贴连接信息”后保存。");
     hint->setWordWrap(true);
     layout->addWidget(hint);
@@ -360,6 +471,11 @@ void ClientPermissions::showCredential(const QString &clientName, const QString 
     secret->setReadOnly(true);
     secret->setEchoMode(QLineEdit::Password);
     form->addRow("独立接入密钥", secret);
+    auto *reveal = new QCheckBox("显示密钥");
+    reveal->setObjectName("clientCredentialReveal");
+    connect(reveal, &QCheckBox::toggled, secret,
+        [secret](bool visible) { secret->setEchoMode(visible ? QLineEdit::Normal : QLineEdit::Password); });
+    form->addRow(QString(), reveal);
     auto *fingerprint = new QLineEdit(pin);
     fingerprint->setReadOnly(true);
     form->addRow("TLS 证书指纹", fingerprint);

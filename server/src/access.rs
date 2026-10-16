@@ -16,11 +16,13 @@ pub struct ClientAccess {
     pub revision: u64,
 }
 
-// The secret itself is never stored, and the hash is never serialized into API replies.
+// Recoverable secrets live separately from the public policy. Never derive Debug or Serialize
+// here: only the loopback administrator credential endpoints may return the original token.
 #[derive(Clone)]
 pub struct ClientRecord {
     pub access: ClientAccess,
     pub token_hash: String,
+    pub token: Option<String>,
 }
 pub type Clients = BTreeMap<String, ClientRecord>;
 

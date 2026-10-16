@@ -3,6 +3,7 @@
 #include "server_settings.h"
 #include "connection_info.h"
 #include "test_tls_identity.h"
+#include <QAbstractButton>
 #include <QApplication>
 #include <QCheckBox>
 #include <QClipboard>
@@ -24,6 +25,7 @@
 #include <QTcpServer>
 #include <QTemporaryDir>
 #include <QTest>
+#include <QTimer>
 #include <QUuid>
 #include <memory>
 
@@ -38,10 +40,19 @@ QJsonObject relayEntry()
 class AdminFixture final : public QTcpServer
 {
   public:
-    bool available = true;
-    int created = 0;
+    bool available = true, tokenKnown = true;
+    int created = 0, updated = 0, rotated = 0, credentialReads = 0, p2pReads = 0, rejectedAuthorization = 0;
     QString secret = QString(64, 'a');
     QString clientToken = "wxcl_" + QString(64, 'c');
+    QString serverId = QString(64, 'b');
+    QJsonObject client, rotationBody;
+
+    void seedClient()
+    {
+        client = {{"id", "offline-client"}, {"name", "已保存的客户端"}, {"enabled", true}, {"revoked", false},
+            {"can_send", true}, {"can_download", false}, {"groups", QJsonArray{"offline-group"}}};
+    }
+
   protected:
     void incomingConnection(qintptr descriptor) override
     {
@@ -59,37 +70,209 @@ class AdminFixture final : public QTcpServer
             if (end < 0 || socket->property("handled").toBool())
                 return;
             const auto lines = buffer->left(end).split('\n');
-            int length = 0;
+            int length = 0, authorizationHeaders = 0;
+            QByteArray authorization;
             for (const auto &line : lines)
+            {
                 if (line.toLower().startsWith("content-length:"))
                     length = line.mid(line.indexOf(':') + 1).trimmed().toInt();
+                if (line.toLower().startsWith("authorization:"))
+                {
+                    ++authorizationHeaders;
+                    authorization = line.mid(line.indexOf(':') + 1).trimmed();
+                }
+            }
             if (buffer->size() < end + 4 + length)
                 return;
             socket->setProperty("handled", true);
             const auto request = lines.first().trimmed().split(' ');
             const auto path = request.value(1);
+            const auto method = request.value(0);
+            const auto payload = QJsonDocument::fromJson(buffer->mid(end + 4, length)).object();
             QJsonObject response;
-            if (path == "/api/local/forwarding")
+            QByteArray status = "200 OK";
+            if (authorizationHeaders != 1 || authorization != "Bearer " + secret.toUtf8())
+            {
+                ++rejectedAuthorization;
+                status = "403 Forbidden";
+                response = {{"error", "fixture administrator authorization required"}};
+            }
+            else if (path == "/api/local/forwarding" && method == "GET")
                 response = {{"groups", QJsonArray{QJsonObject{{"id", "offline-group"}, {"name", "离线群"}}}},
                     {"selected", QJsonArray{"offline-group"}}};
-            else if (path == "/api/local/p2p")
-                response = {{"enabled", available}, {"server_id", available ? QString(64, 'b') : QString()},
+            else if (path == "/api/local/p2p" && method == "GET")
+            {
+                ++p2pReads;
+                response = {{"enabled", available}, {"server_id", available ? serverId : QString()},
                     {"status", available ? "listening" : "failed"}};
-            else if (path == "/api/local/clients" && request.value(0) == "POST")
+            }
+            else if (path == "/api/local/clients" && method == "GET")
+                response = {{"clients", client.isEmpty() ? QJsonArray{} : QJsonArray{client}}};
+            else if (path == "/api/local/clients" && method == "POST")
             {
                 ++created;
-                response = {{"client", QJsonObject{{"id", "offline-client"}, {"name", "测试客户端"}}},
-                    {"token", clientToken}};
+                client = payload;
+                client.insert("id", "offline-client");
+                client.insert("revoked", false);
+                response = {{"client", client}, {"token", clientToken}};
+            }
+            else if (!client.isEmpty() && path == "/api/local/clients/offline-client/credential" && method == "GET")
+            {
+                ++credentialReads;
+                response = {{"client", client},
+                    {"token", tokenKnown ? QJsonValue(clientToken) : QJsonValue(QJsonValue::Null)}};
+            }
+            else if (!client.isEmpty() && path == "/api/local/clients/offline-client/rotate" && method == "POST")
+            {
+                ++rotated;
+                rotationBody = payload;
+                tokenKnown = true;
+                clientToken = "wxcl_" + QString(64, 'd');
+                response = {{"client", client}, {"token", clientToken}};
+            }
+            else if (!client.isEmpty() && path == "/api/local/clients/offline-client" && method == "POST")
+            {
+                ++updated;
+                for (auto entry = payload.begin(); entry != payload.end(); ++entry)
+                    client.insert(entry.key(), entry.value());
+                response = {{"client", client}};
             }
             else
-                response = {{"clients", QJsonArray{}}};
+            {
+                status = "404 Not Found";
+                response = {{"error", "unexpected fixture route"}};
+            }
             const auto body = QJsonDocument(response).toJson(QJsonDocument::Compact);
-            socket->write("HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: " +
+            socket->write("HTTP/1.1 " + status + "\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: " +
                 QByteArray::number(body.size()) + "\r\n\r\n" + body);
             socket->disconnectFromHost();
         });
         socket->startServerEncryption();
     }
+};
+
+bool writeFixtureConfiguration(const QString &directory, const AdminFixture &fixture, QJsonObject p2p = relayEntry())
+{
+    QFile certificate(directory + "/cert.pem");
+    if (!certificate.open(QIODevice::WriteOnly) || certificate.write(TestTlsIdentity::selfSignedPem) <= 0)
+        return false;
+    certificate.close();
+    p2p.insert("enabled", true);
+    QFile config(directory + "/server.json");
+    return config.open(QIODevice::WriteOnly) && config.write(QJsonDocument(QJsonObject{
+        {"listen", "127.0.0.1:" + QString::number(fixture.serverPort())}, {"token", fixture.secret},
+        {"tls_cert", certificate.fileName()}, {"p2p", p2p}}).toJson()) > 0;
+}
+
+// Modal handlers must always close their dialog, including failure paths: otherwise
+// QDialog::exec can prevent the assertion following the initiating click from running.
+class CredentialInteraction final : public QObject
+{
+  public:
+    enum class Action { Copy, Cancel, Forbid };
+    bool complete = false, timedOut = false, confirmed = false, defaultNo = false;
+    bool hiddenByDefault = false, revealWorks = false;
+    QString error, title;
+    QJsonObject connection;
+
+    explicit CredentialInteraction(QWidget &parent) : owner(parent)
+    {
+        poll.setInterval(20);
+        deadline.setSingleShot(true);
+        deadline.setInterval(10000);
+        connect(&deadline, &QTimer::timeout, this, [this]
+        {
+            timedOut = true;
+            error = "Credential fixture timed out";
+            stop();
+            if (auto *question = owner.findChild<QMessageBox *>())
+                question->reject();
+            if (auto *dialog = owner.findChild<QDialog *>("clientCredentialDialog"))
+                dialog->reject();
+        });
+        connect(&poll, &QTimer::timeout, this, [this]
+        {
+            if (auto *question = owner.findChild<QMessageBox *>(); question && question->isVisible())
+            {
+                const auto answer = confirmation;
+                confirmation = QMessageBox::NoButton;
+                auto *button = question->button(answer);
+                if (!button)
+                {
+                    error = "Unexpected confirmation dialog";
+                    stop();
+                    question->reject();
+                    complete = true;
+                    return;
+                }
+                defaultNo = question->defaultButton() == question->button(QMessageBox::No);
+                confirmed = true;
+                if (answer == QMessageBox::No)
+                {
+                    complete = true;
+                    stop();
+                }
+                button->click();
+                return;
+            }
+            auto *dialog = owner.findChild<QDialog *>("clientCredentialDialog");
+            if (!dialog || !dialog->isVisible())
+                return;
+            stop(); // Clipboard callbacks may dispatch nested platform events.
+            title = dialog->windowTitle();
+            auto *copy = dialog->findChild<QPushButton *>("clientCredentialCopy");
+            auto *secret = dialog->findChild<QLineEdit *>("clientCredentialToken");
+            auto *reveal = dialog->findChild<QCheckBox *>("clientCredentialReveal");
+            if (action == Action::Forbid)
+                error = "An operation unexpectedly displayed a credential";
+            else if (!copy || !secret || !reveal || !copy->isEnabled())
+                error = "Credential controls are missing or disabled";
+            else
+            {
+                hiddenByDefault = !reveal->isChecked() && secret->isReadOnly() &&
+                    secret->echoMode() == QLineEdit::Password;
+                reveal->click();
+                const bool visible = secret->echoMode() == QLineEdit::Normal;
+                reveal->click();
+                revealWorks = visible && secret->echoMode() == QLineEdit::Password;
+                if (action == Action::Copy)
+                {
+                    copy->click();
+                    connection = QJsonDocument::fromJson(QApplication::clipboard()->text().toUtf8()).object();
+                }
+            }
+            complete = true;
+            if (action == Action::Cancel || !error.isEmpty())
+                dialog->reject();
+            else
+                dialog->accept();
+        });
+    }
+
+    void arm(Action nextAction, QMessageBox::StandardButton answer = QMessageBox::NoButton)
+    {
+        stop();
+        action = nextAction;
+        confirmation = answer;
+        complete = timedOut = confirmed = defaultNo = hiddenByDefault = revealWorks = false;
+        error.clear();
+        title.clear();
+        connection = {};
+        poll.start();
+        deadline.start();
+    }
+
+    void stop()
+    {
+        poll.stop();
+        deadline.stop();
+    }
+
+  private:
+    QWidget &owner;
+    QTimer poll, deadline;
+    Action action = Action::Forbid;
+    QMessageBox::StandardButton confirmation = QMessageBox::NoButton;
 };
 } // namespace
 
@@ -133,26 +316,32 @@ class ServerGuiTests : public QObject
         window.findChild<QCheckBox *>("clientAccessCanSend")->setChecked(true);
         groups->item(0)->setCheckState(Qt::Checked);
         const auto allowedGroup = groups->item(0)->data(Qt::UserRole).toString();
-        QJsonObject connection;
-        QTimer credentialTimer;
-        credentialTimer.setInterval(25);
-        connect(&credentialTimer, &QTimer::timeout, &window, [&]
-        {
-            auto *dialog = window.findChild<QDialog *>("clientCredentialDialog");
-            if (!dialog)
-                return;
-            QTest::mouseClick(dialog->findChild<QPushButton *>("clientCredentialCopy"), Qt::LeftButton);
-            connection = QJsonDocument::fromJson(QApplication::clipboard()->text().toUtf8()).object();
-            dialog->accept();
-            credentialTimer.stop();
-        });
-        credentialTimer.start();
+        CredentialInteraction credential(window);
+        credential.arm(CredentialInteraction::Action::Copy);
         QTest::mouseClick(window.findChild<QPushButton *>("clientAccessApply"), Qt::LeftButton);
-        QTRY_VERIFY_WITH_TIMEOUT(!connection.value("token").toString().isEmpty(), 5000);
+        QTRY_VERIFY_WITH_TIMEOUT(credential.complete || credential.timedOut, 5000);
+        QVERIFY2(credential.error.isEmpty(), qPrintable(credential.error));
+        QVERIFY(credential.hiddenByDefault && credential.revealWorks);
+        const auto connection = credential.connection;
+        QVERIFY(!connection.value("token").toString().isEmpty());
         QVERIFY(connection.value("token").toString() != administrator);
         QCOMPARE(connection.value("serverUrl").toString(), "http://127.0.0.1:" + QString::number(port));
         auto *list = window.findChild<QListWidget *>("clientAccessList");
         QTRY_COMPARE_WITH_TIMEOUT(list->count(), 1, 5000);
+        const auto clientId = list->item(0)->data(Qt::UserRole).toJsonObject().value("id").toString();
+        QVERIFY(!clientId.isEmpty());
+        auto *copyExisting = window.findChild<QPushButton *>("clientAccessCredential");
+        QVERIFY(copyExisting);
+        QTest::mouseClick(window.findChild<QPushButton *>("clientAccessRefresh"), Qt::LeftButton);
+        QTRY_VERIFY_WITH_TIMEOUT(copyExisting->isEnabled(), 5000);
+        credential.arm(CredentialInteraction::Action::Copy);
+        QTest::mouseClick(copyExisting, Qt::LeftButton);
+        QTRY_VERIFY_WITH_TIMEOUT(credential.complete || credential.timedOut, 5000);
+        QVERIFY2(credential.error.isEmpty(), qPrintable(credential.error));
+        QCOMPARE(credential.connection.value("token"), connection.value("token"));
+        QCOMPARE(credential.connection.value("serverUrl"), connection.value("serverUrl"));
+        QCOMPARE(list->count(), 1);
+        QCOMPARE(list->item(0)->data(Qt::UserRole).toJsonObject().value("id").toString(), clientId);
         Transport client;
         client.configure(connection.value("serverUrl").toString(), connection.value("token").toString());
         QJsonValue value;
@@ -181,11 +370,32 @@ class ServerGuiTests : public QObject
         QVERIFY(window.findChild<QPushButton *>("serverConfigure")->isEnabled());
         window.startService();
         QTRY_COMPARE_WITH_TIMEOUT(window.findChild<QLabel *>("serverBridgeStatus")->text(), QString("已连接"), 15000);
+        QTRY_VERIFY_WITH_TIMEOUT(window.findChild<QPushButton *>("clientAccessRefresh")->isEnabled(), 5000);
+        QTest::mouseClick(window.findChild<QPushButton *>("clientAccessRefresh"), Qt::LeftButton);
+        QTRY_VERIFY_WITH_TIMEOUT(copyExisting->isEnabled(), 5000);
+        credential.arm(CredentialInteraction::Action::Copy);
+        QTest::mouseClick(copyExisting, Qt::LeftButton);
+        QTRY_VERIFY_WITH_TIMEOUT(credential.complete || credential.timedOut, 5000);
+        QVERIFY2(credential.error.isEmpty(), qPrintable(credential.error));
+        QCOMPARE(credential.connection.value("token"), connection.value("token"));
+        QCOMPARE(credential.connection.value("serverUrl"), connection.value("serverUrl"));
+        QCOMPARE(list->count(), 1);
+        const auto restoredClient = list->item(0)->data(Qt::UserRole).toJsonObject();
+        QCOMPARE(restoredClient.value("id").toString(), clientId);
+        QVERIFY(!restoredClient.value("can_send").toBool(true));
+        QVERIFY(!restoredClient.value("can_download").toBool(true));
+        QCOMPARE(restoredClient.value("groups").toArray(), QJsonArray{allowedGroup});
         done = false;
         client.get("/api/groups", [&](const QJsonValue &v, const QString &e) { value = v; error = e; done = true; });
         QTRY_VERIFY(done);
         QVERIFY2(error.isEmpty(), qPrintable(error));
         QCOMPARE(value.toArray().size(), 1);
+        done = false;
+        client.get("/api/status", [&](const QJsonValue &v, const QString &e) { value = v; error = e; done = true; });
+        QTRY_VERIFY(done);
+        QVERIFY2(error.isEmpty(), qPrintable(error));
+        QVERIFY(!value.toObject().value("permissions").toObject().value("can_send").toBool(true));
+        QVERIFY(!value.toObject().value("permissions").toObject().value("can_download").toBool(true));
         window.stopService();
     }
 
@@ -381,6 +591,182 @@ class ServerGuiTests : public QObject
         QVERIFY2(!timedOut, qPrintable(diagnostic()));
         QCOMPARE(fixture.created, 1);
         deadline.stop();
+    }
+
+    void repeatCopyRefreshesAutomaticEntryWithoutSavingPermissionEdits()
+    {
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        AdminFixture fixture;
+        fixture.seedClient();
+        QVERIFY(fixture.listen(QHostAddress::LocalHost, 0));
+        QVERIFY(writeFixtureConfiguration(directory.path(), fixture));
+        const auto storedPolicy = fixture.client;
+        ClientPermissions editor(directory.filePath("server.json"));
+        CredentialInteraction interaction(editor);
+        editor.show();
+        editor.refresh();
+        auto *list = editor.findChild<QListWidget *>("clientAccessList");
+        auto *copy = editor.findChild<QPushButton *>("clientAccessCredential");
+        auto *name = editor.findChild<QLineEdit *>("clientAccessName");
+        auto *send = editor.findChild<QCheckBox *>("clientAccessCanSend");
+        auto *download = editor.findChild<QCheckBox *>("clientAccessCanDownload");
+        auto *groups = editor.findChild<QListWidget *>("clientAccessGroups");
+        QVERIFY(list && copy && name && send && download && groups);
+        QTRY_VERIFY_WITH_TIMEOUT(copy->isEnabled() && list->count() == 1, 5000);
+        name->setText("尚未保存的客户端名称");
+        send->setChecked(false);
+        download->setChecked(true);
+        groups->item(0)->setCheckState(Qt::Unchecked);
+
+        const QString sentinel = "credential-cancel-sentinel";
+        QApplication::clipboard()->setText(sentinel);
+        interaction.arm(CredentialInteraction::Action::Cancel);
+        QTest::mouseClick(copy, Qt::LeftButton);
+        QTRY_VERIFY_WITH_TIMEOUT(interaction.complete || interaction.timedOut, 5000);
+        QVERIFY2(interaction.error.isEmpty(), qPrintable(interaction.error));
+        QVERIFY(interaction.hiddenByDefault && interaction.revealWorks);
+        QCOMPARE(QApplication::clipboard()->text(), sentinel);
+        QCOMPARE(fixture.credentialReads, 1);
+        QCOMPARE(fixture.client, storedPolicy);
+        QCOMPARE(name->text(), QString("尚未保存的客户端名称"));
+        QVERIFY(!send->isChecked() && download->isChecked());
+        QCOMPARE(groups->item(0)->checkState(), Qt::Unchecked);
+
+        const auto beforeFirstCopy = fixture.p2pReads;
+        interaction.arm(CredentialInteraction::Action::Copy);
+        QTest::mouseClick(copy, Qt::LeftButton);
+        QTRY_VERIFY_WITH_TIMEOUT(interaction.complete || interaction.timedOut, 5000);
+        QVERIFY2(interaction.error.isEmpty(), qPrintable(interaction.error));
+        QVERIFY(interaction.hiddenByDefault && interaction.revealWorks);
+        QCOMPARE(fixture.p2pReads, beforeFirstCopy + 1);
+        QCOMPARE(interaction.connection.value("token").toString(), fixture.clientToken);
+        QCOMPARE(interaction.connection.value("serverUrl").toString(), "p2p://" + fixture.serverId);
+        QVERIFY(interaction.title.contains(storedPolicy.value("name").toString()));
+        QVERIFY(!interaction.title.contains(name->text()));
+        QVERIFY(!QJsonDocument(interaction.connection).toJson().contains(fixture.secret.toUtf8()));
+
+        // Change both persisted entry details and the live public server ID. A repeat
+        // copy must re-read these rather than reuse the first credential's snapshot.
+        auto changedEntry = relayEntry();
+        changedEntry["relay_url"] = "https://fresh-offline-relay.invalid";
+        changedEntry["relay_token"] = "fresh-offline-relay-token";
+        changedEntry["relay_quic_port"] = 8443;
+        fixture.serverId = QString(64, 'e');
+        QVERIFY(writeFixtureConfiguration(directory.path(), fixture, changedEntry));
+        const auto beforeSecondCopy = fixture.p2pReads;
+        interaction.arm(CredentialInteraction::Action::Copy);
+        QTest::mouseClick(copy, Qt::LeftButton);
+        QTRY_VERIFY_WITH_TIMEOUT(interaction.complete || interaction.timedOut, 5000);
+        QVERIFY2(interaction.error.isEmpty(), qPrintable(interaction.error));
+        QCOMPARE(fixture.p2pReads, beforeSecondCopy + 1);
+        QCOMPARE(fixture.credentialReads, 3);
+        QCOMPARE(interaction.connection.value("token").toString(), fixture.clientToken);
+        QCOMPARE(interaction.connection.value("serverUrl").toString(), "p2p://" + fixture.serverId);
+        changedEntry["server_id"] = fixture.serverId;
+        QCOMPARE(interaction.connection.value("p2p").toObject(), changedEntry);
+        QJsonObject parsed;
+        QString error;
+        QVERIFY2(ConnectionInfo::parse(QJsonDocument(interaction.connection).toJson(), parsed, error), qPrintable(error));
+        QCOMPARE(list->count(), 1);
+        QCOMPARE(list->item(0)->data(Qt::UserRole).toJsonObject(), storedPolicy);
+        QCOMPARE(fixture.client, storedPolicy);
+        QCOMPARE(name->text(), QString("尚未保存的客户端名称"));
+        QVERIFY(!send->isChecked() && download->isChecked());
+        QCOMPARE(groups->item(0)->checkState(), Qt::Unchecked);
+        QCOMPARE(fixture.created, 0);
+        QCOMPARE(fixture.updated, 0);
+        QCOMPARE(fixture.rotated, 0);
+        QCOMPARE(fixture.rejectedAuthorization, 0);
+    }
+
+    void legacySecretNeverRotatesImplicitlyAndConfirmedRotationPreservesPolicy()
+    {
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        AdminFixture fixture;
+        fixture.seedClient();
+        fixture.tokenKnown = false;
+        QVERIFY(fixture.listen(QHostAddress::LocalHost, 0));
+        QVERIFY(writeFixtureConfiguration(directory.path(), fixture));
+        const auto storedPolicy = fixture.client;
+        const auto originalToken = fixture.clientToken;
+        ClientPermissions editor(directory.filePath("server.json"));
+        CredentialInteraction interaction(editor);
+        editor.show();
+        editor.refresh();
+        auto *copy = editor.findChild<QPushButton *>("clientAccessCredential");
+        auto *rotate = editor.findChild<QPushButton *>("clientAccessRotate");
+        auto *status = editor.findChild<QLabel *>("clientAccessStatus");
+        auto *list = editor.findChild<QListWidget *>("clientAccessList");
+        QVERIFY(copy && rotate && status && list);
+        QTRY_VERIFY_WITH_TIMEOUT(copy->isEnabled() && rotate->isEnabled(), 5000);
+        editor.findChild<QLineEdit *>("clientAccessName")->setText("尚未提交的权限修改");
+        editor.findChild<QCheckBox *>("clientAccessCanSend")->setChecked(false);
+        editor.findChild<QCheckBox *>("clientAccessCanDownload")->setChecked(true);
+        editor.findChild<QListWidget *>("clientAccessGroups")->item(0)->setCheckState(Qt::Unchecked);
+
+        const QString sentinel = "legacy-null-secret-sentinel";
+        QApplication::clipboard()->setText(sentinel);
+        interaction.arm(CredentialInteraction::Action::Forbid);
+        QTest::mouseClick(copy, Qt::LeftButton);
+        QTRY_COMPARE_WITH_TIMEOUT(fixture.credentialReads, 1, 5000);
+        QTRY_VERIFY_WITH_TIMEOUT(copy->isEnabled(), 5000);
+        interaction.stop();
+        QVERIFY2(interaction.error.isEmpty(), qPrintable(interaction.error));
+        QVERIFY(!interaction.complete && !interaction.timedOut);
+        QVERIFY(status->text().contains("更换密钥"));
+        QCOMPARE(QApplication::clipboard()->text(), sentinel);
+        QCOMPARE(fixture.rotated, 0);
+        QCOMPARE(fixture.clientToken, originalToken);
+        QCOMPARE(fixture.client, storedPolicy);
+
+        const auto beforeCancel = fixture.p2pReads;
+        interaction.arm(CredentialInteraction::Action::Forbid, QMessageBox::No);
+        QTest::mouseClick(rotate, Qt::LeftButton);
+        QTRY_VERIFY_WITH_TIMEOUT(interaction.complete || interaction.timedOut, 5000);
+        QVERIFY2(interaction.error.isEmpty(), qPrintable(interaction.error));
+        QVERIFY(interaction.confirmed && interaction.defaultNo);
+        QCOMPARE(fixture.p2pReads, beforeCancel);
+        QCOMPARE(fixture.rotated, 0);
+        QCOMPARE(fixture.clientToken, originalToken);
+
+        fixture.available = false;
+        const auto beforeUnavailable = fixture.p2pReads;
+        interaction.arm(CredentialInteraction::Action::Forbid, QMessageBox::Yes);
+        QTest::mouseClick(rotate, Qt::LeftButton);
+        QTRY_COMPARE_WITH_TIMEOUT(fixture.p2pReads, beforeUnavailable + 1, 5000);
+        QTRY_VERIFY_WITH_TIMEOUT(rotate->isEnabled(), 5000);
+        interaction.stop();
+        QVERIFY2(interaction.error.isEmpty(), qPrintable(interaction.error));
+        QVERIFY(interaction.confirmed && interaction.defaultNo && !interaction.timedOut);
+        QCOMPARE(fixture.rotated, 0); // Resolve usable connection information before invalidating the old key.
+        QCOMPARE(fixture.clientToken, originalToken);
+
+        fixture.available = true;
+        interaction.arm(CredentialInteraction::Action::Copy, QMessageBox::Yes);
+        QTest::mouseClick(rotate, Qt::LeftButton);
+        QTRY_VERIFY_WITH_TIMEOUT(interaction.complete || interaction.timedOut, 5000);
+        QVERIFY2(interaction.error.isEmpty(), qPrintable(interaction.error));
+        QVERIFY(interaction.confirmed && interaction.defaultNo);
+        QVERIFY(interaction.hiddenByDefault && interaction.revealWorks);
+        QCOMPARE(fixture.rotated, 1);
+        QVERIFY(fixture.rotationBody.isEmpty());
+        QVERIFY(fixture.clientToken != originalToken);
+        QCOMPARE(interaction.connection.value("token").toString(), fixture.clientToken);
+        QCOMPARE(fixture.client, storedPolicy);
+        QTRY_VERIFY_WITH_TIMEOUT(copy->isEnabled(), 5000);
+        QCOMPARE(list->count(), 1);
+        QCOMPARE(list->item(0)->data(Qt::UserRole).toJsonObject(), storedPolicy);
+        interaction.arm(CredentialInteraction::Action::Copy);
+        QTest::mouseClick(copy, Qt::LeftButton);
+        QTRY_VERIFY_WITH_TIMEOUT(interaction.complete || interaction.timedOut, 5000);
+        QVERIFY2(interaction.error.isEmpty(), qPrintable(interaction.error));
+        QCOMPARE(interaction.connection.value("token").toString(), fixture.clientToken);
+        QCOMPARE(fixture.created, 0);
+        QCOMPARE(fixture.updated, 0);
+        QCOMPARE(fixture.rotated, 1);
+        QCOMPARE(fixture.rejectedAuthorization, 0);
     }
 };
 

@@ -15,7 +15,7 @@ int main(int argc, char **argv)
     QApplication app(argc, argv);
     QCoreApplication::setOrganizationName("WeChatLite");
     QCoreApplication::setApplicationName("WeChatLite");
-    QCoreApplication::setApplicationVersion("0.3.0");
+    QCoreApplication::setApplicationVersion("0.3.1");
     const auto profile = qEnvironmentVariable("WECHAT_LITE_PROFILE");
     if (!profile.isEmpty())
     {

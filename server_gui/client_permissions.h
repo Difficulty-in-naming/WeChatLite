@@ -2,6 +2,7 @@
 #include "transport.h"
 #include <QJsonArray>
 #include <QWidget>
+#include <functional>
 
 class QCheckBox;
 class QLabel;
@@ -21,6 +22,10 @@ class ClientPermissions : public QWidget
     void newClient();
     void apply();
     void revoke();
+    void existingCredential();
+    void rotateCredential();
+    void updateCredentialActions();
+    void withConnectionInfo(std::function<void(const QJsonObject &)> callback);
     void setWorking(bool value);
     void showCredential(const QString &name, const QString &token, const QJsonObject &p2p = {});
     QString configPath, selectedId;
@@ -32,5 +37,5 @@ class ClientPermissions : public QWidget
     QCheckBox *enabled, *canSend, *canDownload;
     QLabel *status;
     QWidget *editor;
-    QPushButton *refreshButton, *newButton, *applyButton, *revokeButton;
+    QPushButton *refreshButton, *newButton, *applyButton, *revokeButton, *credentialButton, *rotateButton;
 };
