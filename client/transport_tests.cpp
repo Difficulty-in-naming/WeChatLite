@@ -2,6 +2,7 @@
 #include "test_tls_identity.h"
 #include <QCoreApplication>
 #include <QCryptographicHash>
+#include <QDirIterator>
 #include <QFile>
 #include <QJsonDocument>
 #include <QNetworkProxy>
@@ -42,6 +43,7 @@ class TlsFixture : public QTcpServer
     bool keepAlive = false;
     QString redirect;
     std::function<void(const QByteArray &)> onRequest;
+    std::function<bool(QSslSocket *)> rawResponse;
 
   protected:
     void incomingConnection(qintptr descriptor) override
@@ -65,6 +67,7 @@ class TlsFixture : public QTcpServer
                     requests.append(input);
                     if (onRequest)
                         onRequest(input);
+                    if (rawResponse && rawResponse(socket)) return;
                     if (!redirect.isEmpty())
                     {
                         socket->write("HTTP/1.1 302 Found\r\nLocation: " + redirect.toUtf8() +
@@ -141,6 +144,77 @@ class TransportTests : public QObject
     QSslConfiguration original;
 
   private slots:
+    void aSlowDripPosterCannotKeepADownloadSlotForever()
+    {
+        TlsFixture fixture(true);
+        QVERIFY(fixture.listen(QHostAddress::LocalHost));
+        fixture.rawResponse = [](QSslSocket *socket)
+        {
+            socket->write("HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nContent-Length: 5000\r\nConnection: close\r\n\r\nx");
+            auto *drip = new QTimer(socket);
+            QObject::connect(drip, &QTimer::timeout, socket, [socket] { socket->write("x"); });
+            drip->start(100);
+            return true;
+        };
+        Transport transport;
+        transport.configure(fixture.url(), "offline-drip-secret-at-least-24", fixture.pin());
+        QTemporaryDir directory;
+        bool completed = false;
+        QString failure;
+        QElapsedTimer elapsed; elapsed.start();
+        transport.downloadPoster({{"id", "drip"}, {"kind", "video"}}, directory.path(),
+            [&](const QString &, const QString &error) { failure = error; completed = true; });
+        QTRY_VERIFY_WITH_TIMEOUT(completed, 20000);
+        QCOMPARE(failure, QString("视频封面请求超时"));
+        QVERIFY(elapsed.elapsed() < 20000);
+        QVERIFY(!transport.hasActiveDownloads());
+        QDirIterator remaining(directory.path(), QDir::Files | QDir::Hidden, QDirIterator::Subdirectories);
+        QVERIFY(!remaining.hasNext());
+    }
+
+    void videoPosterDownloadsAreSmallVerifiedAndNeverFetchOriginal_data()
+    {
+        QTest::addColumn<QString>("mode");
+        for (const auto &mode : {"valid", "wrong-hash", "oversized", "wrong-length"}) QTest::newRow(mode) << QString(mode);
+    }
+    void videoPosterDownloadsAreSmallVerifiedAndNeverFetchOriginal()
+    {
+        QFETCH(QString, mode);
+        TlsFixture fixture(true);
+        QVERIFY(fixture.listen(QHostAddress::LocalHost));
+        const auto bytes = mode == "oversized" ? QByteArray(48 * 1024 + 1, 'x') : QByteArray("small-offline-cover");
+        fixture.rawResponse = [mode, bytes](QSslSocket *socket)
+        {
+            const auto hash = mode == "wrong-hash" ? QByteArray(64, '0') : QCryptographicHash::hash(bytes, QCryptographicHash::Sha256).toHex();
+            socket->write("HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nX-Content-SHA256: " + hash +
+                "\r\nContent-Length: " + QByteArray::number(bytes.size() + (mode == "wrong-length" ? 1 : 0)) +
+                "\r\nConnection: close\r\n\r\n" + bytes);
+            socket->disconnectFromHost();
+            return true;
+        };
+        Transport transport;
+        transport.configure(fixture.url(), "offline-poster-secret-at-least-24", fixture.pin());
+        QTemporaryDir directory;
+        bool completed = false;
+        QString saved, failure;
+        QSignalSpy progress(&transport, &Transport::progress);
+        transport.downloadPoster({{"id", "clip"}, {"kind", "video"}, {"size", 200000000}}, directory.path(),
+            [&](const QString &path, const QString &error) { completed = true; saved = path; failure = error; });
+        QTRY_VERIFY_WITH_TIMEOUT(completed, 3000);
+        QCOMPARE(fixture.requests.size(), 1);
+        QVERIFY(fixture.requests[0].startsWith("GET /api/media/clip/poster "));
+        QCOMPARE(progress.size(), 0);
+        if (mode == "valid")
+        {
+            QVERIFY2(failure.isEmpty(), qPrintable(failure));
+            QFile file(saved); QVERIFY(file.open(QIODevice::ReadOnly)); QCOMPARE(file.readAll(), bytes);
+        }
+        else { QVERIFY(!failure.isEmpty()); QVERIFY(saved.isEmpty()); }
+        QVERIFY(!transport.hasActiveDownloads());
+        QDirIterator remaining(directory.path(), QDir::Files | QDir::Hidden, QDirIterator::Subdirectories);
+        while (remaining.hasNext()) QVERIFY(!remaining.next().endsWith(".part"));
+    }
+
     void initTestCase()
     {
         QVERIFY(files.isValid());

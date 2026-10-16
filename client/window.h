@@ -31,6 +31,9 @@ class QMenu;
 class HistoryBrowser;
 class AnnouncementDialog;
 class PreferencesDialog;
+class QScreen;
+
+QRect chatWindowBounds(const QRect &available, const QRect &requested = {});
 
 class Window : public QMainWindow
 {
@@ -90,6 +93,8 @@ class Window : public QMainWindow
     QJsonArray hydrateMessages(const QJsonArray &snapshot) const;
     bool hasCurrentMedia(const QJsonObject &media) const;
     void updateComposeHeight();
+    void fitToScreen(bool initial = false);
+    void watchScreen(QScreen *screen);
     void send();
     void uploadNext(int index, quint64 generation, const QString &targetGroup);
     void clearConversation();
@@ -103,6 +108,7 @@ class Window : public QMainWindow
     void saveMediaAndMaybeOpen(const QJsonObject &media, const QString &path, bool open);
     void stopVoice();
     void visibleThumbnails();
+    void fetchVideoPoster(const QJsonObject &media);
     QString draftKey() const;
     Transport transport;
     TunnelSession tunnel;
@@ -123,6 +129,7 @@ class Window : public QMainWindow
     QScrollArea *attachmentArea;
     QHBoxLayout *attachmentLayout;
     QWidget *quoteArea = nullptr;
+    QWidget *composeResizeHandle = nullptr;
     QLabel *quoteLabel = nullptr;
     QToolButton *cancelQuoteButton = nullptr;
     VoicePlayer *voicePlayer = nullptr;
@@ -144,6 +151,9 @@ class Window : public QMainWindow
     QSystemTrayIcon tray;
     QTimer draftTimer, thumbnailTimer, cachePruneTimer;
     bool cacheWorking = false;
+    bool composeDragging = false, screenWatching = false;
+    int composeHeightPreference = 0, composeDragHeight = 0;
+    QPoint composeDragStart;
     QList<QWidget *> resizeEdges;
     QString groupId, serverUrl, secret, downloadRoot, nickname, clientId, pin, pendingId, demoFailure;
     QString lastError;
@@ -155,6 +165,7 @@ class Window : public QMainWindow
     QSet<QString> queuedMediaIds;
     QQueue<std::function<void()>> mediaQueue;
     QSet<QString> unavailableOriginals;
+    QSet<QString> pendingPosters, failedPosters;
     quint64 sendGeneration = 0, groupsGeneration = 0, conversationGeneration = 0, historyGeneration = 0;
     quint64 permissionsGeneration = 0;
     bool busy = false, ready = false, connected = false, loading = false, restoring = false, quitting = false,

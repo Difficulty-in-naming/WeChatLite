@@ -92,6 +92,7 @@ fn build_router(app: Arc<App>, entry: EntryPoint) -> Router {
             post(upload).layer(DefaultBodyLimit::max(MAX_FILE as usize)),
         )
         .route("/media/{id}", get(download))
+        .route("/media/{id}/poster", get(video_poster))
         .route("/events", get(events));
     if matches!(entry, EntryPoint::Standard) {
         api = api
@@ -1115,9 +1116,9 @@ struct UploadQuery {
     name: String,
     group: String,
 }
-struct PartialFile(PathBuf);
+pub(crate) struct PartialFile(pub(crate) PathBuf);
 impl PartialFile {
-    fn keep(mut self) {
+    pub(crate) fn keep(mut self) {
         self.0.clear();
     }
 }
@@ -1261,6 +1262,36 @@ async fn download(
         .header(header::CONTENT_LENGTH, media.size)
         .header("X-Content-SHA256", media.sha256)
         .body(Body::from_stream(stream))?)
+}
+
+async fn video_poster(
+    State(app): State<Arc<App>>,
+    Extension(principal): Extension<Principal>,
+    Path(id): Path<String>,
+) -> ApiResult<Response> {
+    let (group, media) = app
+        .db(move |s| Ok((s.media_group(&id)?, s.media(&id)?)))
+        .await?;
+    if !allowed(&app, &principal, &group, Capability::Download).await {
+        return Err(Error(
+            anyhow::anyhow!("没有此视频的下载权限"),
+            StatusCode::FORBIDDEN,
+        ));
+    }
+    let bytes = crate::poster::load(&app, &media).await?;
+    // Recheck after decoding: revocation must also apply to a small cover.
+    if !allowed(&app, &principal, &group, Capability::Download).await {
+        return Err(Error(
+            anyhow::anyhow!("此视频的下载权限已撤销"),
+            StatusCode::FORBIDDEN,
+        ));
+    }
+    Ok(Response::builder()
+        .header(header::CONTENT_TYPE, "image/jpeg")
+        .header(header::CACHE_CONTROL, "no-store")
+        .header(header::CONTENT_LENGTH, bytes.len())
+        .header("X-Content-SHA256", format!("{:x}", Sha256::digest(&bytes)))
+        .body(Body::from(bytes))?)
 }
 
 #[derive(Default, Deserialize)]
@@ -1543,6 +1574,105 @@ mod tests {
             token_hash: access::token_hash("fixture-independent-secret"),
             token: None,
         }
+    }
+
+    #[tokio::test]
+    async fn video_poster_uses_a_small_cache_and_enforces_download_and_group_permissions() {
+        let temp = tempfile::tempdir().unwrap();
+        let (app, _receiver) = crate::test_app(temp.path());
+        grant(&app).await;
+        let original = temp.path().join("media/offline.mp4");
+        tokio::fs::write(&original, b"original-is-not-a-thumbnail")
+            .await
+            .unwrap();
+        let media = Media {
+            id: "poster-fixture".into(),
+            name: "offline.mp4".into(),
+            kind: "video".into(),
+            size: 27,
+            sha256: "a".repeat(64),
+            path: original.to_string_lossy().into_owned(),
+        };
+        app.store.set_media(&media, "g").unwrap();
+        let cache = temp.path().join("video-posters");
+        tokio::fs::create_dir(&cache).await.unwrap();
+        let key = format!(
+            "{:x}",
+            Sha256::digest(format!("{}:{}", media.id, media.sha256).as_bytes())
+        );
+        let cover = vec![
+            0xff, 0xd8, 0xff, 0xc0, 0, 8, 8, 0, 90, 0, 160, 1, 0xff, 0xd9,
+        ];
+        tokio::fs::write(cache.join(format!("{key}.jpg")), &cover)
+            .await
+            .unwrap();
+        let router = client_router(app.clone());
+        let get = || {
+            request(
+                "GET",
+                "/api/media/poster-fixture/poster",
+                "fixture-independent-secret",
+                "192.0.2.3:2345",
+                Body::empty(),
+            )
+        };
+        let response = router.clone().oneshot(get()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "image/jpeg");
+        assert_eq!(
+            response.headers()["X-Content-SHA256"],
+            format!("{:x}", Sha256::digest(&cover))
+        );
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), 48 * 1024)
+                .await
+                .unwrap()
+                .as_ref(),
+            &cover
+        );
+        app.clients
+            .write()
+            .await
+            .get_mut("fixture-key")
+            .unwrap()
+            .access
+            .can_download = false;
+        assert_eq!(
+            router.clone().oneshot(get()).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+        app.clients
+            .write()
+            .await
+            .get_mut("fixture-key")
+            .unwrap()
+            .access
+            .can_download = true;
+        app.clients
+            .write()
+            .await
+            .get_mut("fixture-key")
+            .unwrap()
+            .access
+            .groups
+            .clear();
+        assert_eq!(
+            router.clone().oneshot(get()).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+        app.clients
+            .write()
+            .await
+            .get_mut("fixture-key")
+            .unwrap()
+            .access
+            .groups
+            .insert("g".into());
+        app.forwarding.write().await.clear();
+        assert_eq!(
+            router.oneshot(get()).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
     }
 
     async fn grant(app: &App) -> Principal {

@@ -255,6 +255,54 @@ fn inbound_local_picture_file_video_and_emoji_keep_verified_originals() {
 }
 
 #[test]
+fn completed_video_partial_and_destination_skip_archive_but_still_verify_content() {
+    let root = tempfile::tempdir().unwrap();
+    let account = root.path().join("account");
+    let video_root = account.join("msg/video/archive");
+    fs::create_dir_all(&video_root).unwrap();
+    let video = b"\0\0\0\x20ftypisomoffline_video_fixture";
+    let corrupt = vec![b'x'; video.len()];
+    // A fallback archive exists, so zero visited entries proves the owned-file fast path.
+    for index in 0..32 {
+        fs::write(video_root.join(format!("other-{index}.mp4")), &corrupt).unwrap();
+    }
+    fs::write(video_root.join("cached.mp4"), video).unwrap();
+    let db = Db::media_fixture(account, "wxid_offline", None, Default::default());
+    let media = Media::new(root.path().join("adapter"));
+    let group = "123456@chatroom";
+    let row = json!({"local_id":3,"sort_seq":3,"shard":"offline","content":format!("<msg><videomsg length='{}' md5='{}'/></msg>",video.len(),picture::md5(video))});
+    let key = message_key(group, &row);
+    let request_key = format!("video:{key}");
+    let destination = media.cache_dir(&request_key).unwrap().join("video.mp4");
+    let partial = media
+        .directory
+        .join("feishu/media/wechat-video")
+        .join(format!("{}.mp4.part", sha256(request_key.as_bytes())));
+    fs::create_dir_all(partial.parent().unwrap()).unwrap();
+    fs::write(&partial, video).unwrap();
+    fs::write(&destination, &corrupt).unwrap();
+    let restored = media.video(&db, None, group, &row, &key).unwrap();
+    assert_eq!(restored, destination);
+    assert_eq!(fs::read(&restored).unwrap(), video);
+    assert_eq!(media.video_scan_entries.get(), 0);
+
+    fs::remove_file(&partial).unwrap();
+    assert_eq!(
+        media.video(&db, None, group, &row, &key).unwrap(),
+        destination
+    );
+    assert_eq!(media.video_scan_entries.get(), 0);
+    // A same-size corrupted private file must not become a successful fast-path hit.
+    fs::write(&destination, &corrupt).unwrap();
+    assert_eq!(
+        media.video(&db, None, group, &row, &key).unwrap(),
+        destination
+    );
+    assert!(media.video_scan_entries.get() > 0);
+    assert_eq!(fs::read(destination).unwrap(), video);
+}
+
+#[test]
 fn missing_and_partial_inbound_media_remain_retryable() {
     let root = tempfile::tempdir().unwrap();
     let account = root.path().join("account");

@@ -416,6 +416,29 @@ class PreferencesTests final : public QObject
         QVERIFY(!QFileInfo::exists(cacheFiles->filePath("own.bin")));
     }
 
+    void videoPostersStaySeparateFromOriginalsAndUntrustedPaths()
+    {
+        auto files = std::make_shared<MediaStorage::LocalFiles>();
+        const QJsonObject descriptor{{"id", "clip"}, {"kind", "video"}, {"size", 1024 * 1024},
+                                     {"sha256", QString(64, 'a')}};
+        const auto cover = cacheFiles->filePath("cover.jpg");
+        QVERIFY(store(cover, QByteArray(100, 'j')));
+        QJsonObject untrusted = descriptor;
+        untrusted["_poster"] = currentFiles->filePath("private-photo.jpg");
+        QJsonObject message{{"id", "m"}, {"group", "g"}, {"status", "received"}, {"media", QJsonArray{untrusted}}};
+        QVERIFY(files->hydrate(message)["media"].toArray()[0].toObject()["_poster"].toString().isEmpty());
+        files->rememberPoster("g", descriptor, cover);
+        QCOMPARE(files->findPoster("g", descriptor), QFileInfo(cover).absoluteFilePath());
+        QVERIFY(files->find("g", descriptor).isEmpty());
+        QVERIFY(files->pathForId("g", "clip").isEmpty());
+        QCOMPARE(files->hydrate(message)["media"].toArray()[0].toObject()["_poster"].toString(), QFileInfo(cover).absoluteFilePath());
+        auto changed = descriptor; changed["sha256"] = QString(64, 'b');
+        QVERIFY(files->findPoster("g", changed).isEmpty());
+        QVERIFY(files->findPoster("other-group", descriptor).isEmpty());
+        files->discard({cover});
+        QVERIFY(files->findPoster("g", descriptor).isEmpty());
+    }
+
     void cleanup()
     {
         Theme::initialize("light");

@@ -113,6 +113,7 @@ struct Fake {
     mode: &'static str,
     extra_group: bool,
     media_pending: bool,
+    conversions: usize,
 }
 fn row(seq: i64, id: i64) -> Value {
     json!({"sort_seq":seq,"local_id":id,"shard":"message__message_0.db","sender_id":7,"sender_username":"member-a","type":"文本","content":"你好","server_id":seq+id,"source":"","create_time":1000})
@@ -128,6 +129,7 @@ impl Default for Fake {
             mode: "confirm",
             extra_group: false,
             media_pending: false,
+            conversions: 0,
         }
     }
 }
@@ -215,10 +217,16 @@ impl Backend for Fake {
         Ok(())
     }
     fn convert(&mut self, g: &str, r: &Value) -> Result<Option<Value>> {
-        ensure!(
-            !self.media_pending || text(r, "type") == "文本",
-            "fixture media is not ready"
-        );
+        self.conversions += 1;
+        if text(r, "type") != "文本" {
+            if self.media_pending {
+                return Err(anyhow::Error::new(crate::media::MediaPending(
+                    "fixture media is not ready".into(),
+                )))
+                .context("fixture conversion");
+            }
+            ensure!(self.mode != "media_error", "fixture media is invalid");
+        }
         Ok(Some(
             json!({"id":source(g,r)?,"source_id":source(g,r)?,"group":g,"text":r["content"]}),
         ))
@@ -734,6 +742,183 @@ fn delayed_backfill_media_preserves_historical_origin_after_restart() {
         messages[0]["message"]["source_id"],
         source("g", &old).unwrap()
     );
+    assert!(engine.access.calls.is_empty());
+}
+
+fn queued_media() -> (TempDir, Engine<Fake>, Value) {
+    let (temp, mut engine) = setup(json!(["g"]));
+    let mut media = row(11, 2);
+    media["type"] = json!("视频");
+    engine.access.rows.get_mut("g").unwrap().push(media.clone());
+    engine.access.media_pending = true;
+    (temp, engine, media)
+}
+
+fn retry_state(engine: &Engine<Fake>, key: &str) -> (f64, Value) {
+    let (due, locator): (f64, String) = engine
+        .store
+        .db
+        .query_row(
+            "SELECT due,locator FROM pending WHERE source=?",
+            [key],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    (due, serde_json::from_str(&locator).unwrap())
+}
+
+#[test]
+fn newly_pending_live_and_explicit_history_media_retry_before_old_30_second_delay() {
+    for historical in [false, true] {
+        let (_temp, mut engine, media) = queued_media();
+        let commands = if historical {
+            // Keep this page to the one new video, avoiding the baseline text fixture.
+            engine.access.rows.insert("g".into(), vec![media.clone()]);
+            vec![
+                json!({"op":"history","group":"g","request_id":uuid::Uuid::new_v4().to_string(),"before_source":"","limit":60}),
+            ]
+        } else {
+            vec![]
+        };
+        let first = engine.cycle(&commands, 1002.0);
+        assert!(!first.iter().any(|event| event["type"] == "message"));
+        let key = source("g", &media).unwrap();
+        let (due, locator) = retry_state(&engine, &key);
+        assert_eq!(due, 1004.0);
+        assert_eq!(locator["_media_wait_since"], 1002.0);
+        assert_eq!(engine.access.conversions, 1);
+        engine.cycle(&[], 1003.0);
+        assert_eq!(engine.access.conversions, 1);
+
+        engine.access.media_pending = false;
+        let ready = engine.cycle(&[], 1004.1);
+        let messages: Vec<_> = ready
+            .iter()
+            .filter(|event| event["type"] == "message")
+            .collect();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["historical"], historical);
+        assert_eq!(messages[0]["message"]["source_id"], key);
+        let (due, locator) = retry_state(&engine, &key);
+        assert_eq!(due, 1034.1);
+        assert!(locator.get("_media_wait_since").is_none());
+        assert!(
+            !engine
+                .cycle(&[], 1006.2)
+                .iter()
+                .any(|event| event["type"] == "message")
+        );
+        assert!(engine.access.calls.is_empty());
+    }
+}
+
+#[test]
+fn long_pending_media_backoff_survives_restart_and_history_reread() {
+    let (temp, mut engine, media) = queued_media();
+    let key = source("g", &media).unwrap();
+    let first = engine.cycle(&[], 1002.0);
+    assert_eq!(
+        first
+            .iter()
+            .filter(|event| event["type"] == "warning")
+            .count(),
+        1
+    );
+    let retry = engine.cycle(&[], 1032.1);
+    assert!(!retry.iter().any(|event| event["type"] == "warning"));
+    assert_eq!(retry_state(&engine, &key).0, 1037.1);
+    let fake = engine.access.clone();
+    drop(engine);
+    let mut engine = Engine::new(fake, temp.path().to_owned(), &json!(["g"]), 1033.0).unwrap();
+    assert_eq!(retry_state(&engine, &key).1["_media_wait_since"], 1002.0);
+
+    // A repeated page request must not restart the rapid polling window for an old attachment.
+    engine.cycle(
+        &[json!({"op":"history","group":"g","request_id":uuid::Uuid::new_v4().to_string(),"before_source":"","limit":60})],
+        1122.1,
+    );
+    let (due, locator) = retry_state(&engine, &key);
+    assert_eq!(due, 1132.1);
+    assert_eq!(locator["_media_wait_since"], 1002.0);
+    assert_eq!(locator["historical"], true);
+    engine.cycle(&[], 1302.1);
+    assert_eq!(retry_state(&engine, &key).0, 1332.1);
+    let conversions = engine.access.conversions;
+    engine.cycle(&[], 1304.2);
+    assert_eq!(engine.access.conversions, conversions);
+    assert!(engine.access.calls.is_empty());
+}
+
+#[test]
+fn permanent_media_failure_keeps_30_second_backoff_and_one_warning() {
+    let (_temp, mut engine, media) = queued_media();
+    engine.access.media_pending = false;
+    engine.access.mode = "media_error";
+    let first = engine.cycle(&[], 1002.0);
+    assert_eq!(
+        first
+            .iter()
+            .filter(|event| event["type"] == "warning")
+            .count(),
+        1
+    );
+    let key = source("g", &media).unwrap();
+    let (due, locator) = retry_state(&engine, &key);
+    assert_eq!(due, 1032.0);
+    assert!(locator.get("_media_wait_since").is_none());
+    engine.cycle(&[], 1004.1);
+    engine.cycle(&[], 1010.0);
+    assert_eq!(engine.access.conversions, 1);
+    let retry = engine.cycle(&[], 1032.1);
+    assert_eq!(engine.access.conversions, 2);
+    assert!(!retry.iter().any(|event| event["type"] == "warning"));
+    assert_eq!(retry_state(&engine, &key).0, 1062.1);
+}
+
+#[test]
+fn short_media_retries_preserve_live_and_history_conversion_budgets() {
+    let (_temp, mut engine) = setup(json!(["g"]));
+    let media: Vec<_> = (11..31)
+        .map(|id| {
+            let mut row = row(id, id);
+            row["type"] = json!("视频");
+            row
+        })
+        .collect();
+    engine.access.media_pending = true;
+    engine
+        .access
+        .rows
+        .get_mut("g")
+        .unwrap()
+        .extend(media.clone());
+    for index in 0..3 {
+        let before = engine.access.conversions;
+        engine.cycle(&[], 1002.0 + index as f64 * 2.1);
+        assert_eq!(engine.access.conversions - before, 8);
+    }
+    assert_eq!(pending(&engine), 20);
+
+    let (_temp, mut engine) = setup(json!(["g"]));
+    engine.access.media_pending = true;
+    engine.access.rows.insert("g".into(), media);
+    let mut events = vec![];
+    history_page(
+        &mut engine.access,
+        &engine.store,
+        &json!({"group":"g","request_id":uuid::Uuid::new_v4().to_string(),"before_source":"","limit":60}),
+        1002.0,
+        &mut events,
+        None,
+    )
+    .unwrap();
+    assert_eq!(engine.access.conversions, 8);
+    assert_eq!(pending(&engine), 20);
+    let done = events
+        .iter()
+        .find(|event| event["type"] == "history_done")
+        .unwrap();
+    assert_eq!(done["sources"].as_array().unwrap().len(), 20);
     assert!(engine.access.calls.is_empty());
 }
 

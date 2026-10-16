@@ -31,6 +31,8 @@
 #include <QListWidget>
 #include <QMenu>
 #include <QMimeData>
+#include <QMouseEvent>
+#include <QPainter>
 #include <QPushButton>
 #include <QScopeGuard>
 #include <QScreen>
@@ -196,6 +198,126 @@ class DesktopTests : public QObject
         QVERIFY2(failure.isEmpty(), qPrintable(failure));
         QTRY_VERIFY_WITH_TIMEOUT(model->rowCount() >= 4, 8000);
     }
+    void windowBoundsFitLogicalScreensAndRecoverAnOffscreenSavedWindow_data()
+    {
+        QTest::addColumn<QRect>("available");
+        QTest::newRow("1080p-100-percent") << QRect(0, 0, 1920, 1040);
+        QTest::newRow("1080p-150-percent") << QRect(0, 0, 1280, 688);
+        QTest::newRow("2k-200-percent") << QRect(0, 0, 1280, 680);
+        QTest::newRow("small-scaled-desktop") << QRect(0, 0, 800, 560);
+        QTest::newRow("left-secondary-monitor") << QRect(-1280, 0, 1280, 680);
+    }
+    void windowBoundsFitLogicalScreensAndRecoverAnOffscreenSavedWindow()
+    {
+        QFETCH(QRect, available);
+        for (const auto &requested : {QRect{}, QRect(5000, -2000, 3000, 2000), QRect(-5000, 5000, 10, 10)})
+        {
+            const auto result = chatWindowBounds(available, requested);
+            QVERIFY(result.isValid());
+            QVERIFY(available.contains(result));
+            QVERIFY(result.width() <= available.width());
+            QVERIFY(result.height() <= available.height());
+            QVERIFY(result.width() >= qMin(760, available.width() - 24));
+            QVERIFY(result.height() >= qMin(520, available.height() - 24));
+        }
+    }
+    void composerTopEdgeDragsAndKeepsTheSendAreaOnscreen()
+    {
+        const auto previous = QSettings().value("composeHeight");
+        const auto restore = qScopeGuard([previous]
+        {
+            if (previous.isValid()) QSettings().setValue("composeHeight", previous);
+            else QSettings().remove("composeHeight");
+        });
+        Window probe;
+        probe.show();
+        QCoreApplication::processEvents();
+        QVERIFY(probe.screen()->availableGeometry().contains(probe.geometry()));
+        auto *handle = probe.findChild<QWidget *>("composeResizeHandle");
+        auto *compose = probe.findChild<QWidget *>("composeArea");
+        QVERIFY(handle && compose);
+        QCOMPARE(handle->cursor().shape(), Qt::SizeVerCursor);
+        const int original = compose->height();
+        const auto center = handle->rect().center();
+        const auto start = handle->mapToGlobal(center);
+        QMouseEvent press(QEvent::MouseButtonPress, QPointF(center), QPointF(start), Qt::LeftButton, Qt::LeftButton, Qt::NoModifier);
+        QApplication::sendEvent(handle, &press);
+        const auto finish = start - QPoint(0, 70);
+        QMouseEvent move(QEvent::MouseMove, QPointF(handle->mapFromGlobal(finish)), QPointF(finish), Qt::NoButton, Qt::LeftButton, Qt::NoModifier);
+        QApplication::sendEvent(handle, &move);
+        QCoreApplication::processEvents();
+        QMouseEvent release(QEvent::MouseButtonRelease, QPointF(handle->mapFromGlobal(finish)), QPointF(finish), Qt::LeftButton, Qt::NoButton, Qt::NoModifier);
+        QApplication::sendEvent(handle, &release);
+        QVERIFY(compose->height() > original);
+        QCOMPARE(QSettings().value("composeHeight").toInt(), compose->height());
+        probe.resize(800, 540);
+        QCoreApplication::processEvents();
+        QVERIFY(compose->height() <= probe.height() * 65 / 100);
+        auto *send = probe.findChild<QPushButton *>("sendButton");
+        QVERIFY(send);
+        QVERIFY(probe.rect().contains(QRect(send->mapTo(&probe, QPoint()), send->size())));
+    }
+    void oldPosterFailureAfterReconnectDoesNotPoisonTheCurrentConversation()
+    {
+        RecordsApiFixture api;
+        QVERIFY(api.server.listen(QHostAddress::LocalHost));
+        QSettings settings;
+        const QStringList keys{"serverUrl", "token", "certificatePin", "p2p"};
+        QHash<QString, QVariant> previous;
+        for (const auto &key : keys) previous[key] = settings.value(key);
+        const auto restore = qScopeGuard([previous]
+        {
+            QSettings settings;
+            for (auto it = previous.cbegin(); it != previous.cend(); ++it)
+                if (it.value().isValid()) settings.setValue(it.key(), it.value()); else settings.remove(it.key());
+        });
+        settings.setValue("serverUrl", api.url());
+        settings.setValue("token", "offline-records-client-at-least-24");
+        settings.remove("certificatePin"); settings.remove("p2p");
+        const QJsonObject media{{"id", "late-clip"}, {"kind", "video"}, {"name", "clip.mp4"},
+                                {"size", 12345}, {"sha256", QString(64, 'b')}};
+        const QJsonObject message{{"id", "late-message"}, {"group", "poster-group"}, {"sender", "Fixture"},
+                                  {"timestamp", 1000}, {"status", "received"}, {"media", QJsonArray{media}}};
+        QImage image(160, 90, QImage::Format_RGB32); image.fill(QColor("#168b41"));
+        QByteArray cover; QBuffer buffer(&cover); QVERIFY(buffer.open(QIODevice::WriteOnly)); QVERIFY(image.save(&buffer, "JPEG"));
+        QPointer<QTcpSocket> held;
+        api.handler = [&](QTcpSocket *socket, const QUrl &url)
+        {
+            const auto path = url.path();
+            if (path == "/api/events") return; // Keep the synthetic WS handshake pending; signals below drive reconnection.
+            if (path == "/api/groups") RecordsApiFixture::respond(socket, QJsonArray{QJsonObject{{"id", "poster-group"}, {"name", "Fixture"}}});
+            else if (path == "/api/status") RecordsApiFixture::respond(socket, QJsonObject{{"ready", true},
+                {"permissions", QJsonObject{{"can_send", true}, {"can_download", true}}}});
+            else if (path == "/api/history") RecordsApiFixture::respond(socket, QJsonObject{{"messages", QJsonArray{message}}, {"has_more", false}});
+            else if (path == "/api/media/late-clip/poster")
+            {
+                if (api.count(path) == 1) { held = socket; return; }
+                socket->write("HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nX-Content-SHA256: " +
+                    QCryptographicHash::hash(cover, QCryptographicHash::Sha256).toHex() + "\r\nContent-Length: " +
+                    QByteArray::number(cover.size()) + "\r\nConnection: close\r\n\r\n" + cover);
+                socket->disconnectFromHost();
+            }
+            else RecordsApiFixture::respond(socket, QJsonObject{});
+        };
+        Window probe;
+        probe.show();
+        auto *transport = probe.findChild<Transport *>();
+        auto *model = probe.findChild<MessageModel *>();
+        auto *view = probe.findChild<MessageView *>();
+        QVERIFY(transport && model && view);
+        QTRY_COMPARE_WITH_TIMEOUT(model->rowCount(), 1, 3000);
+        transport->connectionChanged(true);
+        QTRY_VERIFY_WITH_TIMEOUT(held, 3000);
+        transport->connectionChanged(false);
+        transport->connectionChanged(true);
+        QTRY_VERIFY_WITH_TIMEOUT(view->property("canDownload").toBool(), 3000);
+        held->write("HTTP/1.1 403 Forbidden\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}");
+        held->disconnectFromHost();
+        QTRY_COMPARE_WITH_TIMEOUT(api.count("/api/media/late-clip/poster"), 2, 3000);
+        QTRY_VERIFY_WITH_TIMEOUT(!model->rows[0]["media"].toArray()[0].toObject()["_poster"].toString().isEmpty(), 3000);
+        QCOMPARE(api.count("/api/media/late-clip"), 0);
+    }
+
     void chatHasOnlySendHeaderEntriesAndWindowControls()
     {
         const auto buttons = window->findChildren<QPushButton *>();
@@ -338,6 +460,83 @@ class DesktopTests : public QObject
         QVERIFY(configureServerFixture(demoGroups));
         QTRY_COMPARE_WITH_TIMEOUT(mainList->count(), 3, 8000);
         QTRY_VERIFY_WITH_TIMEOUT(window->findChild<MessageModel *>()->rowCount() >= 4, 8000);
+    }
+    void recordVideoPostersPaintWithoutDownloadingTheVideo()
+    {
+        RecordsApiFixture api;
+        QVERIFY(api.server.listen(QHostAddress::LocalHost, 0));
+        QImage source(480, 288, QImage::Format_RGB32);
+        source.fill(QColor(20, 180, 70));
+        QByteArray jpeg;
+        QBuffer buffer(&jpeg);
+        QVERIFY(buffer.open(QIODevice::WriteOnly));
+        QVERIFY(source.save(&buffer, "JPEG"));
+        buffer.close();
+        const QJsonObject descriptor{{"id", "history-poster-video"}, {"kind", "video"},
+            {"name", "synthetic.mp4"}, {"size", 8 * 1024 * 1024}, {"sha256", QString(64, 'f')}};
+        QJsonObject message{{"id", "history-poster-message"}, {"group", "history-poster-group"},
+            {"sender", "Synthetic member"}, {"sender_id", "synthetic-member"},
+            {"timestamp", 1'700'000'000'000LL}, {"status", "received"}, {"media", QJsonArray{descriptor}}};
+        const auto posterRoute = QString("/api/media/history-poster-video/poster");
+        const auto videoRoute = QString("/api/media/history-poster-video");
+        api.handler = [&](QTcpSocket *socket, const QUrl &url)
+        {
+            if (url.path().endsWith("/members"))
+                RecordsApiFixture::respond(socket, QJsonArray{});
+            else if (url.path() == "/api/records")
+                RecordsApiFixture::respond(socket, QJsonObject{{"messages", QJsonArray{message}},
+                    {"next_before", QJsonValue(QJsonValue::Null)}, {"has_more", false}, {"pending", false}});
+            else if (url.path() == posterRoute)
+            {
+                const auto digest = QCryptographicHash::hash(jpeg, QCryptographicHash::Sha256).toHex();
+                socket->write("HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: image/jpeg\r\nContent-Length: " +
+                    QByteArray::number(jpeg.size()) + "\r\nX-Content-SHA256: " + digest + "\r\n\r\n" + jpeg);
+                socket->disconnectFromHost();
+            }
+            else
+                RecordsApiFixture::respond(socket, QJsonObject{});
+        };
+        Transport transport;
+        transport.configure(api.url(), "offline-records-client");
+        QPointer<HistoryBrowser> browser = new HistoryBrowser(&transport, "history-poster-group", "Synthetic group",
+                                                             files.path(), true);
+        const auto closeBrowser = qScopeGuard([&] { if (browser) delete browser.data(); });
+        browser->show();
+        auto *list = browser->findChild<QListView *>("historyRecords");
+        QVERIFY(list);
+        QTRY_COMPARE_WITH_TIMEOUT(list->model()->rowCount(), 1, 5000);
+        const auto index = list->model()->index(0, 0);
+        auto media = [&] { return index.data(Qt::UserRole).toJsonObject()["media"].toArray().first().toObject(); };
+        QStyleOptionViewItem option;
+        option.rect = {0, 0, list->viewport()->width(), 240};
+        option.font = list->font();
+        const auto height = list->itemDelegate()->sizeHint(option, index);
+        QTRY_VERIFY_WITH_TIMEOUT(!media()["_poster"].toString().isEmpty(), 5000);
+        QVERIFY(QFileInfo(media()["_poster"].toString()).isFile());
+        QCOMPARE(list->itemDelegate()->sizeHint(option, index), height);
+        QImage painted(option.rect.size(), QImage::Format_RGB32);
+        painted.fill(Qt::white);
+        {
+            QPainter painter(&painted);
+            list->itemDelegate()->paint(&painter, option, index);
+        }
+        const QRect card(70, 43, 240, 144); // Empty text keeps the fixed video card below the name.
+        const auto pixel = painted.pixelColor(card.topLeft() + QPoint(20, 20));
+        QVERIFY(pixel.green() > 150 && pixel.red() < 60 && pixel.blue() < 110);
+        QCOMPARE(painted.pixelColor(card.center()), QColor(Qt::white));
+        const auto path = media()["_poster"].toString();
+        message["seq"] = 2;
+        browser->updateMessage(message); // A receipt without transient paths must retain the cover.
+        QCOMPARE(media()["_poster"].toString(), path);
+        QVERIFY(media()["_local"].toString().isEmpty());
+        QTest::qWait(180);
+        QCOMPARE(api.count(posterRoute), 1);
+        QCOMPARE(api.count(videoRoute), 0);
+        QVERIFY(api.clientCredentialOnly);
+        for (const auto &method : api.methods)
+            QCOMPARE(method, QString("GET"));
+        browser->close();
+        QTRY_VERIFY(browser.isNull());
     }
     void recordBrowserPagesFiltersAndLateResponsesStayBounded()
     {

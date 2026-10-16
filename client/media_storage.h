@@ -20,6 +20,8 @@ class LocalFiles final
     QString find(const QString &group, const QJsonObject &media) const;
     QString pathForId(const QString &group, const QString &id) const;
     void remember(const QString &group, const QJsonObject &media, const QString &path);
+    QString findPoster(const QString &group, const QJsonObject &media) const;
+    void rememberPoster(const QString &group, const QJsonObject &media, const QString &path);
     QJsonObject hydrate(QJsonObject message, const QString &fallbackGroup = {}) const;
     void discard(const QStringList &paths);
     void pin(const void *owner, const QSet<QString> &paths);

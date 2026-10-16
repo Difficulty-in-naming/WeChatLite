@@ -10,10 +10,12 @@
 #include <QContextMenuEvent>
 #include <QCryptographicHash>
 #include <QDateTime>
+#include <QFile>
 #include <QFileInfo>
 #include <QHideEvent>
 #include <QImageReader>
 #include <QKeyEvent>
+#include <QKeySequence>
 #include <QMenu>
 #include <QMouseEvent>
 #include <QMovie>
@@ -85,7 +87,7 @@ bool sameMediaDescriptor(const QJsonObject &first, const QJsonObject &second)
     return !first["id"].toString().isEmpty() && first["id"] == second["id"] &&
            first["sha256"] == second["sha256"] && first["size"] == second["size"] && first["kind"] == second["kind"];
 }
-static QJsonObject preserveLocalMedia(QJsonObject message, const QJsonObject &previous)
+QJsonObject preserveLocalMediaState(QJsonObject message, const QJsonObject &previous)
 {
     if (message["group"] != previous["group"] || message["id"] != previous["id"] ||
         message["status"] == "recalled")
@@ -94,17 +96,19 @@ static QJsonObject preserveLocalMedia(QJsonObject message, const QJsonObject &pr
     for (int i = 0; i < media.size(); ++i)
     {
         auto item = media[i].toObject();
-        // Explicit local state is authoritative, including an invalidated empty path.
-        if (item.contains("_local"))
-            continue;
         for (const auto &entry : previous["media"].toArray())
         {
             const auto old = entry.toObject();
-            const auto path = old["_local"].toString();
-            if (sameMediaDescriptor(item, old) &&
-                !path.isEmpty() && QFileInfo(path).isFile())
+            if (sameMediaDescriptor(item, old))
             {
-                item["_local"] = path;
+                // Treat each transient path independently. An explicit empty field
+                // invalidates it, while a receipt without the field retains it.
+                for (const auto &field : {"_local", "_poster"})
+                {
+                    const auto path = old[field].toString();
+                    if (!item.contains(field) && !path.isEmpty() && QFileInfo(path).isFile())
+                        item[field] = path;
+                }
                 break;
             }
         }
@@ -147,7 +151,7 @@ void MessageModel::replace(const QJsonArray &messages)
     for (const auto &message : messages)
     {
         auto row = message.toObject();
-        row = preserveLocalMedia(row, previous.value(row["group"].toString() + '\n' + row["id"].toString()));
+        row = preserveLocalMediaState(row, previous.value(row["group"].toString() + '\n' + row["id"].toString()));
         rows.append(normalize(row));
     }
     std::stable_sort(rows.begin(), rows.end(), messageBefore);
@@ -167,7 +171,7 @@ void MessageModel::upsert(const QJsonObject &incoming)
             auto updated = message;
             if (updated["status"] == "recalled")
                 updated["_can_reedit"] = rows[row]["_can_reedit"].toBool();
-            updated = preserveLocalMedia(updated, rows[row]);
+            updated = preserveLocalMediaState(updated, rows[row]);
             const bool moves = (row > 0 && messageBefore(updated, rows[row - 1])) ||
                                (row + 1 < rows.size() && messageBefore(rows[row + 1], updated));
             if (moves)
@@ -245,16 +249,25 @@ void MessageModel::setCanReedit(const QString &id, bool value)
 }
 void MessageModel::setLocalMedia(const QString &id, const QString &path, const QJsonObject &descriptor)
 {
+    setLocalMediaPath(id, path, descriptor, "_local");
+}
+void MessageModel::setLocalPoster(const QString &id, const QString &path, const QJsonObject &descriptor)
+{
+    setLocalMediaPath(id, path, descriptor, "_poster");
+}
+void MessageModel::setLocalMediaPath(const QString &id, const QString &path, const QJsonObject &descriptor,
+                                     const QString &field)
+{
     for (int row = 0; row < rows.size(); ++row)
     {
         auto media = rows[row]["media"].toArray();
         bool changed = false;
         for (int i = 0; i < media.size(); ++i)
-            if (media[i].toObject()["id"] == id && media[i].toObject()["_local"].toString() != path &&
+            if (media[i].toObject()["id"] == id && media[i].toObject()[field].toString() != path &&
                 (descriptor.isEmpty() || sameMediaDescriptor(media[i].toObject(), descriptor)))
             {
                 auto object = media[i].toObject();
-                object["_local"] = path;
+                object[field] = path;
                 media[i] = object;
                 changed = true;
             }
@@ -295,6 +308,44 @@ static qreal layoutText(QTextLayout &layout, int width)
 static QString layoutString(const QJsonObject &message)
 {
     return wechatDisplayText(message["text"].toString()).replace('\n', QChar::LineSeparator);
+}
+static QList<int> displaySourceOffsets(const QString &source)
+{
+    // Display-only bracket aliases may have a different UTF-16 length. Keep
+    // clipboard text in the original representation, including whole aliases.
+    QList<int> offsets{0};
+    offsets.reserve(source.size() + 1);
+    auto literal = [&](int first, int last)
+    {
+        for (int i = first; i < last; ++i)
+            offsets.append(i + 1);
+    };
+    int position = 0;
+    while (position < source.size())
+    {
+        const int opening = source.indexOf('[', position);
+        if (opening < 0)
+        {
+            literal(position, int(source.size()));
+            break;
+        }
+        literal(position, opening);
+        const int closing = source.indexOf(']', opening + 1);
+        if (closing < 0)
+        {
+            literal(opening, int(source.size()));
+            break;
+        }
+        const auto token = source.mid(opening, closing - opening + 1);
+        const auto display = wechatDisplayText(token);
+        if (display == token)
+            literal(opening, closing + 1);
+        else
+            for (int i = 0; i < display.size(); ++i)
+                offsets.append(i + 1 == display.size() ? closing + 1 : opening);
+        position = closing + 1;
+    }
+    return offsets;
 }
 int MessageDelegate::textHeight(const QJsonObject &message, int width, const QFont &font)
 {
@@ -429,6 +480,11 @@ static MessageGeometry geometryFor(const QJsonObject &message, const QModelIndex
                          row.top() + 19 + (statusLabel(message).isEmpty() ? 0 : 17);
     return geometry;
 }
+static QRect textContentRect(const MessageGeometry &geometry)
+{
+    return QRect(geometry.bubble.topLeft() + QPoint(10, 10),
+                 QSize(geometry.bubble.width() - 20, geometry.textHeight - 20));
+}
 QRect MessageDelegate::bubbleRect(const QStyleOptionViewItem &option, const QModelIndex &index)
 {
     return geometryFor(index.data(Qt::UserRole).toJsonObject(), index, option.rect, option.font).bubble;
@@ -453,6 +509,12 @@ QSize MessageDelegate::sizeHint(const QStyleOptionViewItem &option, const QModel
     auto message = index.data(Qt::UserRole).toJsonObject();
     const int width = option.rect.width() > 0 ? option.rect.width() : 700;
     return {width, geometryFor(message, index, QRect(0, 0, width, 0), option.font).rowHeight};
+}
+void MessageDelegate::setTextSelection(const QModelIndex &index, int start, int length)
+{
+    selectedTextIndex = index;
+    selectedTextStart = start;
+    selectedTextLength = length;
 }
 static QPixmap mediaPixmap(const QJsonObject &media, const QString &gifCachePrefix)
 {
@@ -480,6 +542,102 @@ static QPixmap mediaPixmap(const QJsonObject &media, const QString &gifCachePref
         }
     }
     return pixmap;
+}
+static QPixmap videoPosterPixmap(const QJsonObject &media)
+{
+    constexpr qint64 maximumBytes = 48 * 1024;
+    const auto path = media["_poster"].toString();
+    const QFileInfo info(path);
+    if (path.isEmpty() || !info.isFile() || info.size() <= 0 || info.size() > maximumBytes)
+        return {};
+    const auto identity = info.absoluteFilePath() + '\n' + media["id"].toString() + '\n' +
+        media["sha256"].toString() + '\n' + media["kind"].toString() + '\n' +
+        QString::number(media["size"].toInteger(-1)) + '\n' + QString::number(info.size()) + '\n' +
+        QString::number(info.lastModified().toMSecsSinceEpoch());
+    const auto key = "video-poster:" + QString::fromLatin1(
+        QCryptographicHash::hash(identity.toUtf8(), QCryptographicHash::Sha256).toHex());
+    QPixmap result;
+    if (QPixmapCache::find(key, &result))
+        return result;
+    static QCache<QString, bool> invalid(128);
+    if (invalid.contains(key))
+        return {};
+
+    QFile file(path);
+    if (file.open(QIODevice::ReadOnly))
+    {
+        // The file can change after QFileInfo. Bound the actual read as well as
+        // the decoded dimensions before asking the JPEG plugin for pixels.
+        auto bytes = file.read(maximumBytes + 1);
+        if (bytes.size() <= maximumBytes && bytes.startsWith("\xff\xd8") && bytes.endsWith("\xff\xd9"))
+        {
+            QBuffer buffer(&bytes);
+            buffer.open(QIODevice::ReadOnly);
+            QImageReader reader(&buffer, "jpeg");
+            reader.setAutoDetectImageFormat(false);
+            const auto size = reader.size();
+            if (size.isValid() && size.width() <= 480 && size.height() <= 288)
+            {
+                const auto image = reader.read();
+                if (!image.isNull() && image.size() == size && reader.error() == QImageReader::UnknownError)
+                {
+                    // Crop by source coordinates rather than creating a large
+                    // intermediate pixmap for an unusually narrow image.
+                    QRectF source(image.rect());
+                    if (source.width() * 144 > source.height() * 240)
+                    {
+                        const auto width = source.height() * 240 / 144;
+                        source.setLeft((source.width() - width) / 2);
+                        source.setWidth(width);
+                    }
+                    else
+                    {
+                        const auto height = source.width() * 144 / 240;
+                        source.setTop((source.height() - height) / 2);
+                        source.setHeight(height);
+                    }
+                    result = QPixmap(240, 144);
+                    result.fill(Qt::transparent);
+                    QPainter painter(&result);
+                    painter.setRenderHint(QPainter::SmoothPixmapTransform);
+                    painter.drawImage(QRectF(result.rect()), image, source);
+                    painter.end();
+                    QPixmapCache::insert(key, result);
+                }
+            }
+        }
+    }
+    if (result.isNull())
+        invalid.insert(key, new bool(true));
+    return result;
+}
+void paintVideoPreview(QPainter *painter, const QRect &rect, const QJsonObject &media, const QFont &font)
+{
+    painter->save();
+    painter->setRenderHint(QPainter::Antialiasing);
+    painter->setPen(Qt::NoPen);
+    painter->setBrush(QColor("#525559"));
+    painter->drawRoundedRect(rect, 4, 4);
+    const auto poster = videoPosterPixmap(media);
+    if (!poster.isNull())
+    {
+        QPainterPath clip;
+        clip.addRoundedRect(rect, 4, 4);
+        painter->setClipPath(clip, Qt::IntersectClip);
+        painter->drawPixmap(rect, poster, poster.rect());
+        painter->setBrush(QColor(0, 0, 0, 80));
+        painter->drawEllipse(rect.center(), 16, 16);
+        painter->drawRect(rect.adjusted(0, rect.height() - 25, 0, 0));
+    }
+    painter->setBrush(Qt::white);
+    painter->drawPolygon(QPolygon{{rect.center().x() - 5, rect.center().y() - 9},
+                                  {rect.center().x() - 5, rect.center().y() + 9},
+                                  {rect.center().x() + 10, rect.center().y()}});
+    painter->setPen(Qt::white);
+    painter->setFont(smallFont(font, 11));
+    painter->drawText(rect.adjusted(8, 0, -8, -5), Qt::AlignBottom | Qt::AlignLeft,
+        QFontMetrics(painter->font()).elidedText(media["name"].toString(), Qt::ElideMiddle, rect.width() - 16));
+    painter->restore();
 }
 QPixmap chatAvatar(const QJsonObject &entity, int size)
 {
@@ -621,7 +779,17 @@ void MessageDelegate::paint(QPainter *p, const QStyleOptionViewItem &option, con
         p->setPen(themeColor("#19191a", "#ededed"));
         QTextLayout text(layoutString(message), wechatDisplayFont(option.font));
         layoutText(text, bubble.width() - 20);
-        text.draw(p, {qreal(bubble.left() + 10), qreal(bubble.top() + 10)});
+        QList<QTextLayout::FormatRange> selections;
+        if (selectedTextIndex == index && selectedTextLength > 0)
+        {
+            QTextLayout::FormatRange selection;
+            selection.start = selectedTextStart;
+            selection.length = selectedTextLength;
+            selection.format.setBackground(option.palette.highlight());
+            selection.format.setForeground(option.palette.highlightedText());
+            selections.append(selection);
+        }
+        text.draw(p, {qreal(bubble.left() + 10), qreal(bubble.top() + 10)}, selections);
     }
     else if (textOnly)
     {
@@ -651,20 +819,7 @@ void MessageDelegate::paint(QPainter *p, const QStyleOptionViewItem &option, con
             }
         }
         else if (kind == "video")
-        {
-            p->setPen(Qt::NoPen);
-            p->setBrush(QColor("#525559"));
-            p->drawRoundedRect(rect, 4, 4);
-            p->setBrush(QColor("#ffffff"));
-            p->drawPolygon(QPolygon{{rect.center().x() - 5, rect.center().y() - 9},
-                                    {rect.center().x() - 5, rect.center().y() + 9},
-                                    {rect.center().x() + 10, rect.center().y()}});
-            p->setPen(Qt::white);
-            p->setFont(smallFont(option.font, 11));
-            p->drawText(rect.adjusted(8, 0, -8, -5), Qt::AlignBottom | Qt::AlignLeft,
-                        QFontMetrics(p->font()).elidedText(item["name"].toString(), Qt::ElideMiddle,
-                                                           rect.width() - 16));
-        }
+            paintVideoPreview(p, rect, item, option.font);
         else if (kind == "voice")
         {
             const auto state = property("voiceId").toString() == item["id"].toString()
@@ -913,6 +1068,77 @@ bool MessageView::locateMessage(const QString &id)
     }
     return false;
 }
+QString MessageView::selectedText() const
+{
+    if (!selectedTextIndex.isValid() || textAnchor == textCursor)
+        return {};
+    const auto message = selectedTextIndex.data(Qt::UserRole).toJsonObject();
+    if (message["status"] == "recalled" || message["text"].toString() != selectedTextSource)
+        return {};
+    const auto offsets = displaySourceOffsets(selectedTextSource);
+    const int first = qBound(0, qMin(textAnchor, textCursor), int(offsets.size()) - 1);
+    const int last = qBound(first, qMax(textAnchor, textCursor), int(offsets.size()) - 1);
+    return selectedTextSource.mid(offsets[first], offsets[last] - offsets[first]);
+}
+void MessageView::clearTextSelection()
+{
+    const auto previous = selectedTextIndex;
+    selectedTextIndex = QPersistentModelIndex();
+    selectedTextSource.clear();
+    textAnchor = textCursor = 0;
+    if (auto *delegate = qobject_cast<MessageDelegate *>(itemDelegate()))
+        delegate->setTextSelection({}, 0, 0);
+    if (previous.isValid())
+        viewport()->update(visualRect(previous));
+}
+void MessageView::validateTextSelection()
+{
+    if (!selectedTextIndex.isValid())
+    {
+        clearTextSelection();
+        return;
+    }
+    const auto message = selectedTextIndex.data(Qt::UserRole).toJsonObject();
+    if (message["status"] == "recalled" || message["text"].toString() != selectedTextSource)
+        clearTextSelection();
+}
+void MessageView::updateTextSelection(int position)
+{
+    validateTextSelection();
+    if (!selectedTextIndex.isValid())
+        return;
+    textCursor = qBound(0, position, int(wechatDisplayText(selectedTextSource).size()));
+    if (auto *delegate = qobject_cast<MessageDelegate *>(itemDelegate()))
+        delegate->setTextSelection(selectedTextIndex, qMin(textAnchor, textCursor), qAbs(textCursor - textAnchor));
+    viewport()->update(visualRect(selectedTextIndex));
+}
+int MessageView::textPositionAt(const QModelIndex &index, const QPoint &point, bool clamp) const
+{
+    if (!index.isValid())
+        return -1;
+    const auto message = index.data(Qt::UserRole).toJsonObject();
+    if (message["status"] == "recalled" || message["text"].toString().isEmpty())
+        return -1;
+    const auto geometry = geometryFor(message, index, visualRect(index), font());
+    const auto content = textContentRect(geometry);
+    if (!clamp && !content.contains(point))
+        return -1;
+    QTextLayout layout(layoutString(message), wechatDisplayFont(font()));
+    layoutText(layout, content.width());
+    const auto relative = point - content.topLeft();
+    if (relative.y() < 0)
+        return 0;
+    for (int i = 0; i < layout.lineCount(); ++i)
+    {
+        const auto line = layout.lineAt(i);
+        if (relative.y() < line.y() + line.height())
+        {
+            const auto cursor = line.xToCursor(relative.x());
+            return layout.isValidCursorPosition(cursor) ? cursor : layout.previousCursorPosition(cursor);
+        }
+    }
+    return int(layout.text().size());
+}
 void MessageView::wheelEvent(QWheelEvent *event)
 {
     QListView::wheelEvent(event);
@@ -926,6 +1152,22 @@ void MessageView::wheelEvent(QWheelEvent *event)
 void MessageView::keyPressEvent(QKeyEvent *event)
 {
     stopScrollAnimation();
+    if (event->matches(QKeySequence::Copy))
+    {
+        const auto text = selectedText();
+        if (!text.isEmpty())
+        {
+            QApplication::clipboard()->setText(text);
+            event->accept();
+            return;
+        }
+    }
+    if (event->key() == Qt::Key_Escape && selectedTextIndex.isValid())
+    {
+        clearTextSelection();
+        event->accept();
+        return;
+    }
     if (event->key() == Qt::Key_End && property("locatedHistory").toBool())
     {
         emit latestRequested();
@@ -942,12 +1184,33 @@ void MessageView::setModel(QAbstractItemModel *next)
         disconnect(connection);
     modelConnections.clear();
     clearGifs();
+    clearTextSelection();
     stopScrollAnimation();
     StableListView::setModel(next);
     if (!next)
         return;
-    modelConnections.append(
-        connect(next, &QAbstractItemModel::modelAboutToBeReset, this, &MessageView::stopScrollAnimation));
+    modelConnections.append(connect(next, &QAbstractItemModel::modelAboutToBeReset, this, [this]
+    {
+        stopScrollAnimation();
+        clearTextSelection();
+    }));
+    modelConnections.append(connect(next, &QAbstractItemModel::layoutAboutToBeChanged,
+                                    this, &MessageView::clearTextSelection));
+    modelConnections.append(connect(next, &QAbstractItemModel::rowsAboutToBeRemoved, this,
+        [this](const QModelIndex &parent, int first, int last)
+        {
+            if (selectedTextIndex.isValid() && selectedTextIndex.parent() == parent &&
+                selectedTextIndex.row() >= first && selectedTextIndex.row() <= last)
+                clearTextSelection();
+        }));
+    modelConnections.append(connect(next, &QAbstractItemModel::dataChanged, this,
+        [this](const QModelIndex &first, const QModelIndex &last)
+        {
+            if (selectedTextIndex.isValid() && selectedTextIndex.parent() == first.parent() &&
+                selectedTextIndex.row() >= first.row() && selectedTextIndex.row() <= last.row())
+                validateTextSelection();
+        }));
+    modelConnections.append(connect(next, &QObject::destroyed, this, &MessageView::clearTextSelection));
     modelConnections.append(
         connect(next, &QAbstractItemModel::layoutAboutToBeChanged, this, &MessageView::clearGifs));
     modelConnections.append(
@@ -1083,6 +1346,7 @@ void MessageView::showEvent(QShowEvent *event)
 void MessageView::hideEvent(QHideEvent *event)
 {
     stopScrollAnimation();
+    selectingText = false;
     clearGifs();
     QListView::hideEvent(event);
 }
@@ -1105,8 +1369,49 @@ void MessageView::resizeEvent(QResizeEvent *event)
     scheduleGifUpdate();
     emit viewportChanged();
 }
+void MessageView::mousePressEvent(QMouseEvent *event)
+{
+    const auto index = indexAt(event->pos());
+    if (event->button() == Qt::LeftButton)
+    {
+        selectingText = false;
+        clearTextSelection();
+        const auto position = textPositionAt(index, event->pos(), false);
+        if (position >= 0)
+        {
+            stopScrollAnimation();
+            // Qt normally scrolls a newly current item into view. A tall bubble
+            // must remain at the exact position where the drag began.
+            const bool autoScroll = hasAutoScroll();
+            setAutoScroll(false);
+            setCurrentIndex(index);
+            setFocus(Qt::MouseFocusReason);
+            setAutoScroll(autoScroll);
+            selectedTextIndex = index;
+            selectedTextSource = index.data(Qt::UserRole).toJsonObject()["text"].toString();
+            textAnchor = position;
+            selectingText = true;
+            updateTextSelection(position);
+            viewport()->setCursor(Qt::IBeamCursor);
+            event->accept();
+            return;
+        }
+    }
+    else if (event->button() == Qt::RightButton && selectedTextIndex != index)
+        clearTextSelection();
+    QListView::mousePressEvent(event);
+}
 void MessageView::mouseReleaseEvent(QMouseEvent *event)
 {
+    if (event->button() == Qt::LeftButton && selectingText)
+    {
+        selectingText = false;
+        const auto position = textPositionAt(selectedTextIndex, event->pos(), true);
+        if (position >= 0)
+            updateTextSelection(position);
+        event->accept();
+        return;
+    }
     auto index = indexAt(event->pos());
     if (event->button() == Qt::LeftButton && index.isValid())
     {
@@ -1132,13 +1437,29 @@ void MessageView::mouseReleaseEvent(QMouseEvent *event)
 }
 void MessageView::mouseMoveEvent(QMouseEvent *event)
 {
+    if (selectingText)
+    {
+        const auto position = textPositionAt(selectedTextIndex, event->pos(), true);
+        if (position >= 0)
+            updateTextSelection(position);
+        viewport()->setCursor(Qt::IBeamCursor);
+        event->accept();
+        return;
+    }
     const auto index = indexAt(event->pos());
     QStyleOptionViewItem option;
     option.rect = visualRect(index);
     option.font = font();
+    bool onText = false;
+    if (index.isValid())
+    {
+        const auto message = index.data(Qt::UserRole).toJsonObject();
+        if (message["status"] != "recalled" && !message["text"].toString().isEmpty())
+            onText = textContentRect(geometryFor(message, index, option.rect, option.font)).contains(event->pos());
+    }
     viewport()->setCursor(index.isValid() && MessageDelegate::reeditRect(option, index).contains(event->pos())
                               ? Qt::PointingHandCursor
-                              : Qt::ArrowCursor);
+                              : onText ? Qt::IBeamCursor : Qt::ArrowCursor);
     QListView::mouseMoveEvent(event);
 }
 class ChatContextMenu : public QMenu
@@ -1365,8 +1686,10 @@ QMenu *MessageView::contextMenuFor(const QModelIndex &index, bool avatar)
     }
     if (!message["text"].toString().isEmpty())
     {
-        auto *copy = menu->addAction("复制", this, [message]
-                                     { QApplication::clipboard()->setText(message["text"].toString()); });
+        const auto selected = selectedTextIndex == index ? selectedText() : QString{};
+        const auto copyText = selected.isEmpty() ? message["text"].toString() : selected;
+        auto *copy = menu->addAction("复制", this, [copyText]
+                                     { QApplication::clipboard()->setText(copyText); });
         copy->setObjectName("copyMessage");
         copy->setProperty("chatIcon", "copy");
         auto *quote = menu->addAction("引用", this, [this, message] { emit quoteRequested(message); });
@@ -1454,7 +1777,7 @@ void GroupDelegate::paint(QPainter *p, const QStyleOptionViewItem &option, const
     const QRect avatar(rect.left() + 12, rect.top() + 16, 36, 36);
     p->drawPixmap(avatar, chatAvatar(group, avatar.width()));
     auto font = option.font;
-    font.setPixelSize(14);
+    font.setPixelSize(option.font.pixelSize() > 0 ? qMin(14, option.font.pixelSize()) : 14);
     font.setWeight(QFont::Normal);
     p->setFont(font);
     p->setPen(selected ? Qt::white : themeColor("#19191a", "#ededed"));

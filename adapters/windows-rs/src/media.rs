@@ -49,6 +49,8 @@ pub struct Media {
     image_key: Option<[u8; 16]>,
     xor_key: Option<u8>,
     last_key_scan: Option<Instant>,
+    #[cfg(test)]
+    video_scan_entries: std::cell::Cell<usize>,
 }
 impl Media {
     /// `directory` is the relay's `data/adapter`, preserving existing cache paths.
@@ -61,6 +63,8 @@ impl Media {
             image_key: None,
             xor_key: None,
             last_key_scan: None,
+            #[cfg(test)]
+            video_scan_entries: std::cell::Cell::new(0),
         }
     }
     fn cache_dir(&self, key: &str) -> Result<PathBuf> {
@@ -453,7 +457,19 @@ impl Media {
         let partial = native_root
             .join("wechat-video")
             .join(format!("{ident}.mp4.part"));
-        let mut candidates = vec![destination.clone(), partial.clone()];
+        // Native downloads finish in the owned partial path. Check both known paths before
+        // walking WeChat's potentially large video archive on each pending-media retry.
+        for (root, path) in [(&self.cache, &destination), (&native_root, &partial)] {
+            let Ok(source) = within(root, path) else {
+                continue;
+            };
+            if verified(&source, length, &hashes) {
+                if source != destination {
+                    copy_verified(&source, &destination, Some(length), &hashes)?;
+                }
+                return Ok(destination.clone());
+            }
+        }
         let root = db.account_dir.join("msg/video");
         let id = find_md5(row);
         for entry in WalkDir::new(&root)
@@ -461,6 +477,9 @@ impl Media {
             .into_iter()
             .filter_map(|entry| entry.ok())
         {
+            #[cfg(test)]
+            self.video_scan_entries
+                .set(self.video_scan_entries.get() + 1);
             if entry.file_type().is_file()
                 && entry.metadata().is_ok_and(|m| m.len() == length)
                 && (id
@@ -471,25 +490,13 @@ impl Media {
                         .extension()
                         .is_some_and(|ext| ext.eq_ignore_ascii_case("mp4")))
             {
-                if let Ok(path) = within(&root, entry.path()) {
-                    candidates.push(path);
+                if let Ok(source) = within(&root, entry.path())
+                    && verified(&source, length, &hashes)
+                {
+                    copy_verified(&source, &destination, Some(length), &hashes)?;
+                    return Ok(destination);
                 }
             }
-        }
-        for source in candidates {
-            let Ok(source) = within(&self.cache, &source)
-                .or_else(|_| within(&native_root, &source))
-                .or_else(|_| within(&root, &source))
-            else {
-                continue;
-            };
-            if !verified(&source, length, &hashes) {
-                continue;
-            }
-            if source != destination {
-                copy_verified(&source, &destination, Some(length), &hashes)?;
-            }
-            return Ok(destination);
         }
         let file_id = video.attribute("cdnvideourl").unwrap_or("");
         let aes = video.attribute("aeskey").unwrap_or("");

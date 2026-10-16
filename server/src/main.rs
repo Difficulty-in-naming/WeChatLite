@@ -3,6 +3,7 @@ mod announcement;
 mod bridge;
 mod history;
 mod model;
+mod poster;
 mod records;
 mod store;
 mod web;
@@ -61,6 +62,7 @@ struct App {
     status: RwLock<Value>,
     demo: bool,
     transfers: Arc<Semaphore>,
+    posters: Semaphore,
     shutdown: watch::Sender<bool>,
     forwarding: RwLock<BTreeSet<String>>,
     forwarding_changed: watch::Sender<()>,
@@ -218,6 +220,7 @@ fn test_app(directory: &Path) -> (Arc<App>, mpsc::Receiver<Value>) {
             status: RwLock::new(json!({"type":"status","ready":false})),
             demo: false,
             transfers: Arc::new(Semaphore::new(3)),
+            posters: Semaphore::new(1),
             shutdown,
             forwarding: RwLock::new(forwarding),
             forwarding_changed,
@@ -413,6 +416,7 @@ async fn main() -> Result<()> {
         ),
         demo,
         transfers: Arc::new(Semaphore::new(3)),
+        posters: Semaphore::new(1),
         shutdown,
         forwarding: RwLock::new(forwarding),
         forwarding_changed,

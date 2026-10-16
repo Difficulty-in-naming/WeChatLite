@@ -17,9 +17,11 @@
 #include <QGlyphRun>
 #include <QInputMethodEvent>
 #include <QJsonObject>
+#include <QKeySequence>
 #include <QMenu>
 #include <QMimeData>
 #include <QMovie>
+#include <QMouseEvent>
 #include <QPainter>
 #include <QPointer>
 #include <QScreen>
@@ -28,11 +30,13 @@
 #include <QStandardPaths>
 #include <QTemporaryDir>
 #include <QTextLayout>
+#include <QTextOption>
 #include <QUuid>
 #include <QVBoxLayout>
 #include <QVariantAnimation>
 #include <QWheelEvent>
 #include <QtTest>
+#include <QtMath>
 #include <functional>
 
 class ClientTests : public QObject
@@ -72,6 +76,56 @@ class ClientTests : public QObject
                 {"timestamp", 1'700'000'000'000LL},
                 {"media", QJsonArray{QJsonObject{
                               {"id", QString::number(number)}, {"kind", "gif"}, {"_local", path}}}}};
+    }
+    static QByteArray posterJpeg(const QSize &size, const QColor &color = QColor(20, 180, 70))
+    {
+        QImage image(size, QImage::Format_RGB32);
+        image.fill(color);
+        QByteArray bytes;
+        QBuffer buffer(&bytes);
+        if (!buffer.open(QIODevice::WriteOnly) || !image.save(&buffer, "JPEG"))
+            return {};
+        return bytes;
+    }
+    static QPoint textCursorPoint(MessageView &view, const QModelIndex &index, int position)
+    {
+        QStyleOptionViewItem option;
+        option.rect = view.visualRect(index);
+        option.font = view.font();
+        const auto bubble = MessageDelegate::bubbleRect(option, index);
+        const auto source = index.data(Qt::UserRole).toJsonObject()["text"].toString();
+        QTextLayout layout(wechatDisplayText(source).replace('\n', QChar::LineSeparator), wechatDisplayFont(view.font()));
+        QTextOption textOption;
+        textOption.setWrapMode(QTextOption::WrapAtWordBoundaryOrAnywhere);
+        layout.setTextOption(textOption);
+        layout.beginLayout();
+        qreal top = 0;
+        while (true)
+        {
+            auto line = layout.createLine();
+            if (!line.isValid())
+                break;
+            line.setLineWidth(bubble.width() - 20);
+            line.setPosition({0, top});
+            top += qCeil(line.height());
+        }
+        layout.endLayout();
+        for (int i = 0; i < layout.lineCount(); ++i)
+        {
+            const auto line = layout.lineAt(i);
+            if (position < line.textStart() + line.textLength() || i + 1 == layout.lineCount())
+                return bubble.topLeft() + QPoint(10 + qRound(line.cursorToX(position)),
+                                                  10 + qFloor(line.y() + line.height() / 2));
+        }
+        return {};
+    }
+    static void dragMessageText(MessageView &view, const QPoint &first, const QPoint &last)
+    {
+        QTest::mousePress(view.viewport(), Qt::LeftButton, {}, first);
+        QMouseEvent move(QEvent::MouseMove, QPointF(last), QPointF(view.viewport()->mapToGlobal(last)),
+                         Qt::NoButton, Qt::LeftButton, Qt::NoModifier);
+        QApplication::sendEvent(view.viewport(), &move);
+        QTest::mouseRelease(view.viewport(), Qt::LeftButton, {}, last);
     }
   private slots:
     void initTestCase()
@@ -150,6 +204,228 @@ class ClientTests : public QObject
         QCOMPARE(quote.first().first().toJsonObject()["quote"].toObject(), message["quote"].toObject());
         QCOMPARE(model.rows.first()["text"].toString(), source);
         QCOMPARE(messageQuoteLabel(message["quote"].toObject()), "成员: 🧧原文");
+        delete menu;
+    }
+    void draggingABubbleCopiesTheSelectedTextAndPaintsItsHighlight()
+    {
+        const QString source = "prefix alpha beta suffix";
+        const QJsonObject message{{"id", "selection"}, {"group", "selection-group"},
+                                  {"sender", "Member"}, {"text", source}};
+        MessageModel model;
+        model.replace({message, QJsonObject{{"id", "other"}, {"text", "other complete message"}}});
+        MessageView view;
+        view.resize(580, 350);
+        view.setModel(&model);
+        view.show();
+        QVERIFY(QTest::qWaitForWindowExposed(&view));
+        view.doItemsLayout();
+        const auto index = model.index(0);
+        QStyleOptionViewItem option;
+        option.rect = view.visualRect(index);
+        option.font = view.font();
+        option.palette.setColor(QPalette::Highlight, QColor("#3366cc"));
+        option.palette.setColor(QPalette::HighlightedText, Qt::white);
+        auto render = [&]
+        {
+            QImage image(view.viewport()->size(), QImage::Format_RGB32);
+            image.fill(Qt::white);
+            QPainter painter(&image);
+            view.itemDelegate()->paint(&painter, option, index);
+            return image;
+        };
+        const auto unselected = render();
+        const auto first = source.indexOf("alpha");
+        dragMessageText(view, textCursorPoint(view, index, first), textCursorPoint(view, index, first + 5));
+        QCOMPARE(view.selectedText(), QString("alpha"));
+        QApplication::clipboard()->setText("clipboard sentinel");
+        QTest::keySequence(&view, QKeySequence(QKeySequence::Copy));
+        QCOMPARE(QApplication::clipboard()->text(), QString("alpha"));
+        const auto selected = render();
+        QVERIFY(selected != unselected);
+        int highlightedPixels = 0;
+        for (int y = 0; y < selected.height(); ++y)
+            for (int x = 0; x < selected.width(); ++x)
+                highlightedPixels += selected.pixelColor(x, y) == QColor("#3366cc");
+        QVERIFY(highlightedPixels > 20);
+        QSignalSpy quoted(&view, &MessageView::quoteRequested);
+        auto *menu = view.contextMenuFor(index, false);
+        QVERIFY(menu);
+        menu->findChild<QAction *>("copyMessage")->trigger();
+        QCOMPARE(QApplication::clipboard()->text(), QString("alpha"));
+        menu->findChild<QAction *>("quoteMessage")->trigger();
+        QCOMPARE(quoted.count(), 1);
+        QCOMPARE(quoted.first().first().toJsonObject()["text"].toString(), source);
+        delete menu;
+        menu = view.contextMenuFor(model.index(1), false);
+        QVERIFY(menu);
+        menu->findChild<QAction *>("copyMessage")->trigger();
+        QCOMPARE(QApplication::clipboard()->text(), QString("other complete message"));
+        delete menu;
+        QTest::mouseClick(view.viewport(), Qt::LeftButton, {}, QPoint(4, 4));
+        QVERIFY(view.selectedText().isEmpty());
+        QCOMPARE(render(), unselected);
+        menu = view.contextMenuFor(index, false);
+        QVERIFY(menu);
+        menu->findChild<QAction *>("copyMessage")->trigger();
+        QCOMPARE(QApplication::clipboard()->text(), source);
+        delete menu;
+    }
+    void selectingATallBubbleKeepsItsReadingPositionWithoutCreatingEditors()
+    {
+        QString source;
+        for (int i = 0; i < 80; ++i)
+            source += QString("line %1 中文 selectable text\n").arg(i);
+        MessageModel model;
+        model.replace({QJsonObject{{"id", "tall-selection"}, {"text", source}}});
+        MessageView view;
+        view.resize(580, 350);
+        view.setModel(&model);
+        view.show();
+        QVERIFY(QTest::qWaitForWindowExposed(&view));
+        view.doItemsLayout();
+        auto *bar = view.verticalScrollBar();
+        QVERIFY(bar->maximum() > 0);
+        const auto index = model.index(0);
+        const int first = source.indexOf("line 10");
+        const auto initially = textCursorPoint(view, index, first);
+        bar->setValue(bar->value() + initially.y() - 80);
+        const auto start = textCursorPoint(view, index, first), end = textCursorPoint(view, index, first + 4);
+        QVERIFY(view.viewport()->rect().contains(start) && view.viewport()->rect().contains(end));
+        const auto position = bar->value();
+        const auto widgets = view.findChildren<QWidget *>().size();
+        dragMessageText(view, start, end);
+        QCOMPARE(view.selectedText(), QString("line"));
+        QCOMPARE(bar->value(), position);
+        QCOMPARE(view.findChildren<QWidget *>().size(), widgets);
+    }
+    void multilineChineseAndEmojiSelectionsKeepTheOriginalText_data()
+    {
+        QTest::addColumn<bool>("reverse");
+        QTest::newRow("forward") << false;
+        QTest::newRow("reverse") << true;
+    }
+    void multilineChineseAndEmojiSelectionsKeepTheOriginalText()
+    {
+        QFETCH(bool, reverse);
+        const QString source = "前缀" + QString("跨行中文").repeated(7) + "[红包]🙂\n下一行🚀[未知表情] 文尾";
+        const auto display = wechatDisplayText(source);
+        const int first = display.indexOf("中文"), last = display.indexOf(" 文尾");
+        const int originalFirst = source.indexOf("中文"), originalLast = source.indexOf(" 文尾");
+        const auto expected = source.mid(originalFirst, originalLast - originalFirst);
+        MessageModel model;
+        model.replace({QJsonObject{{"id", "multiline-selection"}, {"text", source}}});
+        MessageView view;
+        view.resize(370, 430);
+        view.setModel(&model);
+        view.show();
+        QVERIFY(QTest::qWaitForWindowExposed(&view));
+        view.doItemsLayout();
+        const auto index = model.index(0);
+        const auto start = textCursorPoint(view, index, first), end = textCursorPoint(view, index, last);
+        QVERIFY(end.y() > start.y()); // Includes wrapping as well as the explicit newline.
+        dragMessageText(view, reverse ? end : start, reverse ? start : end);
+        QCOMPARE(view.selectedText(), expected);
+        QTest::keySequence(&view, QKeySequence(QKeySequence::Copy));
+        QCOMPARE(QApplication::clipboard()->text(), expected);
+        QVERIFY(expected.contains("[红包]🙂\n下一行🚀[未知表情]"));
+
+        const int alias = display.indexOf("🧧");
+        dragMessageText(view, textCursorPoint(view, index, alias), textCursorPoint(view, index, alias + 2));
+        QCOMPARE(view.selectedText(), QString("[红包]"));
+        const int unicode = display.indexOf("🙂");
+        dragMessageText(view, textCursorPoint(view, index, unicode), textCursorPoint(view, index, unicode + 2));
+        QCOMPARE(view.selectedText(), QString("🙂"));
+        QTest::keySequence(&view, QKeySequence(QKeySequence::Copy));
+        QCOMPARE(QApplication::clipboard()->text(), QString("🙂"));
+    }
+    void textSelectionSurvivesReceiptsButClearsForChangedOrRecalledContent()
+    {
+        QJsonObject message{{"id", "selected"}, {"group", "selection-group"},
+                            {"text", "prefix keep selected suffix"}, {"timestamp", 1000}, {"status", "sending"}};
+        MessageModel model;
+        model.replace({message});
+        MessageView view;
+        view.resize(580, 350);
+        view.setModel(&model);
+        view.show();
+        QVERIFY(QTest::qWaitForWindowExposed(&view));
+        view.doItemsLayout();
+        auto select = [&]
+        {
+            const auto index = model.index(model.rowCount() - 1);
+            dragMessageText(view, textCursorPoint(view, index, 7), textCursorPoint(view, index, 20));
+        };
+        select();
+        QCOMPARE(view.selectedText(), QString("keep selected"));
+        message["status"] = "sent";
+        model.upsert(message);
+        QCOMPARE(view.selectedText(), QString("keep selected"));
+        model.upsert({{"id", "earlier"}, {"text", "earlier message"}, {"timestamp", 1}});
+        QCOMPARE(view.selectedText(), QString("keep selected")); // Persistent index tracks an inserted earlier row.
+        message["text"] = "prefix changed text suffix";
+        model.upsert(message);
+        QVERIFY(view.selectedText().isEmpty());
+        message["text"] = "prefix keep selected suffix";
+        model.upsert(message);
+        view.doItemsLayout();
+        select();
+        QCOMPARE(view.selectedText(), QString("keep selected"));
+        message["status"] = "recalled";
+        model.upsert(message);
+        QVERIFY(view.selectedText().isEmpty());
+        QApplication::clipboard()->setText("unchanged after recall");
+        QTest::keySequence(&view, QKeySequence(QKeySequence::Copy));
+        QCOMPARE(QApplication::clipboard()->text(), QString("unchanged after recall"));
+        model.replace({QJsonObject{{"id", "fresh"}, {"text", "prefix keep selected suffix"}}});
+        view.doItemsLayout();
+        select();
+        QCOMPARE(view.selectedText(), QString("keep selected"));
+        model.replace({QJsonObject{{"id", "fresh"}, {"text", "prefix keep selected suffix"}}});
+        QVERIFY(view.selectedText().isEmpty());
+        auto *temporary = new MessageModel;
+        temporary->replace({QJsonObject{{"id", "temporary"}, {"text", "prefix keep selected suffix"}}});
+        view.setModel(temporary);
+        view.doItemsLayout();
+        dragMessageText(view, textCursorPoint(view, temporary->index(0), 7),
+                         textCursorPoint(view, temporary->index(0), 20));
+        QCOMPARE(view.selectedText(), QString("keep selected"));
+        delete temporary;
+        QVERIFY(view.selectedText().isEmpty());
+    }
+    void draggingTextAcrossMediaDoesNotOpenItAndClicksStillWork()
+    {
+        const QString source = "select this text";
+        const QJsonObject message{{"id", "text-media"}, {"group", "selection-group"}, {"text", source},
+            {"media", QJsonArray{QJsonObject{{"id", "video"}, {"kind", "video"}}}},
+            {"quote", QJsonObject{{"id", "source"}, {"sender", "Member"}, {"text", "Original"}}}};
+        MessageModel model;
+        model.replace({message});
+        MessageView view;
+        view.resize(580, 450);
+        view.setModel(&model);
+        view.show();
+        QVERIFY(QTest::qWaitForWindowExposed(&view));
+        view.doItemsLayout();
+        const auto index = model.index(0);
+        QStyleOptionViewItem option;
+        option.rect = view.visualRect(index);
+        option.font = view.font();
+        const auto bubble = MessageDelegate::bubbleRect(option, index);
+        const auto textHeight = MessageDelegate::textHeight(message, bubble.width(), view.font());
+        const auto mediaPoint = bubble.topLeft() + QPoint(120, textHeight + 8 + 72);
+        QSignalSpy opened(&view, &MessageView::mediaClicked), located(&view, &MessageView::locateRequested);
+        dragMessageText(view, textCursorPoint(view, index, 0), mediaPoint);
+        QCOMPARE(view.selectedText(), source);
+        QCOMPARE(opened.count(), 0);
+        QTest::mouseClick(view.viewport(), Qt::LeftButton, {}, mediaPoint);
+        QCOMPARE(opened.count(), 1);
+        QCOMPARE(opened.first().first().toJsonObject()["id"].toString(), QString("video"));
+        QVERIFY(view.selectedText().isEmpty());
+        auto *menu = view.quoteContextMenuFor(index);
+        QVERIFY(menu);
+        menu->findChild<QAction *>("locateQuote")->trigger();
+        QCOMPARE(located.count(), 1);
+        QCOMPARE(located.first().first().toJsonObject()["id"].toString(), QString("source"));
         delete menu;
     }
     void requestedEmojiHaveRealGlyphsAndRenderInTheNativeMessageView()
@@ -1447,6 +1723,172 @@ class ClientTests : public QObject
         model.prepend(previous);
         QCOMPARE(model.rowCount(), 300);
         QCOMPARE(model.rows.first()["id"].toString(), "page-0");
+    }
+    void videoPostersPaintWithoutALocalVideoAndKeepTheCardFixed()
+    {
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        const auto path = directory.filePath("poster.jpg");
+        QFile file(path);
+        QVERIFY(file.open(QIODevice::WriteOnly));
+        const auto bytes = posterJpeg({480, 288});
+        QVERIFY(!bytes.isEmpty() && bytes.size() <= 48 * 1024);
+        QCOMPARE(file.write(bytes), bytes.size());
+        file.close();
+        MessageModel model;
+        const QJsonObject media{{"id", "video-fixture"}, {"kind", "video"}, {"name", "fixture.mp4"},
+                                {"sha256", QString(64, 'a')}, {"size", 8 * 1024 * 1024}};
+        QJsonObject message{{"id", "poster-message"}, {"group", "fixture-group"}, {"sender", "Fixture"},
+                            {"timestamp", 1'700'000'000'000LL}, {"media", QJsonArray{media}}};
+        model.replace({message});
+        MessageDelegate delegate;
+        QStyleOptionViewItem option;
+        option.rect = {0, 0, 700, 240};
+        option.font = qApp->font();
+        const auto geometry = MessageDelegate::bubbleRect(option, model.index(0));
+        QCOMPARE(geometry.size(), QSize(240, 144));
+        const auto height = delegate.sizeHint(option, model.index(0));
+        auto render = [&]
+        {
+            QImage image(option.rect.size(), QImage::Format_RGB32);
+            image.fill(Qt::white);
+            QPainter painter(&image);
+            delegate.paint(&painter, option, model.index(0));
+            return image;
+        };
+        const auto fallback = render();
+        model.setLocalPoster("video-fixture", path, media);
+        QCOMPARE(MessageDelegate::bubbleRect(option, model.index(0)), geometry);
+        QCOMPARE(delegate.sizeHint(option, model.index(0)), height);
+        const auto poster = render();
+        const auto pixel = poster.pixelColor(geometry.topLeft() + QPoint(20, 20));
+        QVERIFY(pixel.green() > 150 && pixel.red() < 60 && pixel.blue() < 110);
+        QCOMPARE(poster.pixelColor(geometry.center()), QColor(Qt::white)); // The play marker remains.
+        QVERIFY(poster != fallback);
+        QCOMPARE(render(), poster); // Cached output agrees with the initial decode.
+        QVERIFY(model.rows.first()["media"].toArray().first().toObject()["_local"].toString().isEmpty());
+
+        // A different descriptor must not reuse an old poster cached under this path.
+        QVERIFY(file.open(QIODevice::WriteOnly | QIODevice::Truncate));
+        const auto red = posterJpeg({480, 288}, QColor(200, 35, 25));
+        QCOMPARE(file.write(red), red.size());
+        file.close();
+        auto changed = media;
+        changed["sha256"] = QString(64, 'b');
+        changed["_poster"] = path;
+        message["media"] = QJsonArray{changed};
+        model.replace({message});
+        const auto replacement = render().pixelColor(geometry.topLeft() + QPoint(20, 20));
+        QVERIFY(replacement.red() > 170 && replacement.green() < 70 && replacement.blue() < 70);
+    }
+    void invalidVideoPostersRemainBoundedAndUseTheGrayCard_data()
+    {
+        QTest::addColumn<QByteArray>("bytes");
+        const auto valid = posterJpeg({480, 288});
+        QVERIFY(!valid.isEmpty());
+        QTest::newRow("empty") << QByteArray{};
+        QTest::newRow("not-an-image") << QByteArray("invalid JPEG bytes");
+        QTest::newRow("incomplete-jpeg") << valid.chopped(2);
+        QTest::newRow("broken-jpeg") << QByteArray::fromHex("ffd8ffe00010696e76616c6964ffd9");
+        QTest::newRow("oversized-file") << valid + QByteArray(48 * 1024, 'x');
+        QTest::newRow("too-wide") << posterJpeg({481, 100});
+        QTest::newRow("too-high") << posterJpeg({100, 289});
+        QImage png(40, 24, QImage::Format_RGB32);
+        png.fill(Qt::green);
+        QByteArray pngBytes;
+        QBuffer pngBuffer(&pngBytes);
+        QVERIFY(pngBuffer.open(QIODevice::WriteOnly));
+        QVERIFY(png.save(&pngBuffer, "PNG"));
+        QTest::newRow("png-is-not-a-jpeg") << pngBytes;
+        auto bomb = valid;
+        const auto frame = bomb.indexOf(QByteArray::fromHex("ffc0"));
+        QVERIFY(frame >= 0 && frame + 8 < bomb.size());
+        for (int offset = 5; offset <= 8; ++offset)
+            bomb[frame + offset] = char(0xff); // 65535 × 65535 header in a tiny file.
+        QTest::newRow("pixel-bomb-header") << bomb;
+    }
+    void invalidVideoPostersRemainBoundedAndUseTheGrayCard()
+    {
+        QFETCH(QByteArray, bytes);
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        const auto path = directory.filePath("poster.jpg");
+        QFile file(path);
+        QVERIFY(file.open(QIODevice::WriteOnly));
+        QCOMPARE(file.write(bytes), bytes.size());
+        file.close();
+        QJsonObject media{{"id", "invalid-poster"}, {"kind", "video"}, {"name", "fixture.mp4"},
+                          {"size", 123}, {"sha256", QString(64, 'c')}};
+        auto render = [&](const QJsonObject &item)
+        {
+            QImage image(240, 144, QImage::Format_RGB32);
+            image.fill(Qt::white);
+            QPainter painter(&image);
+            paintVideoPreview(&painter, image.rect(), item, qApp->font());
+            return image;
+        };
+        const auto fallback = render(media);
+        media["_poster"] = path;
+        QCOMPARE(render(media), fallback);
+        QCOMPARE(render(media), fallback); // Repeated paints use the bounded failed-decode cache.
+        media["_poster"] = directory.filePath("missing.jpg");
+        QCOMPARE(render(media), fallback);
+        media["_poster"] = QJsonObject{{"unexpected", true}};
+        QCOMPARE(render(media), fallback);
+    }
+    void posterStateSurvivesReceiptsAndRejectsStaleDescriptors()
+    {
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        const auto poster = directory.filePath("poster.jpg"), video = directory.filePath("video.mp4");
+        for (const auto &path : {poster, video})
+        {
+            QFile file(path);
+            QVERIFY(file.open(QIODevice::WriteOnly));
+            const auto bytes = path == poster ? posterJpeg({240, 144}) : QByteArray("synthetic video");
+            QCOMPARE(file.write(bytes), bytes.size());
+        }
+        const QJsonObject descriptor{{"id", "retained-video"}, {"kind", "video"},
+                                     {"size", 15}, {"sha256", QString(64, 'd')}};
+        QJsonObject message{{"id", "retained-message"}, {"group", "fixture-group"},
+                            {"status", "pending"}, {"media", QJsonArray{descriptor}}};
+        MessageModel model;
+        model.replace({message});
+        model.setLocalMedia("retained-video", video, descriptor);
+        model.setLocalPoster("retained-video", poster, descriptor);
+        auto stored = [&] { return model.rows.first()["media"].toArray().first().toObject(); };
+        QCOMPARE(stored()["_local"].toString(), video);
+        QCOMPARE(stored()["_poster"].toString(), poster);
+        message["status"] = "sent";
+        model.upsert(message);
+        QCOMPARE(stored()["_local"].toString(), video);
+        QCOMPARE(stored()["_poster"].toString(), poster);
+        model.replace({message});
+        QCOMPARE(stored()["_poster"].toString(), poster);
+        auto explicitLocal = descriptor;
+        explicitLocal["_local"] = video;
+        message["media"] = QJsonArray{explicitLocal};
+        model.upsert(message);
+        QCOMPARE(stored()["_poster"].toString(), poster);
+        explicitLocal["_poster"] = "";
+        message["media"] = QJsonArray{explicitLocal};
+        model.upsert(message);
+        QVERIFY(stored()["_poster"].toString().isEmpty());
+        model.setLocalPoster("retained-video", poster, descriptor);
+        auto changed = descriptor;
+        changed["sha256"] = QString(64, 'e');
+        message["media"] = QJsonArray{changed};
+        model.upsert(message);
+        QVERIFY(stored()["_local"].toString().isEmpty() && stored()["_poster"].toString().isEmpty());
+        model.setLocalPoster("retained-video", poster, descriptor); // Old completion arrives last.
+        QVERIFY(stored()["_poster"].toString().isEmpty());
+        model.setLocalPoster("retained-video", poster, changed);
+        QCOMPARE(stored()["_poster"].toString(), poster);
+        message["status"] = "recalled";
+        model.upsert(message);
+        QVERIFY(model.rows.first()["media"].toArray().isEmpty());
+        model.setLocalPoster("retained-video", poster, changed);
+        QVERIFY(model.rows.first()["media"].toArray().isEmpty());
     }
     void sharedAvatarUsesSmallJpegAndRejectsInvalidData()
     {

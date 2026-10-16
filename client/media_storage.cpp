@@ -109,6 +109,22 @@ void LocalFiles::remember(const QString &group, const QJsonObject &media, const 
     entries.insert(mediaKey(group, media), new Entry{
         info.absoluteFilePath(), media["sha256"].toString(), media["kind"].toString(), info.size(), info.lastModified()});
 }
+QString LocalFiles::findPoster(const QString &group, const QJsonObject &media) const
+{
+    if (media["kind"] != "video") return {};
+    QMutexLocker lock(&mutex);
+    return existing("poster:" + mediaKey(group, media));
+}
+void LocalFiles::rememberPoster(const QString &group, const QJsonObject &media, const QString &path)
+{
+    const QFileInfo info(path);
+    if (group.isEmpty() || media["kind"] != "video" || media["id"].toString().isEmpty() ||
+        media["sha256"].toString().size() != 64 || !info.isFile() || info.size() <= 0 ||
+        info.size() > 48 * 1024 || !isCachePath(info.absoluteFilePath())) return;
+    QMutexLocker lock(&mutex);
+    entries.insert("poster:" + mediaKey(group, media), new Entry{info.absoluteFilePath(),
+        media["sha256"].toString(), "video-poster", info.size(), info.lastModified()});
+}
 QJsonObject LocalFiles::hydrate(QJsonObject message, const QString &fallbackGroup) const
 {
     if (message["status"] == "recalled") { message["media"] = QJsonArray{}; return message; }
@@ -118,6 +134,7 @@ QJsonObject LocalFiles::hydrate(QJsonObject message, const QString &fallbackGrou
     {
         auto item = media[i].toObject();
         item["_local"] = find(group, item); // Never trust a path supplied in an HTTP/WS payload.
+        item["_poster"] = findPoster(group, item);
         media[i] = item;
     }
     message["media"] = media;

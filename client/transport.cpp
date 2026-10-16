@@ -347,6 +347,16 @@ void Transport::upload(const QString &group, const QString &path, const QString 
 void Transport::download(const QJsonObject &media, const QString &root,
                          std::function<void(const QString &, const QString &)> callback)
 {
+    downloadFile(media, root, false, std::move(callback));
+}
+void Transport::downloadPoster(const QJsonObject &media, const QString &root,
+                               std::function<void(const QString &, const QString &)> callback)
+{
+    downloadFile(media, root, true, std::move(callback));
+}
+void Transport::downloadFile(const QJsonObject &media, const QString &root, bool poster,
+                             std::function<void(const QString &, const QString &)> callback)
+{
     if (root.isEmpty() || !QDir(root).isAbsolute())
     {
         callback({}, "请选择完整的附件保存目录");
@@ -369,16 +379,31 @@ void Transport::download(const QJsonObject &media, const QString &root,
     partialDownloads.insert(partial);
     auto hash = std::make_shared<QCryptographicHash>(QCryptographicHash::Sha256);
     auto failed = std::make_shared<QString>();
-    auto *reply = network.get(request("/api/media/" + media["id"].toString()));
+    auto req = request("/api/media/" + QString::fromLatin1(QUrl::toPercentEncoding(media["id"].toString())) +
+                       (poster ? "/poster" : ""));
+    if (poster) req.setTransferTimeout(12000);
+    auto *reply = network.get(req);
     reply->setReadBufferSize(64 * 1024);
     setupTls(reply, pin);
-    auto drain = [reply, file, hash, failed]
+    if (poster) QTimer::singleShot(15000, reply, [reply, failed]
+    {
+        if (reply->isFinished()) return;
+        *failed = "视频封面请求超时";
+        reply->abort();
+    });
+    auto drain = [reply, file, hash, failed, poster]
     {
         while (reply->bytesAvailable() > 0)
         {
             auto chunk = reply->read(64 * 1024);
             if (chunk.isEmpty())
                 break;
+            if (poster && file->size() + chunk.size() > 48 * 1024)
+            {
+                *failed = "视频封面超过容量";
+                reply->abort();
+                return;
+            }
             if (file->write(chunk) != chunk.size())
             {
                 *failed = "磁盘写入失败：" + file->errorString();
@@ -389,9 +414,9 @@ void Transport::download(const QJsonObject &media, const QString &root,
         }
     };
     connect(reply, &QNetworkReply::readyRead, this, drain);
-    connect(reply, &QNetworkReply::downloadProgress, this, &Transport::progress);
+    if (!poster) connect(reply, &QNetworkReply::downloadProgress, this, &Transport::progress);
     connect(reply, &QNetworkReply::finished, this,
-            [this, reply, file, hash, failed, callback, media, directory, partial, drain]
+            [this, reply, file, hash, failed, callback, media, directory, partial, drain, poster]
             {
                 drain();
                 auto length = file->size();
@@ -400,13 +425,18 @@ void Transport::download(const QJsonObject &media, const QString &root,
                 QString error = *failed;
                 if (error.isEmpty() && (reply->error() != QNetworkReply::NoError || status != 200))
                     error = reply->errorString();
-                if (error.isEmpty() && (length != media["size"].toInteger() ||
-                                        hash->result().toHex() != media["sha256"].toString().toLatin1()))
+                const auto expectedLength = poster ? reply->header(QNetworkRequest::ContentLengthHeader).toLongLong()
+                                                   : media["size"].toInteger();
+                const auto expectedHash = poster ? reply->rawHeader("X-Content-SHA256")
+                                                : media["sha256"].toString().toLatin1();
+                if (error.isEmpty() && (length <= 0 || length != expectedLength || expectedHash.size() != 64 ||
+                                        hash->result().toHex() != expectedHash))
                     error = "下载内容校验失败，请重新下载";
                 QString destination;
                 if (error.isEmpty())
                 {
-                    auto name = AttachmentStore::safeName(media["name"].toString());
+                    auto name = poster ? QUuid::createUuid().toString(QUuid::WithoutBraces) + ".jpg"
+                                       : AttachmentStore::safeName(media["name"].toString());
                     destination = QDir(directory).filePath(name);
                     int counter = 0;
                     while (QFileInfo::exists(destination))

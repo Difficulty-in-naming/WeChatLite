@@ -18,9 +18,11 @@ QMenu *createChatContextMenu(QWidget *parent);
 void execChatContextMenu(QMenu *menu, const QPoint &anchor);
 
 QPixmap chatAvatar(const QJsonObject &entity, int size);
+void paintVideoPreview(QPainter *painter, const QRect &rect, const QJsonObject &media, const QFont &font);
 bool canRecallMessage(const QJsonObject &message, qint64 now);
 QString messageQuoteLabel(const QJsonObject &quote);
 bool sameMediaDescriptor(const QJsonObject &first, const QJsonObject &second);
+QJsonObject preserveLocalMediaState(QJsonObject message, const QJsonObject &previous);
 
 class MessageModel : public QAbstractListModel
 {
@@ -37,10 +39,12 @@ class MessageModel : public QAbstractListModel
     void upsert(const QJsonObject &message);
     void prepend(const QJsonArray &messages);
     void setLocalMedia(const QString &id, const QString &path, const QJsonObject &descriptor = {});
+    void setLocalPoster(const QString &id, const QString &path, const QJsonObject &descriptor = {});
     void markQuoteUnavailable(const QString &id);
     void setCanReedit(const QString &id, bool value);
 
   private:
+    void setLocalMediaPath(const QString &id, const QString &path, const QJsonObject &descriptor, const QString &field);
     QJsonObject normalize(QJsonObject message);
     QSet<QString> recalledIds;
     QStringList recalledOrder;
@@ -57,6 +61,11 @@ class MessageDelegate : public QStyledItemDelegate
     static QRect bubbleRect(const QStyleOptionViewItem &option, const QModelIndex &index);
     static QRect quoteRect(const QStyleOptionViewItem &option, const QModelIndex &index);
     static QRect reeditRect(const QStyleOptionViewItem &option, const QModelIndex &index);
+    void setTextSelection(const QModelIndex &index, int start, int length);
+
+  private:
+    QPersistentModelIndex selectedTextIndex;
+    int selectedTextStart = 0, selectedTextLength = 0;
 };
 // Keep the visible document position when asynchronous model updates resize earlier rows.
 class StableListView : public QListView
@@ -97,6 +106,7 @@ class MessageView : public StableListView
     bool scrollAnimationActive() const;
     bool locateMessage(const QString &id);
     void setVoiceState(const QString &id, const QString &state);
+    QString selectedText() const;
   signals:
     void mediaClicked(const QJsonObject &media, bool saveOnly);
     void mentionRequested(const QJsonObject &member);
@@ -109,6 +119,7 @@ class MessageView : public StableListView
     void viewportChanged();
 
   protected:
+    void mousePressEvent(QMouseEvent *event) override;
     void mouseReleaseEvent(QMouseEvent *event) override;
     void mouseMoveEvent(QMouseEvent *event) override;
     void contextMenuEvent(QContextMenuEvent *event) override;
@@ -131,6 +142,14 @@ class MessageView : public StableListView
     void clearGifs();
     void removeGif(const QString &path);
     void requestOlder();
+    int textPositionAt(const QModelIndex &index, const QPoint &point, bool clamp) const;
+    void updateTextSelection(int position);
+    void clearTextSelection();
+    void validateTextSelection();
+    QPersistentModelIndex selectedTextIndex;
+    QString selectedTextSource;
+    int textAnchor = 0, textCursor = 0;
+    bool selectingText = false;
     QTimer gifUpdateTimer;
     QHash<QString, GifAnimation> gifs;
     QList<QMetaObject::Connection> modelConnections;

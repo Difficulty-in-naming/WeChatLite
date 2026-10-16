@@ -39,6 +39,8 @@
 #include <QPushButton>
 #include <QRegularExpression>
 #include <QSaveFile>
+#include <QScreen>
+#include <QCursor>
 #include <QScrollArea>
 #include <QScrollBar>
 #include <QSettings>
@@ -68,6 +70,19 @@ static QPushButton *button(const QString &text, const QString &name = {})
     result->setObjectName(name);
     result->setCursor(Qt::PointingHandCursor);
     return result;
+}
+QRect chatWindowBounds(const QRect &available, const QRect &requested)
+{
+    if (!available.isValid()) return {0, 0, 960, 720};
+    const int margin = qMin(12, qMin(available.width(), available.height()) / 20);
+    const auto area = available.adjusted(margin, margin, -margin, -margin);
+    const QSize minimum(qMin(760, area.width()), qMin(520, area.height()));
+    const auto preferred = requested.isValid() ? requested.size() : QSize(1095, 850);
+    const auto size = preferred.boundedTo(area.size()).expandedTo(minimum);
+    auto position = requested.isValid() ? requested.topLeft() : area.center() - QPoint(size.width() / 2, size.height() / 2);
+    position.setX(qBound(area.left(), position.x(), area.right() - size.width() + 1));
+    position.setY(qBound(area.top(), position.y(), area.bottom() - size.height() + 1));
+    return {position, size};
 }
 static QFrame *line()
 {
@@ -183,10 +198,10 @@ Window::Window(bool demo, const QString &tunnelExecutable)
     setWindowTitle("微信轻聊");
     setWindowIcon(appIcon());
     setWindowFlag(Qt::FramelessWindowHint);
-    resize(1095, 1178);
-    setMinimumSize(760, 660);
+    composeHeightPreference = qBound(0, settings.value("composeHeight", 0).toInt(), 2000);
     setAcceptDrops(true);
     makeUi();
+    fitToScreen(true);
     refreshThemeIcons();
     voicePlayer = new VoicePlayer(this);
     connect(voicePlayer, &VoicePlayer::playingChanged, this, [this](bool playing)
@@ -578,6 +593,13 @@ void Window::makeUi()
     layout->addWidget(messages, 1);
     connect(messages, &MessageView::olderRequested, this, [this] { loadHistory(true); });
 
+    composeResizeHandle = new QWidget;
+    composeResizeHandle->setObjectName("composeResizeHandle");
+    composeResizeHandle->setFixedHeight(5);
+    composeResizeHandle->setCursor(Qt::SizeVerCursor);
+    composeResizeHandle->setAccessibleName("调整输入框高度");
+    composeResizeHandle->installEventFilter(this);
+    layout->addWidget(composeResizeHandle);
     auto *compose = new QWidget;
     compose->setObjectName("composeArea");
     compose->setFixedHeight(303);
@@ -681,6 +703,30 @@ void Window::makeUi()
 
 bool Window::eventFilter(QObject *watched, QEvent *event)
 {
+    if (watched == composeResizeHandle)
+    {
+        if (event->type() == QEvent::MouseButtonPress && static_cast<QMouseEvent *>(event)->button() == Qt::LeftButton)
+        {
+            composeDragging = true;
+            composeDragStart = static_cast<QMouseEvent *>(event)->globalPosition().toPoint();
+            composeDragHeight = findChild<QWidget *>("composeArea")->height();
+            return true;
+        }
+        if (event->type() == QEvent::MouseMove && composeDragging)
+        {
+            composeHeightPreference = composeDragHeight + composeDragStart.y() -
+                static_cast<QMouseEvent *>(event)->globalPosition().toPoint().y();
+            updateComposeHeight();
+            return true;
+        }
+        if (event->type() == QEvent::MouseButtonRelease && composeDragging)
+        {
+            composeDragging = false;
+            composeHeightPreference = findChild<QWidget *>("composeArea")->height();
+            QSettings().setValue("composeHeight", composeHeightPreference);
+            return true;
+        }
+    }
     if (watched->objectName() == "titleBar")
     {
         if (event->type() == QEvent::MouseButtonDblClick)
@@ -727,7 +773,50 @@ void Window::resizeEvent(QResizeEvent *event)
 void Window::showEvent(QShowEvent *event)
 {
     QMainWindow::showEvent(event);
+    if (!screenWatching && windowHandle())
+    {
+        screenWatching = true;
+        connect(windowHandle(), &QWindow::screenChanged, this,
+            [this] { QTimer::singleShot(0, this, [this] { fitToScreen(); }); });
+        for (auto *screen : QGuiApplication::screens()) watchScreen(screen);
+        connect(qApp, &QGuiApplication::screenAdded, this, &Window::watchScreen);
+    }
+    fitToScreen();
     updateNativeFrame();
+}
+void Window::watchScreen(QScreen *screen)
+{
+    const auto update = [this, screen]
+    {
+        if (windowHandle() && windowHandle()->screen() == screen)
+            QTimer::singleShot(0, this, [this] { fitToScreen(); });
+    };
+    connect(screen, &QScreen::availableGeometryChanged, this, update);
+    connect(screen, &QScreen::logicalDotsPerInchChanged, this, update);
+}
+void Window::fitToScreen(bool initial)
+{
+    if (isMinimized()) return;
+    const auto requested = initial ? QSettings().value("windowBounds").toRect() : geometry();
+    auto *target = initial && requested.isValid() ? QGuiApplication::screenAt(requested.center()) : nullptr;
+    if (!target && !initial && windowHandle()) target = windowHandle()->screen();
+    if (!target) target = QGuiApplication::screenAt(QCursor::pos());
+    if (!target) target = QGuiApplication::primaryScreen();
+    if (!target) return;
+    // Qt screen geometry is already expressed in logical pixels, including system scaling.
+    const auto available = target->availableGeometry();
+    const auto fitted = chatWindowBounds(available, requested);
+    setMinimumSize(qMax(1, qMin(760, available.width() - 24)), qMax(1, qMin(520, available.height() - 24)));
+    const int pixels = available.height() < 800 || available.width() < 1100 ? 12 : 14;
+    if (property("contentPixelSize").toInt() != pixels)
+    {
+        setProperty("contentPixelSize", pixels);
+        auto density = font(); density.setPixelSize(pixels); setFont(density);
+        composer->setStyleSheet(QString("font-size:%1px;").arg(pixels));
+        title->setStyleSheet(QString("font-size:%1px;").arg(pixels));
+    }
+    if (!isMaximized() && geometry() != fitted) setGeometry(fitted);
+    updateComposeHeight();
 }
 void Window::changeEvent(QEvent *event)
 {
@@ -739,6 +828,8 @@ void Window::changeEvent(QEvent *event)
     }
     if (event->type() == QEvent::WindowStateChange && isMinimized())
         stopVoice();
+    if (event->type() == QEvent::WindowStateChange && !isMinimized())
+        QTimer::singleShot(0, this, [this] { fitToScreen(); });
     if (event->type() == QEvent::ActivationChange || event->type() == QEvent::WindowStateChange)
         updateNativeFrame();
 }
@@ -911,7 +1002,11 @@ void Window::pruneMediaCache(qint64 limit, std::function<void(const QString &)> 
         if (rect.top() > bounds.bottom()) break;
         if (rect.intersects(bounds))
             for (const auto &entry : model->rows[row]["media"].toArray())
-                protectedPaths.insert(QFileInfo(entry.toObject()["_local"].toString()).absoluteFilePath());
+                for (const auto &field : {"_local", "_poster"})
+                {
+                    const auto path = entry.toObject()[field].toString();
+                    if (!path.isEmpty()) protectedPaths.insert(QFileInfo(path).absoluteFilePath());
+                }
     }
     const auto requestedPath = localFiles->pathForId(voiceGroup, requestedVoiceId);
     if (!requestedPath.isEmpty()) protectedPaths.insert(requestedPath);
@@ -933,11 +1028,17 @@ void Window::pruneMediaCache(qint64 limit, std::function<void(const QString &)> 
             if (self->localFiles == files)
             {
                 QSet<QString> ids;
+                QSet<QString> posterIds;
                 for (const auto &row : self->model->rows)
                     for (const auto &entry : row["media"].toArray())
+                    {
                         if (result.removed.contains(entry.toObject()["_local"].toString()))
                             ids.insert(entry.toObject()["id"].toString());
+                        if (result.removed.contains(entry.toObject()["_poster"].toString()))
+                            posterIds.insert(entry.toObject()["id"].toString());
+                    }
                 for (const auto &id : ids) self->model->setLocalMedia(id, {});
+                for (const auto &id : posterIds) self->model->setLocalPoster(id, {});
             }
             if (self->historyBrowser)
             {
@@ -962,8 +1063,11 @@ void Window::updateCachePins()
         if (rect.intersects(bounds))
             for (const auto &entry : model->rows[row]["media"].toArray())
             {
-                const auto path = entry.toObject()["_local"].toString();
-                if (!path.isEmpty()) paths.insert(QFileInfo(path).absoluteFilePath());
+                for (const auto &field : {"_local", "_poster"})
+                {
+                    const auto path = entry.toObject()[field].toString();
+                    if (!path.isEmpty()) paths.insert(QFileInfo(path).absoluteFilePath());
+                }
             }
     }
     if (!playingVoicePath.isEmpty()) paths.insert(playingVoicePath);
@@ -1257,6 +1361,7 @@ void Window::clearConversation()
     queuedMediaIds.clear();
     locatingId.clear();
     unavailableOriginals.clear();
+    failedPosters.clear();
     historyUpdates.clear();
     ++locateGeneration;
     messages->setProperty("locatedHistory", false);
@@ -1363,7 +1468,10 @@ void Window::loadPermissions()
             }
             refreshAttachments();
             if (canDownload)
+            {
+                failedPosters.clear();
                 thumbnailTimer.start();
+            }
         },
         10000);
 }
@@ -1719,6 +1827,7 @@ void Window::selectGroup(const QString &id, const QString &name)
     locatingId.clear();
     unavailableOriginals.clear();
     historyUpdates.clear();
+    failedPosters.clear();
     ++locateGeneration;
     messages->setProperty("locatedHistory", false);
     messages->stopScrollAnimation();
@@ -2103,10 +2212,10 @@ void Window::updateComposeHeight()
 {
     if (auto *compose = findChild<QWidget *>("composeArea"))
     {
-        const int minimum =
-            quoteArea && !quotedMessage.isEmpty() && attachmentArea && !attachments.items.isEmpty() ? 260
-                                                                                                    : 220;
-        compose->setFixedHeight(qBound(minimum, height() * 26 / 100, 303));
+        const int minimum = attachments.items.isEmpty() ? 140 : 212;
+        const int maximum = qMax(minimum, height() * 65 / 100);
+        const int requested = composeHeightPreference > 0 ? composeHeightPreference : qMin(303, height() * 24 / 100);
+        compose->setFixedHeight(qBound(minimum, requested, maximum));
     }
 }
 void Window::recallMessage(const QJsonObject &message)
@@ -2460,7 +2569,16 @@ void Window::uploadNext(int index, quint64 generation, const QString &targetGrou
                            failure(error);
                            return;
                        }
-                       model->upsert(localFiles->hydrate(value.toObject(), targetGroup));
+                       const auto response = localFiles->hydrate(value.toObject(), targetGroup);
+                       // A WebSocket confirmation can arrive before the original queued POST reply.
+                       const bool alreadyAdvanced = response["status"] == "queued" && std::any_of(
+                           model->rows.cbegin(), model->rows.cend(), [&response](const QJsonObject &row)
+                           {
+                               const auto status = row["status"].toString();
+                               return row["id"] == response["id"] && row["group"] == response["group"] &&
+                                   !status.isEmpty() && status != "queued";
+                           });
+                       if (!alreadyAdvanced) model->upsert(response);
                        messages->scrollToBottom();
                        restoring = true;
                        composer->clear();
@@ -2663,7 +2781,7 @@ void Window::saveMediaAndMaybeOpen(const QJsonObject &media, const QString &path
 }
 void Window::visibleThumbnails()
 {
-    if (!canDownload || !connected || isMinimized() || !isVisible())
+    if (!canDownload || !connected || isMinimized() || !isVisible() || cacheWorking)
         return;
     const auto bounds = messages->viewport()->rect();
     const auto first = messages->indexAt(QPoint(1, 0));
@@ -2680,11 +2798,40 @@ void Window::visibleThumbnails()
         {
             auto media = entry.toObject();
             auto kind = media["kind"].toString();
+            if (kind == "video") fetchVideoPoster(media);
             if ((kind == "image" || kind == "gif") && media["size"].toInteger() <= 8 * 1024 * 1024 &&
                 (media["_local"].toString().isEmpty() || !QFileInfo::exists(media["_local"].toString())))
                 fetchMedia(media, false, true);
         }
     }
+}
+void Window::fetchVideoPoster(const QJsonObject &media)
+{
+    const auto id = media["id"].toString();
+    if (id.isEmpty() || pendingPosters.size() >= 2 || pendingPosters.contains(id) || failedPosters.contains(id)) return;
+    const auto path = localFiles->findPoster(groupId, media);
+    if (!path.isEmpty()) { model->setLocalPoster(id, path, media); return; }
+    pendingPosters.insert(id);
+    const auto files = localFiles;
+    const auto scope = chatPreferences.scope();
+    const auto conversation = conversationGeneration;
+    const auto permission = permissionsGeneration;
+    const auto group = groupId;
+    transport.downloadPoster(media, MediaStorage::cacheDirectory(),
+        [this, media, id, files, scope, conversation, permission, group](const QString &path, const QString &error)
+        {
+            pendingPosters.remove(id);
+            if (scope != chatPreferences.scope() || files != localFiles || !canDownload) return;
+            if (permission != permissionsGeneration) { thumbnailTimer.start(); return; }
+            if (error.isEmpty()) files->rememberPoster(group, media, path);
+            if (conversation == conversationGeneration && group == groupId)
+            {
+                if (error.isEmpty()) { model->setLocalPoster(id, path, media); updateCachePins(); }
+                else { if (failedPosters.size() >= 256) failedPosters.erase(failedPosters.begin()); failedPosters.insert(id); }
+            }
+            thumbnailTimer.start();
+            cachePruneTimer.start();
+        });
 }
 void Window::stopVoice()
 {
@@ -2727,6 +2874,7 @@ void Window::openMedia(const QJsonObject &media, const QString &path)
 }
 void Window::closeEvent(QCloseEvent *event)
 {
+    if (!isMinimized()) QSettings().setValue("windowBounds", isMaximized() ? normalGeometry() : geometry());
     stopVoice();
     saveDraft();
     if (!quitting && demoServer.state() != QProcess::NotRunning && QSystemTrayIcon::isSystemTrayAvailable())

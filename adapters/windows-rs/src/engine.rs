@@ -360,6 +360,29 @@ fn history_position(group: &str, source: &str) -> Result<Option<Value>> {
     ))
 }
 
+// Keep the first short retries responsive without repeatedly decoding abandoned old media.
+// This private locator field survives restarts; Db::reload only reads the message position.
+fn media_retry_delay(locator: &mut Value, now: f64, error: Option<&anyhow::Error>) -> f64 {
+    const WAIT_SINCE: &str = "_media_wait_since";
+    if !error.is_some_and(|error| error.is::<crate::media::MediaPending>()) {
+        if let Some(locator) = locator.as_object_mut() {
+            locator.remove(WAIT_SINCE);
+        }
+        return 30.0;
+    }
+    let since = locator[WAIT_SINCE]
+        .as_f64()
+        .filter(|since| since.is_finite() && *since <= now)
+        .unwrap_or(now);
+    locator[WAIT_SINCE] = json!(since);
+    match now - since {
+        elapsed if elapsed < 30.0 => 2.0,
+        elapsed if elapsed < 120.0 => 5.0,
+        elapsed if elapsed < 300.0 => 10.0,
+        _ => 30.0,
+    }
+}
+
 fn history_page<A: Backend>(
     access: &mut A,
     store: &Receipts,
@@ -394,7 +417,19 @@ fn history_page<A: Backend>(
         }
         sources.push(key.clone());
         journal(store, group, row)?;
-        let mut locator = position(row)?;
+        use rusqlite::OptionalExtension;
+        let previous: Option<String> = store
+            .db
+            .query_row(
+                "SELECT locator FROM pending WHERE source=?",
+                [&key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let mut locator = previous
+            .map(|value| serde_json::from_str(&value))
+            .transpose()?
+            .unwrap_or(position(row)?);
         locator["historical"] = json!(true);
         store.db.execute(
             "UPDATE pending SET locator=?1 WHERE source=?2",
@@ -412,21 +447,24 @@ fn history_page<A: Backend>(
             }
             media_budget -= 1;
         }
-        match access.convert(group, row) {
+        let delay = match access.convert(group, row) {
             Ok(Some(message)) => {
-                events.push(json!({"type":"message","historical":true,"message":message}))
+                events.push(json!({"type":"message","historical":true,"message":message}));
+                media_retry_delay(&mut locator, now, None)
             }
             Ok(None) => {
                 sources.pop();
                 store
                     .db
                     .execute("DELETE FROM pending WHERE source=?", [&key])?;
+                continue;
             }
-            Err(_) => {} // Keep the durable locator for the normal bounded media retry path.
-        }
+            // Keep the durable locator for the normal bounded media retry path.
+            Err(error) => media_retry_delay(&mut locator, now, Some(&error)),
+        };
         store.db.execute(
-            "UPDATE pending SET due=? WHERE source=?",
-            params![now + 30.0, key],
+            "UPDATE pending SET due=?1,locator=?2 WHERE source=?3",
+            params![now + delay, locator.to_string(), key],
         )?;
     }
     events.push(json!({"type":"history_done","group":group,"request_id":request,"before_source":before_source,"has_more":has_more,"sources":sources}));
@@ -1146,15 +1184,17 @@ impl<A: Backend> Engine<A> {
                 pending.push(row?);
             }
             drop(statement);
-            for (key, group, locator) in pending {
+            for (key, group, raw_locator) in pending {
                 if self.store.contains("echoes", "key", &key)? {
                     self.store
                         .db
                         .execute("DELETE FROM pending WHERE source=?", [&key])?;
                     continue;
                 }
+                let mut retry_locator = None;
                 let result: Result<bool> = (|| {
-                    let locator: Value = serde_json::from_str(&locator)?;
+                    retry_locator = Some(serde_json::from_str::<Value>(&raw_locator)?);
+                    let locator = retry_locator.as_ref().context("消息定位缺失")?;
                     let row = self.access.reload(&group, &locator)?;
                     if let Some(job) = self.jobs.first() {
                         if job.defers(&mut self.access, &self.store, &group, &row)? {
@@ -1172,18 +1212,29 @@ impl<A: Backend> Engine<A> {
                 })();
                 let delay = match result {
                     Ok(false) => 2.0,
-                    Ok(true) => 30.0,
+                    Ok(true) => retry_locator
+                        .as_mut()
+                        .map_or(30.0, |locator| media_retry_delay(locator, now, None)),
                     Err(error) => {
                         if self.warned.insert(key.clone()) {
                             events.push(json!({"type":"warning","group":group,"text":format!("微信附件暂未就绪，将保留并重试：{error}")}));
                         }
-                        30.0
+                        retry_locator.as_mut().map_or(30.0, |locator| {
+                            media_retry_delay(locator, now, Some(&error))
+                        })
                     }
                 };
-                self.store.db.execute(
-                    "UPDATE pending SET due=? WHERE source=?",
-                    params![now + delay, key],
-                )?;
+                if let Some(locator) = retry_locator {
+                    self.store.db.execute(
+                        "UPDATE pending SET due=?1,locator=?2 WHERE source=?3",
+                        params![now + delay, locator.to_string(), key],
+                    )?;
+                } else {
+                    self.store.db.execute(
+                        "UPDATE pending SET due=? WHERE source=?",
+                        params![now + delay, key],
+                    )?;
+                }
             }
         }
         Ok(())

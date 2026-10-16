@@ -106,7 +106,8 @@ RowLayout layoutRow(const QJsonObject &message, int width, const QFont &font)
     for (int i = 0; i < qMin(8, media.size()); ++i)
     {
         top += 6;
-        const auto size = thumbnailSize(media[i].toObject());
+        const auto item = media[i].toObject();
+        const auto size = item["kind"] == "video" ? QSize(240, 144) : thumbnailSize(item);
         const auto row = size.isEmpty() ? QSize(qMin(270, available), 55) : size.boundedTo({available, 180});
         result.media.append(QRect(70, top, row.width(), row.height()));
         top += row.height();
@@ -173,16 +174,24 @@ class RecordsModel final : public QAbstractListModel
     }
     void localMedia(const QString &id, const QString &path, const QJsonObject &descriptor = {})
     {
+        localMediaPath(id, path, descriptor, "_local");
+    }
+    void localPoster(const QString &id, const QString &path, const QJsonObject &descriptor = {})
+    {
+        localMediaPath(id, path, descriptor, "_poster");
+    }
+    void localMediaPath(const QString &id, const QString &path, const QJsonObject &descriptor, const QString &field)
+    {
         for (int row = 0; row < rows.size(); ++row)
         {
             auto media = rows[row]["media"].toArray();
             bool changed = false;
             for (int i = 0; i < media.size(); ++i)
-                if (media[i].toObject()["id"] == id && media[i].toObject()["_local"].toString() != path &&
+                if (media[i].toObject()["id"] == id && media[i].toObject()[field].toString() != path &&
                     (descriptor.isEmpty() || sameMediaDescriptor(media[i].toObject(), descriptor)))
                 {
                     auto item = media[i].toObject();
-                    item["_local"] = path;
+                    item[field] = path;
                     media[i] = item;
                     changed = true;
                 }
@@ -198,7 +207,7 @@ class RecordsModel final : public QAbstractListModel
         for (int row = 0; row < rows.size(); ++row)
             if (rows[row]["id"] == message["id"])
             {
-                rows[row] = message; // The browser hydrates trusted local state before publishing it.
+                rows[row] = preserveLocalMediaState(message, rows[row]);
                 emit dataChanged(index(row), index(row));
                 return;
             }
@@ -246,6 +255,11 @@ class RecordDelegate final : public QStyledItemDelegate
         {
             const auto item = media[i].toObject();
             const auto rect = layout.media[i];
+            if (item["kind"] == "video")
+            {
+                paintVideoPreview(p, rect, item, option.font);
+                continue;
+            }
             if (!thumbnailSize(item).isEmpty())
             {
                 const auto path = item["_local"].toString();
@@ -544,6 +558,39 @@ void HistoryBrowser::loadVisibleThumbnails()
             const auto kind = media["kind"].toString();
             if (downloading.size() >= 2)
                 break;
+            if (kind == "video")
+            {
+                const auto known = localFiles->findPoster(groupId, media);
+                if (!known.isEmpty()) { rows->localPoster(id, known, media); continue; }
+                if (id.isEmpty() || downloading.contains(id) || failedThumbnails.contains(id)) continue;
+                downloading.insert(id);
+                QPointer<HistoryBrowser> self(this);
+                const auto requestedGeneration = generation;
+                const auto files = localFiles;
+                const auto group = groupId;
+                transport->downloadPoster(media, MediaStorage::cacheDirectory(),
+                    [self, files, group, media, id, requestedGeneration](const QString &path, const QString &error)
+                    {
+                        if (!self) return;
+                        self->downloading.remove(id);
+                        if (!self->valid || self->generation != requestedGeneration) return;
+                        if (error.isEmpty())
+                        {
+                            files->rememberPoster(group, media, path);
+                            static_cast<RecordsModel *>(self->records)->localPoster(id, path, media);
+                            self->updateCachePins();
+                            self->list->viewport()->update();
+                            emit self->cacheUpdated();
+                        }
+                        else
+                        {
+                            if (self->failedThumbnails.size() >= 256) self->failedThumbnails.erase(self->failedThumbnails.begin());
+                            self->failedThumbnails.insert(id);
+                        }
+                        self->thumbnailTimer.start();
+                    });
+                continue;
+            }
             const auto known = localFiles->find(groupId, media);
             if (!known.isEmpty())
             {
@@ -600,8 +647,11 @@ QSet<QString> HistoryBrowser::protectedCachePaths() const
         if (rect.intersects(bounds))
             for (const auto &entry : rows->rows[row]["media"].toArray())
             {
-                const auto path = entry.toObject()["_local"].toString();
-                if (!path.isEmpty()) result.insert(QFileInfo(path).absoluteFilePath());
+                for (const auto &field : {"_local", "_poster"})
+                {
+                    const auto path = entry.toObject()[field].toString();
+                    if (!path.isEmpty()) result.insert(QFileInfo(path).absoluteFilePath());
+                }
             }
     }
     return result;
@@ -614,11 +664,17 @@ void HistoryBrowser::discardCached(const QStringList &paths)
     if (paths.isEmpty()) return;
     auto *rows = static_cast<RecordsModel *>(records);
     QSet<QString> ids;
+    QSet<QString> posterIds;
     for (const auto &row : rows->rows)
         for (const auto &entry : row["media"].toArray())
+        {
             if (paths.contains(entry.toObject()["_local"].toString()))
                 ids.insert(entry.toObject()["id"].toString());
+            if (paths.contains(entry.toObject()["_poster"].toString()))
+                posterIds.insert(entry.toObject()["id"].toString());
+        }
     for (const auto &id : ids) rows->localMedia(id, {});
+    for (const auto &id : posterIds) rows->localPoster(id, {});
 }
 void HistoryBrowser::activate(const QModelIndex &index, const QPoint &point)
 {

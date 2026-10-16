@@ -25,6 +25,8 @@ class Transport : public QObject
     void cancelSend();
     void download(const QJsonObject &media, const QString &directory,
                   std::function<void(const QString &, const QString &)> callback);
+    void downloadPoster(const QJsonObject &media, const QString &directory,
+                        std::function<void(const QString &, const QString &)> callback);
     QUrl baseUrl() const { return base; }
     bool hasActiveDownloads() const { return !partialDownloads.isEmpty(); }
   signals:
@@ -38,6 +40,8 @@ class Transport : public QObject
     void finishJson(class QNetworkReply *reply, JsonCallback callback);
     void setupTls(class QNetworkReply *reply, const QByteArray &expectedPin);
     void trackSend(class QNetworkReply *reply);
+    void downloadFile(const QJsonObject &media, const QString &directory, bool poster,
+                      std::function<void(const QString &, const QString &)> callback);
     QNetworkAccessManager network;
     QWebSocket socket;
     QUrl base;
