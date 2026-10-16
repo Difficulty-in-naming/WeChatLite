@@ -55,6 +55,13 @@
 #include <QWheelEvent>
 #include <QtTest>
 #include <memory>
+#ifdef Q_OS_WIN
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <Windows.h>
+#include <mmsystem.h>
+#endif
 
 class FileOpenHandler : public QObject
 {
@@ -2594,6 +2601,10 @@ class DesktopTests : public QObject
     }
     void voicePlaysInsideChatAndStopsOnClickGroupChangeMinimizeAndRecall()
     {
+#ifdef Q_OS_WIN
+        if (waveOutGetNumDevs() == 0)
+            QSKIP("This Windows host has no playback device; other desktop interactions still run.");
+#endif
         FileOpenHandler handler;
         QDesktopServices::setUrlHandler("file", &handler, "open");
         const auto reset = qScopeGuard([] { QDesktopServices::unsetUrlHandler("file"); });

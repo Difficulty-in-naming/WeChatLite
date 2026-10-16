@@ -3,6 +3,13 @@
 #include <QTemporaryDir>
 #include <QtEndian>
 #include <QtTest>
+#ifdef Q_OS_WIN
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <Windows.h>
+#include <mmsystem.h>
+#endif
 
 namespace
 {
@@ -146,6 +153,10 @@ class VoiceTests final : public QObject
     }
     void playbackFinishesOnceAndAcceptsPaddedMetadata()
     {
+#ifdef Q_OS_WIN
+        if (waveOutGetNumDevs() == 0)
+            QSKIP("This Windows host has no playback device; WAV validation still runs.");
+#endif
 #if !defined(Q_OS_WIN) && !defined(Q_OS_MACOS)
         QSKIP("Native playback is implemented for Windows and macOS.");
 #endif
@@ -169,6 +180,10 @@ class VoiceTests final : public QObject
     }
     void stoppingCannotRevivePlayback()
     {
+#ifdef Q_OS_WIN
+        if (waveOutGetNumDevs() == 0)
+            QSKIP("This Windows host has no playback device; WAV validation still runs.");
+#endif
 #if !defined(Q_OS_WIN) && !defined(Q_OS_MACOS)
         QSKIP("Native playback is implemented for Windows and macOS.");
 #endif
@@ -189,6 +204,10 @@ class VoiceTests final : public QObject
     }
     void switchingKeepsOnlyTheNewCompletion()
     {
+#ifdef Q_OS_WIN
+        if (waveOutGetNumDevs() == 0)
+            QSKIP("This Windows host has no playback device; WAV validation still runs.");
+#endif
 #if !defined(Q_OS_WIN) && !defined(Q_OS_MACOS)
         QSKIP("Native playback is implemented for Windows and macOS.");
 #endif
@@ -213,6 +232,10 @@ class VoiceTests final : public QObject
     }
     void invalidReplacementStopsAndDestructorCancelsCallbacks()
     {
+#ifdef Q_OS_WIN
+        if (waveOutGetNumDevs() == 0)
+            QSKIP("This Windows host has no playback device; WAV validation still runs.");
+#endif
 #if !defined(Q_OS_WIN) && !defined(Q_OS_MACOS)
         QSKIP("Native playback is implemented for Windows and macOS.");
 #endif
