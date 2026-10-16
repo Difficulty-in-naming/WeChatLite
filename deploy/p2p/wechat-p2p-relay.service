@@ -1,0 +1,32 @@
+[Unit]
+Description=WeChat Lite private P2P rendezvous and encrypted relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=wechat-p2p
+Group=wechat-p2p
+ExecStart=/opt/wechat-p2p/1.3.0/iroh-relay --config-path /etc/wechat-p2p/relay.toml
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=10
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+AmbientCapabilities=
+MemoryMax=192M
+CPUQuota=50%
+TasksMax=64
+LimitNOFILE=1024
+
+[Install]
+WantedBy=multi-user.target

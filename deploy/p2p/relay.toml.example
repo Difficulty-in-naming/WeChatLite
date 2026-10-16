@@ -1,0 +1,24 @@
+# Generate a separate relay access token; this is not a WeChat administrator key.
+enable_relay = true
+http_bind_addr = "127.0.0.1:55440"
+enable_quic_addr_discovery = true
+enable_metrics = false
+key_cache_capacity = 256
+
+[access]
+shared_token = ["REPLACE_WITH_A_RANDOM_64_CHARACTER_SECRET"]
+
+[tls]
+https_bind_addr = "0.0.0.0:54443"
+quic_bind_addr = "0.0.0.0:54443"
+cert_mode = "Manual"
+manual_cert_path = "/etc/wechat-p2p/server.crt"
+manual_key_path = "/etc/wechat-p2p/server.key"
+
+[limits]
+accept_conn_limit = 5.0
+accept_conn_burst = 10
+
+[limits.client.rx]
+bytes_per_second = 2097152
+max_burst_bytes = 4194304

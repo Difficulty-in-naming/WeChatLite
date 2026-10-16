@@ -1,0 +1,78 @@
+# 微信轻聊
+
+轻量的 C++ / Qt Widgets 聊天客户端，配合独立的 Qt 管理界面、Rust 转发核心和本机微信适配器。客户端可以运行在另一台电脑，服务端只访问其本机已登录的微信。
+
+## 下载与运行
+
+在 [Releases](https://github.com/Difficulty-in-naming/WeChatLite/releases) 下载对应平台、对应角色的程序。客户端和服务端分开运行、分开分发。
+
+| 平台 | 客户端 | 转发服务端 |
+| --- | --- | --- |
+| Windows x64 | `WeChatLite-Client-Windows-x64.exe` | `WeChatLite-Server-Windows-x64.exe` |
+| Apple Silicon Mac | `WeChatLite-Client-macOS-arm64.dmg`，内含“微信轻聊.app” | `WeChatLite-Server-macOS-arm64.dmg`，内含“微信轻聊服务端.app” |
+
+Windows 每个角色只需分发一个 EXE。首次启动会校验并释放依赖到当前用户的版本化应用缓存；后续复用，启动器在打开实际应用后退出。它是单文件分发，并非把 Qt、Rust helper、微信适配器全部静态链接成一个进程。用户配置、聊天数据与下载目录独立于程序缓存。
+
+Mac 使用自包含的 `.app`，在 Finder 中是一个应用，依赖和使用说明位于应用内部。DMG 是下载载体。当前构建采用 ad-hoc 签名，尚未完成 Developer ID 签名与 Apple 公证。
+
+**当前 Mac 本机微信适配器尚未实现。Mac 客户端可以连接 Windows 微信服务端；Mac 服务端包仅包含管理 GUI、Rust 核心与 P2P 模块，不能直接转发本机 Mac 微信。** Windows 适配器限定微信 **4.1.15.13**，版本或指纹不匹配会拒绝接入。
+
+## 首次连接
+
+1. 在微信所在的 Windows 电脑运行服务端，配置连接、存储和 TLS，启动服务。
+2. 在“转发群”勾选需要转发的群。新发现的群默认不转发。
+3. 在“客户端权限”新建客户端，指定允许的群、发送/撤回与下载权限。
+4. 将创建时一次显示的连接信息交给该客户端，在客户端设置中粘贴并保存。
+
+实际可见群是全局转发范围与该客户端授权范围的交集。管理员密钥只允许真实本机回环连接，不能发给客户端；停用或撤销客户端会中断其事件连接，并立即限制历史、成员、发送、上传及下载。
+
+可选择 HTTPS 直接地址，或自建公网入口的自动连接。自动连接使用固定设备身份，QUIC 直连优先，无法直连时加密中继；微信电脑不必映射路由器端口。原 HTTPS/WSS、独立客户端密钥与证书指纹校验保留。入口只负责建联与必要的中继，不保存聊天数据库。
+
+详细步骤：[客户端](docs/CLIENT.md)、[服务端](docs/SERVER.md)、[P2P 连接](docs/P2P.md)、[公网入口部署](deploy/p2p/README.md)。
+
+## 聊天功能
+
+- 拖拽或粘贴文件、图片、视频与 GIF，先附加到输入区，再发送；单件上限 512 MiB，每次最多 12 个附件。
+- 接收文件、视频、GIF 和语音。下载保存到自选目录的 `YYYY-MM-DD` 子目录；图片、GIF、视频和文件交给系统默认应用打开，语音在聊天窗口内播放。
+- 输入 @ 选择真实成员；右键头像可 @。右键文本可复制、引用，以及在本人已确认消息发送不足三分钟时撤回。撤回后可重新编辑本客户端保留的原稿；引用可定位原文。
+- 列表平滑滚动，向上按需读取更早消息，并保持阅读位置；内存消息窗口最多 300 条。
+- 右键群可置顶/取消置顶，或显示/忽略消息通知，重启后保留。允许通知的群收到新的他人消息时使用系统原生通知；当前正在浏览的群免打扰，历史加载、断线重放、重复事件、状态更新和自己发送不弹通知。系统权限和勿扰设置仍由操作系统控制。
+- 不显示无意义的操作提示条或鼠标悬停提示；聊天区域不加入通话、表情工具栏等额外按钮。
+
+发送提交与微信确认分别记录；不确定结果不会自动重发。稳定请求编号用于去重。原生文本引用只接受本机数据库中已确认的同群文本；撤回仍需版本匹配的原生记录及数据库回读确认。
+
+## 资源与数据
+
+界面只绘制可见消息，图片、GIF 和缩略图缓存有上限；最小化或隐藏后释放动画资源。附件流式写入磁盘。Rust 转发、P2P 与微信桥接使用有界队列和缓冲，没有 Python、Electron 或浏览器运行时。
+
+Windows 桥接的数据库读取、媒体处理和发送确认使用 Rust，SILK 解码链接 C SDK，原生发送、引用与撤回使用经版本校验的 C++ 组件，WXGF 按需调用独立 FFmpeg。客户端不包含本机微信适配器。
+
+源码与发布包不携带真实接入密钥、服务器设备私钥、SSH 凭据、聊天数据库或个人附件。运行配置保存在各自系统应用数据目录。发布前审查说明见 [源码与发布检查](docs/RELEASE.md)。
+
+## 从源码构建
+
+Windows：Qt 6.8.3（Widgets、Network、WebSockets、Test）、CMake、MSVC x64 / Windows SDK 与 Rust MSVC 工具链。准备带 HEVC 解码、PNG 输出及测试所需 libx265 编码器的独立 FFmpeg EXE。
+
+```powershell
+powershell -File scripts/build-windows.ps1 -QtRoot C:\Qt\6.8.3\msvc2022_64 -FFmpeg C:\Tools\ffmpeg.exe
+```
+
+脚本构建和测试原生模块、Rust 核心/桥接/P2P、Qt 客户端与管理端，再创建干净运行目录及便携单 EXE。开发工具默认复用工作区 `.qt`、`.tools`，不属于运行包。
+
+Apple Silicon Mac：Xcode Command Line Tools、Qt 6.8.3+、CMake、Rust。当前构建最低系统版本 macOS 13。
+
+```bash
+QT_PREFIX=/path/to/Qt/6.8.3/macos bash scripts/build-macos.sh
+```
+
+GitHub Actions 的 `macOS arm64 packages` 工作流可以手动运行，在原生 arm64 Mac 上构建、测试、部署依赖、检查签名并生成两份 DMG。只上传程序与校验值，测试诊断单独保存为短期 Actions artifact。
+
+```text
+cargo test --locked -p wechat-relay -p wechat-adapter -p wechat-p2p
+ctest --test-dir build -C Release --output-on-failure
+ctest --test-dir build/native -C Release --output-on-failure
+```
+
+默认自动化使用演示服务、离线样本或合成 fixture，不发送真实微信群消息。真实 WeChat 适配器、系统通知视觉效果、不同外网的直连成功率和签名公证须分别验证，不能以单元测试替代。
+
+第三方组件与对应源码材料见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。旧 Python 桥接源码保留为迁移参考，不进入发布运行包。

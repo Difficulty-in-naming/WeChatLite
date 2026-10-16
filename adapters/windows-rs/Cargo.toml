@@ -1,0 +1,38 @@
+[package]
+name = "wechat-adapter"
+version = "0.2.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "v5"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+rusqlite = { version = "0.38", features = ["bundled", "serialize"] }
+sha2 = "0.10"
+sha1 = "0.10"
+hmac = "0.12"
+pbkdf2 = "0.12"
+aes = "0.8"
+cbc = "0.1"
+cipher = "0.4"
+md-5 = "0.10"
+zstd = "0.13"
+hex = "0.4"
+encoding_rs = "0.8"
+memchr = "2"
+rand = "0.9"
+ureq = { version = "3", default-features = false, features = ["rustls", "json"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
+base64 = "0.22"
+roxmltree = "0.21"
+walkdir = "2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Diagnostics_Debug", "Win32_System_Threading", "Win32_System_Memory", "Win32_System_LibraryLoader", "Win32_Storage_FileSystem", "Win32_System_Registry"] }
+
+[build-dependencies]
+cc = "1"
+
+[dev-dependencies]
+tempfile = "3"
