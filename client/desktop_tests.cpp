@@ -650,6 +650,82 @@ class DesktopTests : public QObject
         browser->close();
         QTRY_VERIFY(browser.isNull());
     }
+    void recordVideoPosterCompletionPersistsAfterBrowserCloses()
+    {
+        RecordsApiFixture api;
+        QVERIFY(api.server.listen(QHostAddress::LocalHost, 0));
+        QImage source(96, 64, QImage::Format_RGB32);
+        source.fill(QColor(31, 126, 210));
+        QByteArray jpeg;
+        QBuffer buffer(&jpeg);
+        QVERIFY(buffer.open(QIODevice::WriteOnly));
+        QVERIFY(source.save(&buffer, "JPEG"));
+        buffer.close();
+        const QJsonObject descriptor{{"id", "history-late-poster-video"}, {"kind", "video"},
+            {"name", "late.mp4"}, {"size", 8 * 1024 * 1024}, {"sha256", QString(64, 'e')}};
+        const QString group("history-late-poster-group");
+        const QJsonObject message{{"id", "history-late-poster-message"}, {"group", group},
+            {"sender", "Synthetic member"}, {"timestamp", 1'700'000'000'000LL},
+            {"status", "received"}, {"media", QJsonArray{descriptor}}};
+        const QString posterRoute("/api/media/history-late-poster-video/poster");
+        QPointer<QTcpSocket> held;
+        api.handler = [&](QTcpSocket *socket, const QUrl &url)
+        {
+            if (url.path().endsWith("/members"))
+                RecordsApiFixture::respond(socket, QJsonArray{});
+            else if (url.path() == "/api/records")
+                RecordsApiFixture::respond(socket, QJsonObject{{"messages", QJsonArray{message}}, {"has_more", false}});
+            else if (url.path() == posterRoute)
+                held = socket; // The browser must be destroyed before validated bytes arrive.
+            else
+                RecordsApiFixture::respond(socket, QJsonObject{});
+        };
+        QVERIFY(QStandardPaths::isTestModeEnabled());
+        QVERIFY(MediaStorage::cacheDirectory().contains(QCoreApplication::applicationName()));
+        const auto cache = QDir(MediaStorage::cacheDirectory()).filePath(QDate::currentDate().toString("yyyy-MM-dd"));
+        const auto previous = QDir(cache).entryList({"*.jpg"}, QDir::Files);
+        QString saved;
+        const auto removeCover = qScopeGuard([&] { if (!saved.isEmpty()) QFile::remove(saved); });
+        const auto index = QDir(QFileInfo(files.path()).canonicalFilePath()).filePath("late-poster-index");
+        const QString scope("offline-history-late-poster-scope");
+        auto localFiles = std::make_shared<MediaStorage::LocalFiles>(scope, index);
+        Transport transport;
+        transport.configure(api.url(), "offline-records-client");
+        QPointer<HistoryBrowser> browser = new HistoryBrowser(&transport, group, "Synthetic group",
+                                                             files.path(), true, nullptr, localFiles);
+        const auto closeBrowser = qScopeGuard([&] { if (browser) delete browser.data(); });
+        browser->show();
+        QTRY_VERIFY_WITH_TIMEOUT(held && transport.hasActiveDownloads(), 5000);
+        QCOMPARE(api.count(posterRoute), 1);
+        browser->close();
+        QTRY_VERIFY(browser.isNull());
+        const auto digest = QCryptographicHash::hash(jpeg, QCryptographicHash::Sha256).toHex();
+        held->write("HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: image/jpeg\r\nContent-Length: " +
+                    QByteArray::number(jpeg.size()) + "\r\nX-Content-SHA256: " + digest + "\r\n\r\n" + jpeg);
+        held->disconnectFromHost();
+        QTRY_VERIFY_WITH_TIMEOUT(!transport.hasActiveDownloads(), 5000);
+        for (const auto &name : QDir(cache).entryList({"*.jpg"}, QDir::Files))
+        {
+            if (previous.contains(name)) continue;
+            QFile file(QDir(cache).filePath(name));
+            if (file.open(QIODevice::ReadOnly) && file.readAll() == jpeg) saved = file.fileName();
+        }
+        QVERIFY(!saved.isEmpty()); // HTTP integrity checks completed and the file really exists.
+        localFiles.reset();
+        auto restarted = std::make_shared<MediaStorage::LocalFiles>(scope, index);
+        QCOMPARE(restarted->findPoster(group, descriptor), saved);
+        QVERIFY(MediaStorage::LocalFiles("another-account", index).findPoster(group, descriptor).isEmpty());
+        browser = new HistoryBrowser(&transport, group, "Synthetic group", files.path(), true, nullptr, restarted);
+        browser->show();
+        auto *list = browser->findChild<QListView *>("historyRecords");
+        QTRY_COMPARE_WITH_TIMEOUT(list->model()->rowCount(), 1, 5000);
+        QCOMPARE(list->model()->index(0, 0).data(Qt::UserRole).toJsonObject()["media"].toArray().first()
+                     .toObject()["_poster"].toString(), saved);
+        QTest::qWait(250);
+        QCOMPARE(api.count(posterRoute), 1);
+        QVERIFY(api.clientCredentialOnly);
+        QCOMPARE(api.count("/api/media/history-late-poster-video"), 0);
+    }
     void recordBrowserPagesFiltersAndLateResponsesStayBounded()
     {
         RecordsApiFixture api;

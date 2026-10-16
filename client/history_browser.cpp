@@ -590,12 +590,12 @@ void HistoryBrowser::loadVisibleThumbnails()
                 transport->downloadPoster(media, MediaStorage::cacheDirectory(),
                     [self, files, group, media, id, requestedGeneration](const QString &path, const QString &error)
                     {
+                        if (error.isEmpty()) files->rememberPoster(group, media, path);
                         if (!self) return;
                         self->downloading.remove(id);
                         if (!self->valid || self->generation != requestedGeneration) return;
                         if (error.isEmpty())
                         {
-                            files->rememberPoster(group, media, path);
                             static_cast<RecordsModel *>(self->records)->localPoster(id, path, media);
                             self->updateCachePins();
                             self->list->viewport()->update();
