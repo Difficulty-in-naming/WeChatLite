@@ -373,7 +373,7 @@ HistoryBrowser::HistoryBrowser(Transport *service, const QString &group, const Q
     details->addStretch();
     details->addWidget(member);
     outer->addLayout(details);
-    list = new QListView;
+    list = new StableListView;
     list->setObjectName("historyRecords");
     records = new RecordsModel(this);
     list->setModel(records);
@@ -384,7 +384,6 @@ HistoryBrowser::HistoryBrowser(Transport *service, const QString &group, const Q
     list->setSpacing(0);
     list->installEventFilter(this);
     list->viewport()->installEventFilter(this);
-    new SmoothScroll(list);
     outer->addWidget(list, 1);
     auto *footer = new QHBoxLayout;
     footer->setContentsMargins(24, 0, 24, 0);

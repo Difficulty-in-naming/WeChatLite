@@ -149,6 +149,9 @@ impl Drop for Local {
     }
 }
 impl Backend for Local {
+    fn self_id(&self) -> String {
+        self.db.wxid.clone()
+    }
     fn catalog(&mut self) -> Result<Vec<Value>> {
         let groups = self.db.groups()?;
         Ok(groups.into_iter().map(|group| {

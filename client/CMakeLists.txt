@@ -4,8 +4,9 @@ qt_add_executable(wechat-lite
     attachment.cpp attachment.h voice_player.cpp voice_player.h
     connection_info.cpp connection_info.h tunnel_session.cpp tunnel_session.h
     history_browser.cpp history_browser.h announcement_dialog.cpp announcement_dialog.h
+    ui_icons.qrc
     chat_preferences.cpp chat_preferences.h system_notifier.cpp system_notifier.h)
-target_link_libraries(wechat-lite PRIVATE Qt6::Widgets Qt6::Network Qt6::WebSockets)
+target_link_libraries(wechat-lite PRIVATE Qt6::Widgets Qt6::Network Qt6::WebSockets Qt6::Svg)
 set_target_properties(wechat-lite PROPERTIES WIN32_EXECUTABLE TRUE MACOSX_BUNDLE TRUE
     MACOSX_BUNDLE_BUNDLE_NAME "微信轻聊" MACOSX_BUNDLE_GUI_IDENTIFIER "local.wechatlite.client"
     MACOSX_BUNDLE_BUNDLE_VERSION ${PROJECT_VERSION}
@@ -37,8 +38,9 @@ qt_add_executable(desktop-tests desktop_tests.cpp window.cpp window.h composer.c
     transport.cpp transport.h messages.cpp messages.h attachment.cpp attachment.h voice_player.cpp voice_player.h
     connection_info.cpp connection_info.h tunnel_session.cpp tunnel_session.h
     history_browser.cpp history_browser.h announcement_dialog.cpp announcement_dialog.h
+    ui_icons.qrc
     chat_preferences.cpp chat_preferences.h)
-target_link_libraries(desktop-tests PRIVATE Qt6::Widgets Qt6::Test Qt6::Network Qt6::WebSockets)
+target_link_libraries(desktop-tests PRIVATE Qt6::Widgets Qt6::Test Qt6::Network Qt6::WebSockets Qt6::Svg)
 if(WIN32)
     target_link_libraries(wechat-lite PRIVATE dwmapi user32 winmm)
     target_link_libraries(desktop-tests PRIVATE dwmapi user32 winmm)

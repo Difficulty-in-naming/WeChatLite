@@ -198,6 +198,20 @@ class DesktopTests : public QObject
                     button->objectName() == "closeWindow" || button->objectName() == "historyButton" ||
                     button->objectName() == "announcementButton");
             QVERIFY(button->toolTip().isEmpty());
+            if (button->objectName() == "historyButton" || button->objectName() == "announcementButton")
+            {
+                QVERIFY(button->text().isEmpty());
+                QCOMPARE(button->accessibleName(), button->objectName() == "historyButton" ?
+                    QString("聊天记录") : QString("群公告"));
+                QVERIFY(!button->icon().isNull());
+                QCOMPARE(button->iconSize(), QSize(20, 20));
+                const auto rendered = button->icon().pixmap(QSize(20, 20)).toImage();
+                bool visible = false;
+                for (int y = 0; y < rendered.height(); ++y)
+                    for (int x = 0; x < rendered.width(); ++x)
+                        visible |= qAlpha(rendered.pixel(x, y)) != 0;
+                QVERIFY(visible); // The SVG is embedded and renders, rather than merely naming a resource.
+            }
         }
         auto *tray = window->findChild<QSystemTrayIcon *>();
         QVERIFY(tray && tray->contextMenu());
@@ -595,16 +609,21 @@ class DesktopTests : public QObject
     }
     void chatPreferencesPersistAndSeparateLogicalServersAndKeys()
     {
+        using Mode = ChatPreferences::NotificationMode;
         const auto logical = "p2p://" + QString(64, 'a');
         ChatPreferences preferences;
         QVERIFY(preferences.configure(logical, "offline-client-key-a"));
         QVERIFY(!preferences.pinned("group") && !preferences.muted("group"));
+        QCOMPARE(preferences.notificationMode("group"), Mode::AllMessages);
         preferences.setPinned("group", true);
-        preferences.setMuted("group", true);
+        preferences.setNotificationMode("group", Mode::MentionsOnly);
+        preferences.setNotificationMode("ignored", Mode::Ignore);
         QSettings().sync();
         ChatPreferences restarted;
         QVERIFY(restarted.configure(logical, "offline-client-key-a"));
-        QVERIFY(restarted.pinned("group") && restarted.muted("group"));
+        QVERIFY(restarted.pinned("group") && !restarted.muted("group"));
+        QCOMPARE(restarted.notificationMode("group"), Mode::MentionsOnly);
+        QCOMPARE(restarted.notificationMode("ignored"), Mode::Ignore);
         QVERIFY(!restarted.configure(logical, "offline-client-key-a"));
         QVERIFY(restarted.configure(logical, "offline-client-key-b"));
         QVERIFY(!restarted.pinned("group") && !restarted.muted("group"));
@@ -612,11 +631,27 @@ class DesktopTests : public QObject
         QVERIFY(!restarted.pinned("group") && !restarted.muted("group"));
         QVERIFY(restarted.configure(logical, "offline-client-key-a"));
         restarted.setPinned("group", false);
-        QVERIFY(!restarted.pinned("group") && restarted.muted("group"));
-        restarted.setMuted("group", false);
+        QVERIFY(!restarted.pinned("group"));
+        QCOMPARE(restarted.notificationMode("group"), Mode::MentionsOnly);
+        restarted.setNotificationMode("group", Mode::AllMessages);
         ChatPreferences defaults;
         defaults.configure(logical, "offline-client-key-a");
         QVERIFY(!defaults.pinned("group") && !defaults.muted("group"));
+        QCOMPARE(defaults.notificationMode("group"), Mode::AllMessages);
+        ChatPreferences legacy;
+        legacy.configure(logical, "legacy-notification-key");
+        QSettings().setValue(legacy.scope(), QJsonDocument(QJsonObject{
+            {"old-muted", QJsonObject{{"muted", true}, {"pinned", true}}},
+            {"old-unmuted", QJsonObject{{"muted", false}}},
+            {"old-default", QJsonObject{{"pinned", true}}}}).toJson(QJsonDocument::Compact));
+        ChatPreferences migrated;
+        migrated.configure(logical, "legacy-notification-key");
+        QCOMPARE(migrated.notificationMode("old-muted"), Mode::Ignore);
+        QVERIFY(migrated.pinned("old-muted"));
+        QCOMPARE(migrated.notificationMode("old-unmuted"), Mode::AllMessages);
+        QCOMPARE(migrated.notificationMode("old-default"), Mode::AllMessages);
+        QVERIFY(migrated.pinned("old-default"));
+        QVERIFY(!QSettings().value(migrated.scope()).toByteArray().contains("\"muted\""));
     }
     void groupMenuPinsMutesAndPreservesSelectionSearchAndNormalOrder()
     {
@@ -641,9 +676,12 @@ class DesktopTests : public QObject
                 list->item(row)->isHidden());
         auto *menu = window->groupContextMenuFor(target);
         QVERIFY(menu);
-        QCOMPARE(menu->actions().size(), 2);
+        QCOMPARE(menu->actions().size(), 5);
         QCOMPARE(menu->actions().first()->text(), QString("置顶"));
-        QCOMPARE(menu->actions().last()->text(), QString("忽略消息通知"));
+        QCOMPARE(menu->findChild<QAction *>("groupNotificationsIgnore")->text(), QString("忽略通知"));
+        QCOMPARE(menu->findChild<QAction *>("groupNotificationsMentions")->text(), QString("仅被 @ 时通知"));
+        QCOMPARE(menu->findChild<QAction *>("groupNotificationsAll")->text(), QString("所有新消息通知"));
+        QVERIFY(menu->findChild<QAction *>("groupNotificationsAll")->isChecked());
         QVERIFY(menu->testAttribute(Qt::WA_TranslucentBackground));
         QVERIFY(!menu->toolTipsVisible());
         menu->actions().first()->trigger();
@@ -657,15 +695,25 @@ class DesktopTests : public QObject
                 hidden.value(list->item(row)->data(Qt::UserRole).toJsonObject().value("id").toString()));
         menu = window->groupContextMenuFor(target);
         QCOMPARE(menu->actions().first()->text(), QString("取消置顶"));
-        menu->actions().last()->trigger();
+        menu->findChild<QAction *>("groupNotificationsIgnore")->trigger();
         delete menu;
         QSignalSpy refreshed(list->model(), &QAbstractItemModel::rowsInserted);
         transport->event({{"type", "groups"}});
         QTRY_VERIFY_WITH_TIMEOUT(!refreshed.isEmpty(), 8000);
         QCOMPARE(list->item(0)->data(Qt::UserRole).toJsonObject().value("id").toString(), target);
         menu = window->groupContextMenuFor(target);
-        QCOMPARE(menu->actions().last()->text(), QString("显示消息通知"));
-        menu->actions().last()->trigger();
+        QVERIFY(menu->findChild<QAction *>("groupNotificationsIgnore")->isChecked());
+        menu->resize(menu->sizeHint());
+        const auto ignoredMenu = menu->grab().toImage();
+        menu->findChild<QAction *>("groupNotificationsMentions")->trigger();
+        QVERIFY(menu->findChild<QAction *>("groupNotificationsMentions")->isChecked());
+        QVERIFY(!menu->findChild<QAction *>("groupNotificationsIgnore")->isChecked());
+        QVERIFY(!menu->findChild<QAction *>("groupNotificationsAll")->isChecked());
+        QVERIFY(ignoredMenu != menu->grab().toImage()); // Selection is visible in the custom painted menu.
+        delete menu;
+        menu = window->groupContextMenuFor(target);
+        QVERIFY(menu->findChild<QAction *>("groupNotificationsMentions")->isChecked());
+        menu->findChild<QAction *>("groupNotificationsAll")->trigger();
         delete menu;
         transport->event({{"type", "message"}, {"created", false}, {"seq", 99999},
             {"message", QJsonObject{{"id", "group-order-fixture"}, {"group", selectedId},
@@ -755,8 +803,8 @@ class DesktopTests : public QObject
         transport->event(fresh);
         QCOMPARE(notifications.size(), 1);
         auto *menu = window->groupContextMenuFor(current);
-        QCOMPARE(menu->actions().last()->text(), QString("忽略消息通知"));
-        menu->actions().last()->trigger();
+        QVERIFY(menu->findChild<QAction *>("groupNotificationsAll")->isChecked());
+        menu->findChild<QAction *>("groupNotificationsIgnore")->trigger();
         delete menu;
         const auto muted = event("muted", current);
         transport->event(muted);
@@ -766,16 +814,16 @@ class DesktopTests : public QObject
             receivedWhileMuted |= row.value("id") == muted.value("message").toObject().value("id");
         QVERIFY(receivedWhileMuted);
         menu = window->groupContextMenuFor(current);
-        QCOMPARE(menu->actions().last()->text(), QString("显示消息通知"));
-        menu->actions().last()->trigger();
+        QVERIFY(menu->findChild<QAction *>("groupNotificationsIgnore")->isChecked());
+        menu->findChild<QAction *>("groupNotificationsAll")->trigger();
         delete menu;
         window->showNormal();
         QApplication::setActiveWindow(window);
         QTRY_VERIFY(window->isActiveWindow());
         transport->event(event("active-current", current));
-        QCOMPARE(notifications.size(), 1);
-        transport->event(event("active-other", other));
         QCOMPARE(notifications.size(), 2);
+        transport->event(event("active-other", other));
+        QCOMPARE(notifications.size(), 3);
         window->hide();
         auto media = event("media", current);
         auto mediaMessage = media.value("message").toObject();
@@ -783,7 +831,7 @@ class DesktopTests : public QObject
         mediaMessage["media"] = QJsonArray{QJsonObject{{"kind", "gif"}, {"id", "new-gif"}}};
         media["message"] = mediaMessage;
         transport->event(media);
-        QCOMPARE(notifications.size(), 3);
+        QCOMPARE(notifications.size(), 4);
         QVERIFY(notifications.last().at(2).toString().contains("[GIF]"));
         transport->connectionChanged(false);
         transport->event(event("disconnected", current));
@@ -793,11 +841,11 @@ class DesktopTests : public QObject
         transport->event({{"type", "synced"}, {"seq", seq}});
         reconnectReplay["seq"] = ++seq;
         transport->event(reconnectReplay);
-        QCOMPARE(notifications.size(), 3);
+        QCOMPARE(notifications.size(), 4);
         transport->event(event("after-reconnect", current));
-        QCOMPARE(notifications.size(), 4);
+        QCOMPARE(notifications.size(), 5);
         transport->event(event("unknown-group", "not-authorized"));
-        QCOMPARE(notifications.size(), 4);
+        QCOMPARE(notifications.size(), 5);
         transport->event({{"type", "reset"}});
         window->showNormal();
         window->activateConversation(current);
@@ -822,6 +870,116 @@ class DesktopTests : public QObject
         status->value.insert("type", "status");
         transport->event(status->value);
         transport->event({{"type", "synced"}, {"seq", 0}});
+    }
+    void mentionNotificationsUseStructuredOwnIdentityAndNeverNamesOrText()
+    {
+        auto *transport = window->findChild<Transport *>();
+        auto *list = window->findChild<QListWidget *>("groups");
+        QTRY_VERIFY(list->currentItem());
+        const auto current = list->currentItem()->data(Qt::UserRole).toJsonObject().value("id").toString();
+        const auto choose = [this, &current](const QString &action)
+        {
+            auto *menu = window->groupContextMenuFor(current);
+            menu->findChild<QAction *>(action)->trigger();
+            delete menu;
+        };
+        choose("groupNotificationsMentions");
+        window->hide();
+        transport->event({{"type", "status"}, {"ready", true}, {"self_id", "wxid_own_one"}});
+        qint64 seq = 3000000;
+        transport->event({{"type", "synced"}, {"seq", seq}});
+        QSignalSpy notifications(window, &Window::systemNotificationRequested);
+        const auto event = [&seq, &current](const QString &id, const QJsonArray &mentions)
+        {
+            return QJsonObject{{"type", "message"}, {"seq", ++seq}, {"created", true},
+                {"message", QJsonObject{{"id", "mention-notification-" + id}, {"group", current},
+                    {"sender_id", "wxid_other"}, {"sender", "桌面测试"},
+                    {"text", "@桌面测试 @所有人 wxid_own_one"}, {"mentions", mentions},
+                    {"status", "received"}, {"timestamp", 1}}}};
+        };
+        const auto ownMention = QJsonArray{QJsonObject{{"id", "wxid_own_one"}, {"name", "同名昵称"}}};
+        const auto allMention = QJsonArray{QJsonObject{{"id", "notify@all"}, {"name", "所有人"}}};
+        transport->event(event("plain", {}));
+        transport->event(event("same-name", {QJsonObject{{"id", "someone-else"}, {"name", "桌面测试"}}}));
+        transport->event(event("client-id", {QJsonObject{{"id", "fixture-client"}, {"name", "我"}}}));
+        transport->event(event("text-all", {QJsonObject{{"id", "@all"}, {"name", "所有人"}}}));
+        transport->event(event("malformed", {QJsonValue("wxid_own_one"), QJsonObject{{"id", 1}}}));
+        QVERIFY(notifications.isEmpty());
+        auto matched = event("self", ownMention);
+        transport->event(matched);
+        QCOMPARE(notifications.size(), 1);
+        matched["seq"] = ++seq;
+        transport->event(matched);
+        QCOMPARE(notifications.size(), 1); // One creation cannot notify twice on a later receipt.
+        transport->event(event("all", allMention));
+        QCOMPARE(notifications.size(), 2);
+        auto own = event("own-sender-id", ownMention);
+        auto body = own["message"].toObject();
+        body["sender_id"] = "wxid_own_one";
+        own["message"] = body;
+        transport->event(own);
+        auto historical = event("historical", ownMention);
+        historical["historical"] = true;
+        transport->event(historical);
+        auto update = event("update", ownMention);
+        update["created"] = false;
+        transport->event(update);
+        auto outgoing = event("outgoing", ownMention);
+        body = outgoing["message"].toObject();
+        body["outgoing"] = true;
+        outgoing["message"] = body;
+        transport->event(outgoing);
+        QCOMPARE(notifications.size(), 2);
+        window->showNormal();
+        QApplication::setActiveWindow(window);
+        QTRY_VERIFY(window->isActiveWindow());
+        transport->event(event("active", ownMention));
+        QCOMPARE(notifications.size(), 3);
+        window->hide();
+        choose("groupNotificationsIgnore");
+        transport->event(event("ignored-self", ownMention));
+        transport->event(event("ignored-all", allMention));
+        QCOMPARE(notifications.size(), 3);
+        choose("groupNotificationsAll");
+        transport->event(event("all-mode-plain", {}));
+        QCOMPARE(notifications.size(), 4);
+        choose("groupNotificationsMentions");
+        transport->event({{"type", "status"}, {"ready", false}, {"self_id", "wxid_own_one"}});
+        transport->event(event("disconnected-wechat-identity", ownMention));
+        QCOMPARE(notifications.size(), 4);
+        transport->event({{"type", "status"}, {"ready", true}});
+        transport->event(event("unknown-self", ownMention));
+        QCOMPARE(notifications.size(), 4);
+        transport->event(event("unknown-all", allMention));
+        QCOMPARE(notifications.size(), 5);
+        transport->event({{"type", "status"}, {"ready", true}, {"self_id", "wxid_own_two"}});
+        transport->event(event("old-identity", ownMention));
+        QCOMPARE(notifications.size(), 5);
+        const auto newMention = QJsonArray{QJsonObject{{"id", "wxid_own_two"}, {"name", "另一个昵称"}}};
+        transport->event(event("new-identity", newMention));
+        QCOMPARE(notifications.size(), 6);
+        transport->connectionChanged(false);
+        transport->event(event("offline", newMention));
+        transport->connectionChanged(true);
+        transport->event(event("before-sync", newMention));
+        transport->event({{"type", "synced"}, {"seq", seq}});
+        transport->event(event("no-reused-identity", newMention));
+        QCOMPARE(notifications.size(), 6);
+        transport->event(event("reconnected-all", allMention));
+        QCOMPARE(notifications.size(), 7);
+        choose("groupNotificationsAll");
+        struct DemoStatus { bool done = false; QJsonObject value; QString error; };
+        auto status = std::make_shared<DemoStatus>();
+        transport->get("/api/status", [status](const QJsonValue &value, const QString &error)
+        {
+            status->value = value.toObject(); status->error = error; status->done = true;
+        });
+        QTRY_VERIFY_WITH_TIMEOUT(status->done, 8000);
+        QVERIFY2(status->error.isEmpty(), qPrintable(status->error));
+        status->value.insert("type", "status");
+        transport->event(status->value);
+        transport->event({{"type", "synced"}, {"seq", 0}});
+        window->showNormal();
     }
     void automaticClientStoresStableIdentityAndStartsOnlyOnSave()
     {
@@ -1321,6 +1479,22 @@ class DesktopTests : public QObject
         QTRY_COMPARE(history->rowCount(), 121);
         QCOMPARE(history->rows.last()["id"].toString(), "latest");
         QCOMPARE(olderRequests, 0);
+        // A delayed refresh must preserve where the user scrolls while it is pending.
+        holdNextHistory = true;
+        transport->event({{"type", "reset"}});
+        QTRY_VERIFY(heldHistory);
+        view->scrollTo(history->index(60), QAbstractItemView::PositionAtTop);
+        view->verticalScrollBar()->setValue(view->verticalScrollBar()->value() + 11);
+        const auto refreshAnchorIndex = view->indexAt(QPoint(1, 0));
+        const auto refreshAnchor = refreshAnchorIndex.data(Qt::UserRole).toJsonObject()["id"].toString();
+        const auto refreshOffset = view->visualRect(refreshAnchorIndex).top();
+        RecordsApiFixture::respond(heldHistory, QJsonObject{{"messages", sourceHistory},
+            {"has_more", true}, {"pending", false}});
+        QTRY_VERIFY(view->property("locatedHistory").toBool());
+        QTest::qWait(40);
+        const auto refreshedIndex = view->indexAt(QPoint(1, 0));
+        QCOMPARE(refreshedIndex.data(Qt::UserRole).toJsonObject()["id"].toString(), refreshAnchor);
+        QCOMPARE(view->visualRect(refreshedIndex).top(), refreshOffset);
         view->scrollToTop();
         const auto anchor = view->indexAt(QPoint(1, 0)).data(Qt::UserRole).toJsonObject()["id"].toString();
         auto scrollOlder = [view]

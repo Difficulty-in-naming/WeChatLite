@@ -120,6 +120,7 @@ class Window : public QMainWindow
     QQueue<QByteArray> seenMessageOrder;
     bool notificationsSynced = false;
     qint64 notificationSyncSeq = 0;
+    QString selfMemberId;
     QString locatingId;
     QString pendingActivatedGroup;
     quint64 locateGeneration = 0;

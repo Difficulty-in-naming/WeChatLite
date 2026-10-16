@@ -57,7 +57,33 @@ class MessageDelegate : public QStyledItemDelegate
     static QRect quoteRect(const QStyleOptionViewItem &option, const QModelIndex &index);
     static QRect reeditRect(const QStyleOptionViewItem &option, const QModelIndex &index);
 };
-class MessageView : public QListView
+// Keep the visible document position when asynchronous model updates resize earlier rows.
+class StableListView : public QListView
+{
+  public:
+    explicit StableListView(QWidget *parent = nullptr);
+    void setModel(QAbstractItemModel *model) override;
+    void doItemsLayout() override;
+
+  protected:
+    void dataChanged(const QModelIndex &first, const QModelIndex &last,
+                     const QList<int> &roles = {}) override;
+    void resizeEvent(QResizeEvent *event) override;
+    SmoothScroll *smoothScroll = nullptr;
+
+  private:
+    void rememberReadingPosition();
+    struct ReadingPosition
+    {
+        QPersistentModelIndex index;
+        QString id, group;
+        int offset = 0, scrollValue = 0;
+        bool pending = false, bottom = false;
+    } reading;
+    QList<QMetaObject::Connection> anchorConnections;
+    bool layingOut = false;
+};
+class MessageView : public StableListView
 {
     Q_OBJECT
   public:
@@ -109,7 +135,6 @@ class MessageView : public QListView
     QList<QMetaObject::Connection> modelConnections;
     QPointer<QWidget> observedWindow;
     QString gifCachePrefix;
-    SmoothScroll *smoothScroll = nullptr;
 };
 class GroupDelegate : public QStyledItemDelegate
 {

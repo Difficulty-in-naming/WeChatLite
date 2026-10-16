@@ -213,7 +213,7 @@ void MessageModel::setLocalMedia(const QString &id, const QString &path)
         auto media = rows[row]["media"].toArray();
         bool changed = false;
         for (int i = 0; i < media.size(); ++i)
-            if (media[i].toObject()["id"] == id)
+            if (media[i].toObject()["id"] == id && media[i].toObject()["_local"].toString() != path)
             {
                 auto object = media[i].toObject();
                 object["_local"] = path;
@@ -696,7 +696,103 @@ void MessageView::setVoiceState(const QString &id, const QString &state)
     viewport()->update();
 }
 
-MessageView::MessageView(QWidget *parent) : QListView(parent)
+StableListView::StableListView(QWidget *parent) : QListView(parent)
+{
+    smoothScroll = new SmoothScroll(this);
+}
+void StableListView::rememberReadingPosition()
+{
+    if (reading.pending || layingOut || !isVisible() || !model() || model()->rowCount() == 0)
+        return;
+    reading.index = indexAt(QPoint(1, 0));
+    const auto message = reading.index.data(Qt::UserRole).toJsonObject();
+    reading.id = message["id"].toString();
+    reading.group = message["group"].toString();
+    reading.offset = reading.index.isValid() ? visualRect(reading.index).top() : 0;
+    auto *bar = verticalScrollBar();
+    reading.scrollValue = bar->value();
+    reading.bottom = property("followBottom").toBool() && !property("locatedHistory").toBool() &&
+                     !smoothScroll->isRunning() && bar->maximum() - bar->value() <= 2;
+    reading.pending = reading.index.isValid() || reading.bottom;
+}
+void StableListView::setModel(QAbstractItemModel *next)
+{
+    for (const auto &connection : anchorConnections)
+        disconnect(connection);
+    anchorConnections.clear();
+    reading = {};
+    if (next)
+    {
+        // Register before QListView so cached old row rectangles are captured before Qt invalidates them.
+        anchorConnections.append(connect(next, &QAbstractItemModel::rowsAboutToBeInserted,
+                                         this, [this] { rememberReadingPosition(); }));
+        anchorConnections.append(connect(next, &QAbstractItemModel::rowsAboutToBeRemoved,
+                                         this, [this] { rememberReadingPosition(); }));
+        anchorConnections.append(connect(next, &QAbstractItemModel::modelAboutToBeReset,
+                                         this, [this] { rememberReadingPosition(); }));
+        anchorConnections.append(connect(next, &QAbstractItemModel::layoutAboutToBeChanged,
+                                         this, [this] { rememberReadingPosition(); }));
+    }
+    QListView::setModel(next);
+}
+void StableListView::dataChanged(const QModelIndex &first, const QModelIndex &last,
+                                 const QList<int> &roles)
+{
+    rememberReadingPosition();
+    QListView::dataChanged(first, last, roles);
+}
+void StableListView::resizeEvent(QResizeEvent *event)
+{
+    rememberReadingPosition();
+    QListView::resizeEvent(event);
+}
+void StableListView::doItemsLayout()
+{
+    if (layingOut || !reading.pending)
+    {
+        QListView::doItemsLayout();
+        return;
+    }
+    layingOut = true;
+    auto *bar = verticalScrollBar();
+    const auto previous = bar->value();
+    auto saved = reading;
+    reading = {};
+    // Qt's scrollbar handler can execute the pending layout before later valueChanged slots.
+    // Measure the user's intervening movement here, before our own range clamping begins.
+    if (previous != saved.scrollValue)
+    {
+        saved.offset -= previous - saved.scrollValue;
+        saved.bottom = false;
+    }
+    {
+        // Qt still needs scrollbar signals to update its pixel offset and scrollbar visibility.
+        // Only postpone wheel cancellation while the same layout restores the document anchor.
+        smoothScroll->setLayoutChanging(true);
+        QListView::doItemsLayout();
+        QModelIndex anchor = saved.index;
+        if (!anchor.isValid() && !saved.id.isEmpty() && model())
+            for (int row = 0; row < model()->rowCount(); ++row)
+            {
+                const auto index = model()->index(row, 0);
+                const auto message = index.data(Qt::UserRole).toJsonObject();
+                if (message["id"].toString() == saved.id && message["group"].toString() == saved.group)
+                {
+                    anchor = index;
+                    break;
+                }
+            }
+        if (saved.bottom && !property("locatedHistory").toBool() && !smoothScroll->isRunning())
+            bar->setValue(bar->maximum());
+        else if (anchor.isValid())
+            bar->setValue(bar->value() + visualRect(anchor).top() - saved.offset);
+        smoothScroll->offsetBy(bar->value() - previous);
+        smoothScroll->setLayoutChanging(false);
+    }
+    layingOut = false;
+    viewport()->update();
+}
+MessageView::MessageView(QWidget *parent) : StableListView(parent)
 {
     setFont(QApplication::font());
     gifCachePrefix = "chat-gif:" + QString::number(quintptr(this), 16) + ":";
@@ -712,7 +808,7 @@ MessageView::MessageView(QWidget *parent) : QListView(parent)
     setSpacing(0);
     setUniformItemSizes(false);
     setResizeMode(QListView::Adjust);
-    smoothScroll = new SmoothScroll(this);
+    setProperty("followBottom", true);
     smoothScroll->reachedTop = [this] { requestOlder(); };
     smoothScroll->reachedBottom = [this]
     {
@@ -802,7 +898,7 @@ void MessageView::setModel(QAbstractItemModel *next)
     modelConnections.clear();
     clearGifs();
     stopScrollAnimation();
-    QListView::setModel(next);
+    StableListView::setModel(next);
     if (!next)
         return;
     modelConnections.append(
@@ -960,7 +1056,7 @@ bool MessageView::eventFilter(QObject *watched, QEvent *event)
 }
 void MessageView::resizeEvent(QResizeEvent *event)
 {
-    QListView::resizeEvent(event);
+    StableListView::resizeEvent(event);
     doItemsLayout();
     scheduleGifUpdate();
     emit viewportChanged();
@@ -1081,8 +1177,19 @@ class ChatContextMenu : public QMenu
                                : action->objectName() == "recallMessage" ? QColor("#e55757")
                                                                          : QColor("#19191a");
             painter.setPen(color);
+            const bool checkable = action->isCheckable();
+            if (checkable && action->isChecked())
+            {
+                painter.save();
+                painter.setPen(QPen(color, 1.7, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+                const auto centerY = area.center().y();
+                painter.drawPolyline(QPolygonF{{qreal(area.left() + 10), qreal(centerY)},
+                                               {qreal(area.left() + 14), qreal(centerY + 4)},
+                                               {qreal(area.left() + 21), qreal(centerY - 4)}});
+                painter.restore();
+            }
             const auto icon = action->property("chatIcon").toString();
-            if (!icon.isEmpty())
+            if (!checkable && !icon.isEmpty())
             {
                 painter.save();
                 painter.translate(area.left() + 10, area.center().y() - 7);
@@ -1113,7 +1220,7 @@ class ChatContextMenu : public QMenu
                 }
                 painter.restore();
             }
-            const auto textArea = area.adjusted(icon.isEmpty() ? 12 : 30, 0, -8, 0);
+            const auto textArea = area.adjusted(checkable || !icon.isEmpty() ? 30 : 12, 0, -8, 0);
             painter.drawText(textArea, Qt::AlignVCenter | Qt::AlignLeft,
                              fontMetrics().elidedText(action->text(), Qt::ElideRight, textArea.width()));
         }

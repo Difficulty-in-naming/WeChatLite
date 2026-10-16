@@ -2,6 +2,17 @@ use super::*;
 use tempfile::TempDir;
 
 #[test]
+fn status_exposes_actual_account_identity_without_native_authorization() {
+    let (_temp, mut engine) = setup(json!([]));
+    assert_eq!(engine.status()["self_id"], "wxid_fixture_self");
+    assert!(engine.access.allowed.is_empty());
+    assert!(engine.access.calls.is_empty());
+    engine.cycle(&[json!({"op":"configure","groups":["g"]})], 1000.1);
+    assert_eq!(engine.status()["self_id"], "wxid_fixture_self");
+    assert!(engine.access.allowed.is_empty());
+}
+
+#[test]
 fn announcement_reads_selected_group_without_authorizing_native_or_changing_message_cursors() {
     let (_temp, mut engine) = setup(json!(["g"]));
     engine.last_poll = 1000.0;
@@ -128,6 +139,9 @@ fn tuple(row: &Value) -> (i64, String, i64) {
     )
 }
 impl Backend for Fake {
+    fn self_id(&self) -> String {
+        "wxid_fixture_self".into()
+    }
     fn catalog(&mut self) -> Result<Vec<Value>> {
         let mut groups = vec![
             json!({"id":"g","name":"测试群"}),

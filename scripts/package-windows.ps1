@@ -42,9 +42,9 @@ Copy-Item -LiteralPath 'target\release\wechat-adapter.exe' -Destination $adapter
 Copy-Item -LiteralPath 'adapters\windows-rs\vendor\WeChatActions.dll' -Destination $adapter
 Copy-Item -LiteralPath 'adapters\windows-rs\vendor\WeChatQuote.dll' -Destination $adapter
 Copy-Item -LiteralPath $FFmpeg -Destination (Join-Path $adapter 'ffmpeg.exe')
-& "$QtRoot\bin\windeployqt.exe" --release --no-translations --no-opengl-sw --no-system-d3d-compiler (Join-Path $client 'wechat-lite.exe')
+& "$QtRoot\bin\windeployqt.exe" --release --no-translations --no-opengl-sw --no-system-d3d-compiler --exclude-plugins qsvgicon (Join-Path $client 'wechat-lite.exe')
 if ($LASTEXITCODE) { throw 'Client Qt deployment failed' }
-& "$QtRoot\bin\windeployqt.exe" --release --no-translations --no-opengl-sw --no-system-d3d-compiler (Join-Path $server 'wechat-server.exe')
+& "$QtRoot\bin\windeployqt.exe" --release --no-translations --no-opengl-sw --no-system-d3d-compiler --exclude-plugins qsvgicon (Join-Path $server 'wechat-server.exe')
 if ($LASTEXITCODE) { throw 'Server GUI Qt deployment failed' }
 $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
 foreach ($package in @($client, $server)) {
@@ -92,7 +92,7 @@ if (Test-Path -LiteralPath (Join-Path $client 'adapter')) { throw 'Client contai
 if (@(Get-ChildItem -LiteralPath $adapter -Force).Count -ne 4) { throw 'Server adapter runtime must have exactly four files' }
 $qtFolders = @('generic', 'imageformats', 'networkinformation', 'platforms', 'styles', 'tls')
 $runtimeFiles = @('qt.conf', 'THIRD_PARTY_NOTICES.md', '使用说明.md',
-    'Qt6Core.dll', 'Qt6Gui.dll', 'Qt6Network.dll', 'Qt6WebSockets.dll', 'Qt6Widgets.dll',
+    'Qt6Core.dll', 'Qt6Gui.dll', 'Qt6Network.dll', 'Qt6WebSockets.dll', 'Qt6Widgets.dll', 'Qt6Svg.dll',
     'concrt140.dll', 'msvcp140.dll', 'msvcp140_1.dll', 'msvcp140_2.dll',
     'msvcp140_atomic_wait.dll', 'msvcp140_codecvt_ids.dll', 'vccorlib140.dll',
     'vcruntime140.dll', 'vcruntime140_1.dll', 'vcruntime140_threads.dll')

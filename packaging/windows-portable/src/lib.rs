@@ -98,6 +98,7 @@ pub fn allowed_file(role: &str, path: &str) -> bool {
                     | "Qt6Network.dll"
                     | "Qt6WebSockets.dll"
                     | "Qt6Widgets.dll"
+                    | "Qt6Svg.dll"
                     | "concrt140.dll"
                     | "msvcp140.dll"
                     | "msvcp140_1.dll"

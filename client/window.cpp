@@ -7,6 +7,7 @@
 #include "smooth_scroll.h"
 #include "voice_player.h"
 #include <QApplication>
+#include <QActionGroup>
 #include <QClipboard>
 #include <QCloseEvent>
 #include <QComboBox>
@@ -41,6 +42,7 @@
 #include <QShowEvent>
 #include <QSplitter>
 #include <QStandardPaths>
+#include <QSvgRenderer>
 #include <QTcpServer>
 #include <QToolButton>
 #include <QUrlQuery>
@@ -227,6 +229,7 @@ Window::Window(bool demo, const QString &tunnelExecutable)
         if (quitting || QUrl(serverUrl).scheme() != "p2p")
             return;
         connected = false;
+        selfMemberId.clear();
         canSend = canDownload = false;
         ++permissionsGeneration;
         transport.configure({}, secret, pin);
@@ -249,6 +252,7 @@ Window::Window(bool demo, const QString &tunnelExecutable)
                 }
                 else
                 {
+                    selfMemberId.clear();
                     invalidateAuxiliaryWindows();
                     historyButton->setEnabled(false);
                     announcementButton->setEnabled(false);
@@ -293,6 +297,8 @@ Window::Window(bool demo, const QString &tunnelExecutable)
     connect(messages, &MessageView::latestRequested, this,
             [this]
             {
+                messages->stopScrollAnimation();
+                messages->scrollToBottom();
                 ++historyGeneration;
                 loading = false;
                 historyUpdates.clear();
@@ -493,13 +499,35 @@ void Window::makeUi()
     title->setObjectName("chatTitle");
     title->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
     headerLayout->addWidget(title, 1);
-    historyButton = button("聊天记录", "historyButton");
-    announcementButton = button("群公告", "announcementButton");
+    const auto headerIcon = [](const QString &resource)
+    {
+        QSvgRenderer svg(resource);
+        QIcon icon;
+        for (int scale : {1, 2, 3})
+        {
+            QPixmap pixmap(20 * scale, 20 * scale);
+            pixmap.fill(Qt::transparent);
+            {
+                QPainter painter(&pixmap);
+                svg.render(&painter);
+            }
+            pixmap.setDevicePixelRatio(scale);
+            icon.addPixmap(pixmap);
+        }
+        return icon;
+    };
+    historyButton = button({}, "historyButton");
+    historyButton->setAccessibleName("聊天记录");
+    historyButton->setIcon(headerIcon(":/client/icons/history.svg"));
+    announcementButton = button({}, "announcementButton");
+    announcementButton->setAccessibleName("群公告");
+    announcementButton->setIcon(headerIcon(":/client/icons/announcement.svg"));
     for (auto *entry : {historyButton, announcementButton})
     {
-        entry->setFixedHeight(26);
+        entry->setFixedSize(26, 26);
+        entry->setIconSize({20, 20});
         entry->setStyleSheet(
-            "QPushButton { background:transparent; border:0; border-radius:3px; padding:3px 6px; font-size:12px; }"
+            "QPushButton { background:transparent; border:0; border-radius:3px; padding:0; }"
             "QPushButton:hover { background:#eeeef0; }"
             "QPushButton:disabled { color:#b0b0b0; }");
         headerLayout->addWidget(entry);
@@ -1033,6 +1061,7 @@ void Window::clearConversation()
 }
 void Window::connectService()
 {
+    selfMemberId.clear();
     notificationsSynced = false;
     notificationSyncSeq = 0;
     if (chatPreferences.configure(serverUrl, secret))
@@ -1332,7 +1361,7 @@ QMenu *Window::groupContextMenuFor(const QString &id)
     auto *menu = createChatContextMenu(groups);
     menu->setObjectName("groupContextMenu");
     menu->setToolTipsVisible(false);
-    const bool pinned = chatPreferences.pinned(id), muted = chatPreferences.muted(id);
+    const bool pinned = chatPreferences.pinned(id);
     auto *pinAction = menu->addAction(pinned ? "取消置顶" : "置顶", this, [this, id, pinned, scope]
     {
         if (scope != chatPreferences.scope())
@@ -1341,15 +1370,28 @@ QMenu *Window::groupContextMenuFor(const QString &id)
         sortGroups();
     });
     pinAction->setObjectName("pinGroup");
-    auto *notifications = menu->addAction(muted ? "显示消息通知" : "忽略消息通知", this,
-        [this, id, muted, scope]
+    menu->addSeparator();
+    auto *notificationActions = new QActionGroup(menu);
+    notificationActions->setExclusive(true);
+    using Mode = ChatPreferences::NotificationMode;
+    const auto addNotificationMode = [&](const QString &text, const QString &name, Mode mode)
     {
-        if (scope != chatPreferences.scope())
-            return;
-        chatPreferences.setMuted(id, !muted);
-        sortGroups();
-    });
-    notifications->setObjectName("groupNotifications");
+        auto *action = menu->addAction(text);
+        action->setObjectName(name);
+        action->setCheckable(true);
+        action->setChecked(chatPreferences.notificationMode(id) == mode);
+        notificationActions->addAction(action);
+        connect(action, &QAction::triggered, this, [this, id, scope, mode]
+        {
+            if (scope != chatPreferences.scope())
+                return;
+            chatPreferences.setNotificationMode(id, mode);
+            sortGroups();
+        });
+    };
+    addNotificationMode("忽略通知", "groupNotificationsIgnore", Mode::Ignore);
+    addNotificationMode("仅被 @ 时通知", "groupNotificationsMentions", Mode::MentionsOnly);
+    addNotificationMode("所有新消息通知", "groupNotificationsAll", Mode::AllMessages);
     return menu;
 }
 
@@ -1379,8 +1421,8 @@ void Window::maybeNotifyMessage(const QJsonObject &event, bool firstSeen)
         event.value("seq").toInteger() <= notificationSyncSeq ||
         !event.value("created").toBool() || event.value("historical").toBool() ||
         message.value("outgoing").toBool() || message.value("status") != "received" ||
-        chatPreferences.muted(id) ||
-        (id == groupId && isVisible() && !isMinimized() && isActiveWindow()))
+        (!selfMemberId.isEmpty() && message.value("sender_id").toString() == selfMemberId) ||
+        !chatPreferences.allowsNotification(id, message.value("mentions").toArray(), selfMemberId))
         return;
     QString name;
     for (int row = 0; row < groups->count(); ++row)
@@ -1488,12 +1530,9 @@ void Window::loadHistory(bool older, int pendingAttempt)
     query.addQueryItem("group", id);
     if (older && !model->rows.isEmpty())
         query.addQueryItem("before", QString::number(model->rows.first()["seq"].toInteger()));
-    const auto anchorIndex = messages->indexAt(QPoint(1, 0));
-    const auto anchor = anchorIndex.data(Qt::UserRole).toJsonObject()["id"].toString();
-    const auto anchorOffset = messages->visualRect(anchorIndex).top();
     transport.get(
         "/api/history?" + query.toString(QUrl::FullyEncoded),
-        [this, id, older, pendingAttempt, generation, anchor, anchorOffset](const QJsonValue &value, const QString &error)
+        [this, id, older, pendingAttempt, generation](const QJsonValue &value, const QString &error)
         {
             if (id != groupId || generation != historyGeneration)
                 return;
@@ -1519,21 +1558,14 @@ void Window::loadHistory(bool older, int pendingAttempt)
                 {
                     model->prepend(entries);
                     messages->setProperty("locatedHistory", true);
-                    int row = 0;
-                    for (int i = 0; i < model->rowCount(); ++i)
-                        if (model->rows[i]["id"].toString() == anchor)
-                        {
-                            row = i;
-                            break;
-                        }
-                    messages->scrollTo(model->index(row), QAbstractItemView::PositionAtTop);
-                    messages->verticalScrollBar()->setValue(messages->verticalScrollBar()->value() -
-                                                            anchorOffset);
                 }
             }
             else
             {
-                messages->setProperty("locatedHistory", false);
+                const auto *bar = messages->verticalScrollBar();
+                const bool followLatest = model->rows.isEmpty() ||
+                    (!messages->property("locatedHistory").toBool() &&
+                     !messages->scrollAnimationActive() && bar->maximum() - bar->value() <= 2);
                 auto snapshot = entries;
                 for (const auto &update : updates)
                 {
@@ -1548,8 +1580,36 @@ void Window::loadHistory(bool older, int pendingAttempt)
                     if (!replaced)
                         snapshot.append(update);
                 }
+                if (!followLatest)
+                {
+                    // A retry/reconnect must not replace a reading window with the latest page.
+                    // Refresh existing rows and fill unused capacity, retaining every current ID.
+                    QJsonArray retained;
+                    QHash<QString, int> positions;
+                    for (const auto &message : model->rows)
+                    {
+                        positions.insert(message["id"].toString(), int(retained.size()));
+                        retained.append(message);
+                    }
+                    for (const auto &entry : snapshot)
+                    {
+                        const auto key = entry.toObject()["id"].toString();
+                        if (key.isEmpty())
+                            continue;
+                        if (positions.contains(key))
+                            retained[positions[key]] = entry;
+                        else if (retained.size() < 300)
+                        {
+                            positions.insert(key, int(retained.size()));
+                            retained.append(entry);
+                        }
+                    }
+                    snapshot = retained;
+                }
+                messages->setProperty("locatedHistory", !followLatest);
                 model->replace(snapshot);
-                messages->scrollToBottom();
+                if (followLatest)
+                    messages->scrollToBottom();
             }
             refreshReeditLinks();
             for (const auto &message : model->rows)
@@ -1597,6 +1657,11 @@ void Window::handleEvent(const QJsonObject &event)
     {
         const bool wasReady = ready;
         ready = event["ready"].toBool();
+        selfMemberId = ready ? event.value("self_id").toString() : QString();
+        if (selfMemberId.toUtf8().size() > 1024 || selfMemberId != selfMemberId.trimmed() ||
+            selfMemberId == "notify@all" || std::any_of(selfMemberId.cbegin(), selfMemberId.cend(),
+                [](QChar character) { return character.category() == QChar::Other_Control; }))
+            selfMemberId.clear();
         if (ready && !wasReady && !groupId.isEmpty())
         {
             activateCurrentGroup();
@@ -1608,6 +1673,7 @@ void Window::handleEvent(const QJsonObject &event)
     }
     else if (type == "reset")
     {
+        selfMemberId.clear();
         invalidateAuxiliaryWindows();
         notificationsSynced = false;
         notificationSyncSeq = 0;
@@ -1678,14 +1744,10 @@ void Window::handleEvent(const QJsonObject &event)
                 notify((recall == "failed" ? "撤回失败：" : "撤回结果待核对：") +
                            message["recall_error"].toString(),
                        true);
-            auto *bar = messages->verticalScrollBar();
-            bool atBottom = !messages->scrollAnimationActive() && bar->maximum() - bar->value() <= 2;
             model->upsert(message);
             if (message["status"] == "recalled")
                 model->setCanReedit(message["id"].toString(),
                                     !recallDrafts.get(message["id"].toString(), groupId).isEmpty());
-            if (atBottom && !messages->property("locatedHistory").toBool())
-                QTimer::singleShot(0, messages, &QListView::scrollToBottom);
             thumbnailTimer.start();
         }
         for (int i = 0; !historical && i < groups->count(); ++i)

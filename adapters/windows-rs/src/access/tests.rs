@@ -167,6 +167,7 @@ fn assert_blob_source(source: &[u8]) {
         .db
         .page(GROUP, &json!({"sort_seq":0,"shard":"","local_id":0}), 2)
         .unwrap();
+    assert_eq!(access.self_id(), "wxid_self");
     assert!(rows[0]["source"].is_array());
     let converted = access.convert(GROUP, &rows[0]).unwrap().unwrap();
     assert_eq!(

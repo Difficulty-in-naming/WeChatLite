@@ -2,6 +2,7 @@
 #include <QAbstractItemView>
 #include <QApplication>
 #include <QScrollBar>
+#include <QSignalBlocker>
 #include <QStyleHints>
 #include <QVariantAnimation>
 #include <QWheelEvent>
@@ -28,14 +29,14 @@ class SmoothScroll final : public QObject
         connect(view->verticalScrollBar(), &QScrollBar::valueChanged, this,
                 [this](int)
                 {
-                    if (!writing)
+                    if (!writing && !layoutChanging)
                         stop();
                 });
         connect(view->verticalScrollBar(), &QScrollBar::rangeChanged, this,
                 [this](int minimum, int maximum)
                 {
                     // Appending a message must not cancel an upward wheel gesture in progress.
-                    if (animation.state() == QAbstractAnimation::Running &&
+                    if (!layoutChanging && animation.state() == QAbstractAnimation::Running &&
                         (animation.endValue().toReal() < minimum || animation.endValue().toReal() > maximum))
                         stop();
                 });
@@ -43,6 +44,21 @@ class SmoothScroll final : public QObject
     }
     void stop() { animation.stop(); }
     bool isRunning() const { return animation.state() == QAbstractAnimation::Running; }
+    void setLayoutChanging(bool changing) { layoutChanging = changing; }
+    void offsetBy(int pixels)
+    {
+        if (!pixels || !isRunning())
+            return;
+        // Re-layout moved the document, not the user's intended remaining wheel distance.
+        const QSignalBlocker blocker(&animation);
+        const auto elapsed = animation.currentTime();
+        const auto start = animation.startValue().toReal() + pixels;
+        const auto end = animation.endValue().toReal() + pixels;
+        animation.setStartValue(start);
+        animation.setEndValue(qBound(qreal(view->verticalScrollBar()->minimum()), end,
+                                    qreal(view->verticalScrollBar()->maximum())));
+        animation.setCurrentTime(elapsed);
+    }
     std::function<void()> reachedTop, reachedBottom;
 
   protected:
@@ -95,5 +111,5 @@ class SmoothScroll final : public QObject
     }
     QAbstractItemView *view;
     QVariantAnimation animation;
-    bool writing = false, upward = false;
+    bool writing = false, upward = false, layoutChanging = false;
 };

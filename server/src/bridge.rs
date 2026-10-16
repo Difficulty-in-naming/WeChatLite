@@ -18,7 +18,8 @@ pub async fn start(app: Arc<App>, mut receiver: mpsc::Receiver<Value>) -> Result
     if app.demo {
         demo_seed(&app).await?;
         *app.forwarding.write().await = app.db(|s| s.forward_groups()).await?.unwrap_or_default();
-        app.set_status(true, "演示模式 · 未连接真实微信").await;
+        app.set_status_identity(true, "演示模式 · 未连接真实微信", "me")
+            .await;
         return Ok(tokio::spawn(async move {
             let mut permissions = app.clients_changed.subscribe();
             loop {
@@ -385,7 +386,7 @@ async fn run_stream<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                         "status"=>{
                             ready=value["ready"].as_bool().unwrap_or(false);
                             pending=true;
-                            app.set_status(ready,value["text"].as_str().unwrap_or("微信状态未知")).await;
+                            app.set_status_identity(ready,value["text"].as_str().unwrap_or("微信状态未知"),value["self_id"].as_str().unwrap_or("")).await;
                         },
                         "groups"=>{
                             let groups:Vec<Group>=serde_json::from_value(value["groups"].clone())?;
@@ -644,6 +645,40 @@ mod tests {
             .unwrap()
             .unwrap();
         serde_json::from_str(&line).unwrap()
+    }
+
+    #[tokio::test]
+    async fn adapter_status_identity_is_forwarded_bounded_and_cleared_on_disconnect_or_missing_id()
+    {
+        let temp = tempfile::tempdir().unwrap();
+        let (app, receiver) = crate::test_app(temp.path());
+        let mut events = app.events.subscribe();
+        let (task, mut output, _input) = fixture(app.clone(), receiver).await;
+        for (ready, identity, expected) in [
+            (true, json!("wxid_fixture_self"), "wxid_fixture_self"),
+            (false, json!("wxid_fixture_self"), ""),
+            (true, json!("other-real-id"), "other-real-id"),
+            (true, Value::Null, ""),
+            (true, json!(" "), ""),
+            (true, json!("bad\nidentity"), ""),
+            (true, json!("notify@all"), ""),
+            (true, json!("x".repeat(1025)), ""),
+            (true, json!(42), ""),
+        ] {
+            emit(
+                &mut output,
+                json!({"type":"status","ready":ready,"self_id":identity}),
+            )
+            .await;
+            let status = tokio::time::timeout(Duration::from_secs(1), events.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(status["self_id"], expected);
+            assert_eq!(app.status.read().await["self_id"], expected);
+        }
+        app.shutdown.send_replace(true);
+        task.await.unwrap().unwrap();
     }
 
     #[test]

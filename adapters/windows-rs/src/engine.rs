@@ -103,6 +103,9 @@ pub struct Step {
 }
 
 pub trait Backend {
+    fn self_id(&self) -> String {
+        String::new()
+    }
     fn catalog(&mut self) -> Result<Vec<Value>>;
     fn members(&mut self, group: &str) -> Result<Vec<Value>>;
     fn announcement(&mut self, _group: &str) -> Result<Value> {
@@ -874,7 +877,7 @@ impl<A: Backend> Engine<A> {
         })
     }
     pub fn status(&self) -> Value {
-        json!({"type":"status","ready":true,"text":format!("已连接本机 Windows 微信 · Rust 适配器 · 已选择 {} 个群转发",self.watched.len())})
+        json!({"type":"status","ready":true,"self_id":self.access.self_id(),"text":format!("已连接本机 Windows 微信 · Rust 适配器 · 已选择 {} 个群转发",self.watched.len())})
     }
     fn authorize(&mut self, group: &str) -> Result<()> {
         ensure!(

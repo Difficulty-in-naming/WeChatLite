@@ -29,6 +29,7 @@
 #include <QVariantAnimation>
 #include <QWheelEvent>
 #include <QtTest>
+#include <functional>
 
 class ClientTests : public QObject
 {
@@ -76,6 +77,264 @@ class ClientTests : public QObject
         QCoreApplication::setApplicationName("Client-" + QUuid::createUuid().toString(QUuid::WithoutBraces));
         QSettings::setDefaultFormat(QSettings::IniFormat);
         QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, settingsDirectory.path());
+    }
+    void delayedMediaLayoutsKeepTheReadingAnchor_data()
+    {
+        QTest::addColumn<QString>("position");
+        QTest::newRow("middle") << QString("middle");
+        QTest::newRow("near-bottom") << QString("near-bottom");
+        QTest::newRow("bottom") << QString("bottom");
+    }
+    void delayedMediaLayoutsKeepTheReadingAnchor()
+    {
+        QFETCH(QString, position);
+        QTemporaryDir directory;
+        const auto wide = directory.filePath("delayed-wide.png");
+        const auto tall = directory.filePath("delayed-tall.png");
+        QImage image(240, 35, QImage::Format_RGB32);
+        image.fill(Qt::blue);
+        QVERIFY(image.save(wide));
+        image = QImage(35, 240, QImage::Format_RGB32);
+        image.fill(Qt::green);
+        QVERIFY(image.save(tall));
+        QFile attachment(directory.filePath("delayed-file.txt"));
+        QVERIFY(attachment.open(QIODevice::WriteOnly));
+        attachment.write("offline attachment");
+        attachment.close();
+        QJsonArray history;
+        for (int i = 0; i < 45; ++i)
+        {
+            QJsonObject message{{"id", QString::number(i)}, {"seq", i + 1},
+                                {"timestamp", 1'700'000'000'000LL}, {"text", "reading position"}};
+            if (i == 3 || i == 8 || i == 9)
+                message["media"] = QJsonArray{QJsonObject{{"id", "media-" + QString::number(i)},
+                                                        {"kind", i == 9 ? "file" : "image"}}};
+            history.append(message);
+        }
+        MessageModel model;
+        model.replace(history);
+        MessageView view;
+        view.resize(620, 320);
+        view.setModel(&model);
+        view.show();
+        auto *bar = view.verticalScrollBar();
+        QTRY_VERIFY(bar->maximum() > 2000);
+        if (position == "middle")
+        {
+            view.scrollTo(model.index(20), QAbstractItemView::PositionAtTop);
+            bar->setValue(bar->value() + 17);
+        }
+        else
+            bar->setValue(bar->maximum() - (position == "near-bottom" ? 7 : 0));
+        QTest::qWait(20);
+        const QPersistentModelIndex anchor(view.indexAt(QPoint(1, 0)));
+        QVERIFY(anchor.isValid());
+        const auto offset = view.visualRect(anchor).top();
+        const auto initialMaximum = bar->maximum();
+        QStringList jumps;
+        class PaintWitness final : public QObject
+        {
+          public:
+            std::function<void()> observe;
+            bool eventFilter(QObject *object, QEvent *event) override
+            {
+                if (event->type() == QEvent::Paint)
+                    observe();
+                return QObject::eventFilter(object, event);
+            }
+        } witness;
+        witness.observe = [&]
+        {
+            const auto actual = view.visualRect(anchor).top();
+            if ((position == "bottom" && bar->value() != bar->maximum()) ||
+                (position != "bottom" && actual != offset))
+                jumps.append(QString("offset=%1 expected=%2 value=%3 maximum=%4")
+                                 .arg(actual).arg(offset).arg(bar->value()).arg(bar->maximum()));
+        };
+        view.viewport()->installEventFilter(&witness);
+        QTimer::singleShot(15, &model, [&] { model.setLocalMedia("media-3", wide); });
+        QTimer::singleShot(50, &model, [&] { model.setLocalMedia("media-8", tall); });
+        QTimer::singleShot(85, &model, [&] { model.setLocalMedia("media-9", attachment.fileName()); });
+        QTest::qWait(140);
+        QVERIFY(bar->maximum() != initialMaximum); // Real headers changed row heights; no placeholder-only test.
+        model.upsert({{"id", "new-message"}, {"seq", 100}, {"timestamp", 1'700'000'000'100LL},
+                      {"text", "new message while media arrives"}});
+        QTest::qWait(30);
+        QVERIFY2(jumps.isEmpty(), qPrintable(jumps.join(';')));
+        if (position == "bottom")
+            QCOMPARE(bar->value(), bar->maximum());
+        else
+        {
+            QCOMPARE(view.visualRect(anchor).top(), offset);
+            QVERIFY(bar->value() < bar->maximum());
+        }
+    }
+    void mediaLayoutKeepsScrollBarVisibilityAndSubsequentPixelScrolling()
+    {
+        QTemporaryDir directory;
+        const auto tall = directory.filePath("scrollbar-tall.png");
+        const auto wide = directory.filePath("scrollbar-wide.png");
+        QImage image(35, 240, QImage::Format_RGB32);
+        for (int y = 0; y < image.height(); ++y)
+            for (int x = 0; x < image.width(); ++x)
+                image.setPixelColor(x, y, QColor(y, 80, 170));
+        QVERIFY(image.save(tall));
+        image = QImage(240, 35, QImage::Format_RGB32);
+        image.fill(Qt::blue);
+        QVERIFY(image.save(wide));
+        MessageModel model;
+        model.replace({QJsonObject{{"id", "only"}, {"timestamp", 1'700'000'000'000LL},
+                                   {"media", QJsonArray{QJsonObject{{"id", "resized"}, {"kind", "image"}}}}}});
+        class ScrollWitness final : public MessageView
+        {
+          public:
+            QList<int> deltas;
+          protected:
+            void scrollContentsBy(int dx, int dy) override
+            {
+                deltas.append(dy);
+                MessageView::scrollContentsBy(dx, dy);
+            }
+        } view;
+        view.resize(620, 250);
+        view.setModel(&model);
+        view.show();
+        auto *bar = view.verticalScrollBar();
+        QTRY_COMPARE(bar->maximum(), 0);
+        QVERIFY(!bar->isVisible());
+        model.setLocalMedia("resized", tall);
+        QTRY_VERIFY(bar->maximum() > 1);
+        QTRY_VERIFY_WITH_TIMEOUT(bar->isVisible(), 500);
+        QCOMPARE(bar->value(), bar->maximum());
+        QTest::qWait(20);
+        const auto before = view.viewport()->grab().toImage();
+        const auto previous = bar->value();
+        view.deltas.clear();
+        bar->setValue(previous - 1);
+        QTest::qWait(20);
+        QCOMPARE(bar->value(), previous - 1);
+        QCOMPARE(view.deltas, QList<int>{1});
+        const auto after = view.viewport()->grab().toImage();
+        // A one-pixel upward scroll moves the actual painted image down by exactly one pixel.
+        const auto scale = view.devicePixelRatioF();
+        const QPoint sample(qRound(85 * scale), qRound(110 * scale));
+        QCOMPARE(after.pixelColor(sample + QPoint(0, qRound(scale))), before.pixelColor(sample));
+        model.setLocalMedia("resized", wide);
+        QTRY_COMPARE(bar->maximum(), 0);
+        QTRY_VERIFY_WITH_TIMEOUT(!bar->isVisible(), 500);
+        QCOMPARE(bar->value(), 0);
+    }
+    void mediaLayoutMovesTheWheelAnimationWithItsReadingAnchor()
+    {
+        QTemporaryDir directory;
+        const auto path = directory.filePath("animated-layout.png");
+        QImage image(35, 240, QImage::Format_RGB32);
+        image.fill(Qt::blue);
+        QVERIFY(image.save(path));
+        MessageModel model;
+        QJsonArray history;
+        for (int i = 0; i < 70; ++i)
+        {
+            QJsonObject message{{"id", QString::number(i)}, {"seq", i + 1}, {"text", "history"}};
+            if (i == 3)
+                message["media"] = QJsonArray{QJsonObject{{"id", "wheel-image"}, {"kind", "image"}}};
+            history.append(message);
+        }
+        model.replace(history);
+        MessageView view;
+        view.resize(620, 320);
+        view.setModel(&model);
+        view.show();
+        auto *bar = view.verticalScrollBar();
+        QTRY_VERIFY(bar->maximum() > 2000);
+        view.scrollTo(model.index(30), QAbstractItemView::PositionAtTop);
+        auto *animation = view.findChild<QVariantAnimation *>("smoothScrollAnimation");
+        QVERIFY(animation);
+        QWheelEvent wheel(QPointF(20, 20), view.viewport()->mapToGlobal(QPoint(20, 20)), {},
+                          QPoint(0, 120), Qt::NoButton, Qt::NoModifier, Qt::NoScrollPhase, false);
+        QApplication::sendEvent(view.viewport(), &wheel);
+        animation->setCurrentTime(40);
+        QCOMPARE(animation->state(), QAbstractAnimation::Running);
+        const auto start = animation->startValue().toReal(), target = animation->endValue().toReal();
+        const auto originalValue = bar->value(), originalMaximum = bar->maximum();
+        const QPersistentModelIndex anchor(view.indexAt(QPoint(1, 0)));
+        const auto offset = view.visualRect(anchor).top();
+        model.setLocalMedia("wheel-image", path);
+        view.doItemsLayout();
+        const auto documentShift = bar->maximum() - originalMaximum;
+        QVERIFY(documentShift > 0);
+        QCOMPARE(bar->value(), originalValue + documentShift);
+        QCOMPARE(view.visualRect(anchor).top(), offset);
+        QCOMPARE(animation->currentTime(), 40);
+        QCOMPARE(animation->state(), QAbstractAnimation::Running);
+        QCOMPARE(animation->endValue().toReal(), target + documentShift);
+        animation->setCurrentTime(80);
+        QCOMPARE(bar->value(), qRound(start + documentShift + (target - start) * .875));
+        QVERIFY(bar->value() < originalValue + documentShift);
+        bar->setValue(bar->value() + 23);
+        const auto manualValue = bar->value();
+        QCOMPARE(animation->state(), QAbstractAnimation::Stopped);
+        QTest::qWait(180);
+        QCOMPARE(bar->value(), manualValue);
+        const auto wide = directory.filePath("second-delayed-image.png");
+        image = QImage(240, 35, QImage::Format_RGB32);
+        image.fill(Qt::green);
+        QVERIFY(image.save(wide));
+        const QPersistentModelIndex manualAnchor(view.indexAt(QPoint(1, 0)));
+        const auto manualOffset = view.visualRect(manualAnchor).top();
+        model.setLocalMedia("wheel-image", wide);
+        bar->setValue(bar->value() - 37); // A gesture between dataChanged and Qt's queued layout wins.
+        view.doItemsLayout();
+        QCOMPARE(view.visualRect(manualAnchor).top(), manualOffset + 37);
+    }
+    void upwardGestureBeforeQueuedLayoutDoesNotFollowNewMessagesToTheBottom()
+    {
+        MessageModel model;
+        QJsonArray history;
+        for (int i = 0; i < 60; ++i)
+            history.append(QJsonObject{{"id", QString::number(i)}, {"seq", i + 1}, {"text", "history"}});
+        model.replace(history);
+        MessageView view;
+        view.resize(620, 320);
+        view.setModel(&model);
+        view.show();
+        auto *bar = view.verticalScrollBar();
+        QTRY_VERIFY(bar->maximum() > 2000);
+        view.scrollToBottom();
+        const auto original = bar->value();
+        model.upsert({{"id", "new"}, {"seq", 100}, {"text", QString("new message ").repeated(40)}});
+        QWheelEvent wheel(QPointF(20, 20), view.viewport()->mapToGlobal(QPoint(20, 20)), {},
+                          QPoint(0, 120), Qt::NoButton, Qt::NoModifier, Qt::NoScrollPhase, false);
+        QApplication::sendEvent(view.viewport(), &wheel);
+        view.doItemsLayout();
+        QCOMPARE(bar->value(), original);
+        QVERIFY(bar->value() < bar->maximum());
+        QVERIFY(view.scrollAnimationActive());
+    }
+    void prependingHistoryKeepsTheAnchorAtTheTimeOfTheModelUpdate()
+    {
+        MessageModel model;
+        QJsonArray history;
+        for (int i = 0; i < 70; ++i)
+            history.append(QJsonObject{{"id", QString::number(i)}, {"seq", i + 1},
+                                       {"timestamp", 1'700'000'000'000LL + i}, {"text", "history"}});
+        model.replace(history);
+        MessageView view;
+        view.resize(620, 320);
+        view.setModel(&model);
+        view.show();
+        auto *bar = view.verticalScrollBar();
+        QTRY_VERIFY(bar->maximum() > 2000);
+        view.scrollTo(model.index(30), QAbstractItemView::PositionAtTop);
+        bar->setValue(bar->value() + 13);
+        const auto anchor = view.indexAt(QPoint(1, 0)).data(Qt::UserRole).toJsonObject()["id"].toString();
+        const auto offset = view.visualRect(view.indexAt(QPoint(1, 0))).top();
+        model.prepend({QJsonObject{{"id", "older"}, {"timestamp", 1'600'000'000'000LL},
+                                  {"text", QString("older content ").repeated(60)}}});
+        view.doItemsLayout();
+        const auto current = view.indexAt(QPoint(1, 0));
+        QCOMPARE(current.data(Qt::UserRole).toJsonObject()["id"].toString(), anchor);
+        QCOMPARE(view.visualRect(current).top(), offset);
     }
     void wheelScrollingEasesAccumulatesAndRespectsManualMovement()
     {

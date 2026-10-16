@@ -262,7 +262,20 @@ impl App {
         let _ = self.events.send(web::public(value));
     }
     async fn set_status(&self, ready: bool, text: &str) {
-        let status = json!({"type":"status", "ready":ready, "text":text, "demo":self.demo});
+        self.set_status_identity(ready, text, "").await;
+    }
+    async fn set_status_identity(&self, ready: bool, text: &str, identity: &str) {
+        let identity = if ready
+            && identity.len() <= 1024
+            && identity.trim() == identity
+            && !identity.chars().any(char::is_control)
+            && identity != "notify@all"
+        {
+            identity
+        } else {
+            ""
+        };
+        let status = json!({"type":"status", "ready":ready, "text":text, "demo":self.demo,"self_id":identity});
         *self.status.write().await = status.clone();
         self.publish(status);
     }

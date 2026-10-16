@@ -9,7 +9,7 @@ are included in distributable packages.
 
 | Component | License and retained source / notices |
 | --- | --- |
-| Qt 6.8.3 dynamic Widgets, Network and WebSockets libraries | Module and bundled-code terms vary; [Qt licensing](https://doc.qt.io/qt-6/licensing.html), [matching source archive](https://download.qt.io/archive/qt/6.8/6.8.3/). The application links Qt dynamically. |
+| Qt 6.8.3 dynamic Widgets, Network, WebSockets and SVG libraries | Module and bundled-code terms vary; [Qt licensing](https://doc.qt.io/qt-6/licensing.html), [matching source archive](https://download.qt.io/archive/qt/6.8/6.8.3/). The application links Qt dynamically. |
 | Rust relay/adapter dependencies | Exact versions/checksums are in `Cargo.lock`; each crate retains its license. This includes SQLite, image codecs and cryptography/networking dependencies. |
 | iroh / iroh-relay 1.3.0 and noq QUIC transport | MIT OR Apache-2.0, with retained BSD-3-Clause portions; [upstream](https://github.com/n0-computer/iroh/tree/v1.3.0). Matching notices are in `network/licenses` and package `licenses/`. Used by the Rust relay and `wechat-link` client helper; the separately deployed public relay is the pinned official Linux release. Dependencies and source checksums are retained in `Cargo.lock`. |
 | Local database/media algorithms ported from wechatauto-replica 1.2.6 | Apache-2.0, [upstream source](https://github.com/fanyuantaier/wechatauto-replica); original notice in `adapters/windows-rs/vendor/WechatAuto-LICENSE.txt` and package `licenses/WechatAuto-Apache-2.0.txt`. |

@@ -1,0 +1,6 @@
+<RCC>
+  <qresource prefix="/client/icons">
+    <file alias="history.svg">icons/history.svg</file>
+    <file alias="announcement.svg">icons/announcement.svg</file>
+  </qresource>
+</RCC>
