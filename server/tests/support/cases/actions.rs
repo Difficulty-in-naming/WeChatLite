@@ -174,28 +174,108 @@ pub async fn pending_recall_survives_restart_as_check_and_never_reissues_action(
 pub async fn failed_or_uncertain_confirmation_preserves_body_and_does_not_retry() -> Result<()> {
     let relay = Relay::new("forwarding").await?;
     relay.api.select(&["fixture-a"]).await?;
-    for status in ["failed", "uncertain"] {
-        let original = relay
-            .confirmed(
-                if status == "failed" {
-                    "recall fail"
-                } else {
-                    "recall uncertain"
-                },
-                json!({}),
-            )
-            .await?;
+    for (status, text) in [
+        ("failed", "recall fail"),
+        ("uncertain", "recall uncertain"),
+        ("uncertain", "recall uncertain forged proof"),
+    ] {
+        let original = relay.confirmed(text, json!({})).await?;
         let id = original["id"].as_str().unwrap();
         let endpoint = format!("/api/messages/{id}/recall");
         relay.api.post(&endpoint, json!({})).await?;
         eventually(|| async { Ok(relay.stored(id)?.filter(|v| v["recall_status"] == status)) })
             .await?;
         assert_eq!(relay.stored(id)?.unwrap()["text"], original["text"]);
+        assert_eq!(relay.stored(id)?.unwrap()["recall_retryable"], false);
         assert_eq!(
-            relay.api.post(&endpoint, json!({})).await?["recall_status"],
+            relay.api.post(&endpoint, json!({"explicit_retry":true,"recall_retryable":true,"definite_not_submitted":true})).await?["recall_status"],
             status
         );
     }
-    assert_eq!(relay.commands("recall")?.len(), 2);
+    assert_eq!(relay.commands("recall")?.len(), 3);
+    Ok(())
+}
+
+pub async fn only_proven_unsubmitted_recall_can_be_explicitly_retried_with_fresh_authorization()
+-> Result<()> {
+    let mut relay = Relay::new("forwarding").await?;
+    relay.api.select(&["fixture-a"]).await?;
+    let original = relay
+        .confirmed("recall unsubmitted first", json!({}))
+        .await?;
+    let id = original["id"].as_str().unwrap();
+    let endpoint = format!("/api/messages/{id}/recall");
+    relay.api.post(&endpoint, json!({})).await?;
+    eventually(|| async {
+        Ok(relay
+            .stored(id)?
+            .filter(|row| row["recall_status"] == "failed"))
+    })
+    .await?;
+    assert_eq!(relay.stored(id)?.unwrap()["recall_retryable"], true);
+    relay.stop().await?;
+    relay.start().await?;
+    assert_eq!(relay.commands("recall")?.len(), 1);
+    assert!(relay.commands("recall_check")?.is_empty());
+    let key = relay
+        .api
+        .key(json!({"groups":["fixture-a"],"can_send":false}))
+        .await?;
+    relay
+        .api
+        .deny(
+            &endpoint,
+            Some(json!({"explicit_retry":true})),
+            key["token"].as_str(),
+            403,
+        )
+        .await?;
+    relay.api.select(&[]).await?;
+    relay
+        .api
+        .deny(&endpoint, Some(json!({})), None, 403)
+        .await?;
+    relay.api.select(&["fixture-a"]).await?;
+    relay.change(id, json!({"outgoing":false}))?;
+    relay
+        .api
+        .deny(&endpoint, Some(json!({})), None, 400)
+        .await?;
+    relay.change(id, json!({"outgoing":true,"timestamp":now()-181000}))?;
+    relay
+        .api
+        .deny(&endpoint, Some(json!({})), None, 400)
+        .await?;
+    relay.change(
+        id,
+        json!({"timestamp":original["timestamp"],"source_id":"","source_ids":[]}),
+    )?;
+    relay
+        .api
+        .deny(&endpoint, Some(json!({})), None, 400)
+        .await?;
+    assert_eq!(relay.commands("recall")?.len(), 1);
+    relay.change(
+        id,
+        json!({"source_id":original["source_id"],"source_ids":original["source_ids"]}),
+    )?;
+    assert_eq!(
+        relay.api.post(&endpoint, json!({})).await?["recall_status"],
+        "pending"
+    );
+    assert_eq!(
+        relay.state(id, "recalled").await?["recall_retryable"],
+        false
+    );
+    let commands = relay.commands("recall")?;
+    assert_eq!(commands.len(), 2);
+    assert_eq!(commands[1]["explicit_retry"], true);
+    assert_eq!(commands[0]["recall_attempt"].as_str().unwrap().len(), 32);
+    assert_ne!(commands[0]["recall_attempt"], commands[1]["recall_attempt"]);
+    assert_eq!(
+        commands[1]["recall_attempt"],
+        commands[1]["message"]["recall_attempt"]
+    );
+    assert_eq!(commands[1]["message"]["recall_retryable"], false);
     Ok(())
 }

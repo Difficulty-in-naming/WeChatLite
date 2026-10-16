@@ -364,13 +364,14 @@ fn material(path: &std::path::Path) -> Option<[u8; 32]> {
     None
 }
 
-fn configs_from_module(
-    process: &Process,
-    (base, size, path): (usize, usize, PathBuf),
-) -> Vec<([u8; 32], u32, String)> {
-    let Some(material) = material(&path) else {
-        return Vec::new();
-    };
+struct ConfigRoot {
+    landmark: usize,
+    slot: usize,
+    root: u64,
+    config: u64,
+}
+
+fn config_roots(process: &Process, base: usize, size: usize) -> Vec<ConfigRoot> {
     let mut result = Vec::new();
     for landmark in process.find(
         &[b"global_config".to_vec()],
@@ -383,43 +384,135 @@ fn configs_from_module(
             continue;
         }
         for back in [0x138, 0x130] {
-            let Some(root) = landmark
+            let Some(slot) = landmark
                 .checked_add(16)
-                .and_then(|v| v.checked_sub(back))
-                .and_then(|a| process.number(a))
-                .filter(|v| pointer(*v))
+                .and_then(|value| value.checked_sub(back))
+                .filter(|value| *value >= base && *value < base.saturating_add(size))
             else {
                 continue;
             };
-            let Some(config) = process.number(root as usize + 0x68).filter(|v| pointer(*v)) else {
+            let Some(root) = process.number(slot).filter(|value| pointer(*value)) else {
                 continue;
             };
-            let Some(cipher) = process
-                .string(config as usize + 0x2b8)
-                .filter(|v| v.len() == 32)
+            let Some(config) = process
+                .number(root as usize + 0x68)
+                .filter(|value| pointer(*value))
             else {
                 continue;
             };
-            let Some(wxid) = process
-                .string(config as usize + 0x48)
-                .and_then(|v| String::from_utf8(v).ok())
-                .filter(|v| !v.is_empty() && v.len() < 128)
-            else {
-                continue;
-            };
-            let Some(dword) = process
-                .read(config as usize + 0x40, 4)
-                .and_then(|v| v.try_into().ok())
-                .map(u32::from_le_bytes)
-            else {
-                continue;
-            };
-            let mut master = [0; 32];
-            for index in 0..32 {
-                master[index] = cipher[index] ^ material[index];
-            }
-            result.push((master, dword, wxid));
+            result.push(ConfigRoot {
+                landmark,
+                slot,
+                root,
+                config,
+            });
         }
+    }
+    result
+}
+
+fn config_account(process: &Process, root: &ConfigRoot) -> Option<String> {
+    let layout = process.read(root.landmark, 32)?;
+    if layout.get(..13)? != b"global_config"
+        || u64_at(&layout, 16) != Some(13)
+        || u64_at(&layout, 24) != Some(15)
+        || process.number(root.slot) != Some(root.root)
+        || process.number(root.root as usize + 0x68) != Some(root.config)
+    {
+        return None;
+    }
+    let object = process.read(root.config as usize + 0x48, 32)?;
+    let length = u64_at(&object, 16)? as usize;
+    let capacity = u64_at(&object, 24)?;
+    if length == 0 || length >= 128 || capacity < length as u64 {
+        return None;
+    }
+    let bytes = if capacity <= 15 {
+        object.get(..length)?.to_vec()
+    } else {
+        process.read(u64_at(&object, 0)? as usize, length)?
+    };
+    let value = String::from_utf8(bytes).ok()?;
+    (value.len() == length
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_-".contains(&byte))
+        && process.number(root.slot) == Some(root.root)
+        && process.number(root.root as usize + 0x68) == Some(root.config))
+    .then_some(value)
+}
+
+pub struct UiAccountSnapshot {
+    pub accounts: Vec<String>,
+    pub roots: Vec<serde_json::Value>,
+}
+
+pub fn current_account(pid: u32, expected_base: usize) -> Result<UiAccountSnapshot> {
+    let (base, size, _) = module(pid).ok_or_else(|| anyhow::anyhow!("无法读取微信主模块"))?;
+    ensure!(base == expected_base, "微信主模块已变化，撤回未提交");
+    let process = Process::open(pid)?;
+    let profiles: Vec<_> = config_roots(&process, base, size)
+        .into_iter()
+        .filter_map(|root| config_account(&process, &root).map(|account| (root, account)))
+        .collect();
+    ensure!(
+        (1..=16).contains(&profiles.len()),
+        "微信当前账号资料无法唯一校验"
+    );
+    let mut accounts = Vec::new();
+    let mut roots = Vec::new();
+    for (root, account) in profiles {
+        ensure!(
+            config_account(&process, &root).as_ref() == Some(&account),
+            "微信当前账号在读取期间变化，撤回未提交"
+        );
+        accounts.push(account);
+        roots.push(
+            serde_json::json!({"landmark":root.landmark,"root_slot":root.slot,
+            "root":root.root,"config":root.config}),
+        );
+    }
+    ensure!(
+        module(pid).is_some_and(|(current, _, _)| current == base),
+        "微信主进程已变化"
+    );
+    Ok(UiAccountSnapshot { accounts, roots })
+}
+
+fn configs_from_module(
+    process: &Process,
+    (base, size, path): (usize, usize, PathBuf),
+) -> Vec<([u8; 32], u32, String)> {
+    let Some(material) = material(&path) else {
+        return Vec::new();
+    };
+    let mut result = Vec::new();
+    for ConfigRoot { config, .. } in config_roots(process, base, size) {
+        let Some(cipher) = process
+            .string(config as usize + 0x2b8)
+            .filter(|v| v.len() == 32)
+        else {
+            continue;
+        };
+        let Some(wxid) = process
+            .string(config as usize + 0x48)
+            .and_then(|v| String::from_utf8(v).ok())
+            .filter(|v| !v.is_empty() && v.len() < 128)
+        else {
+            continue;
+        };
+        let Some(dword) = process
+            .read(config as usize + 0x40, 4)
+            .and_then(|v| v.try_into().ok())
+            .map(u32::from_le_bytes)
+        else {
+            continue;
+        };
+        let mut master = [0; 32];
+        for index in 0..32 {
+            master[index] = cipher[index] ^ material[index];
+        }
+        result.push((master, dword, wxid));
     }
     result
 }

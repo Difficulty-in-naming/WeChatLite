@@ -2,6 +2,7 @@
 // No keyboard, clipboard, window interaction, remote host or background sends.
 #include <windows.h>
 #include <bcrypt.h>
+#include <intrin.h>
 #pragma comment(lib, "bcrypt.lib")
 #include <algorithm>
 #include <array>
@@ -38,7 +39,7 @@ constexpr std::time_t kWindow = 180;
 constexpr size_t kMaxRecords = 32, kMaxAttempts = 1024;
 constexpr uintptr_t kCopy = 0x1A5B50, kDestroy = 0x1AEE40;
 constexpr uintptr_t kAlloc = 0x74AB89C, kFree = 0x74AB8E0;
-constexpr uintptr_t kQueue = 0x19DA130, kExecute = 0x19DA5B0, kWork = 0x2315AF0;
+constexpr uintptr_t kExecute = 0x19DA5B0, kWork = 0x2315AF0;
 uintptr_t base = 0;
 HMODULE module = nullptr;
 std::filesystem::path configPath;
@@ -50,9 +51,6 @@ bool stopped = true;
 bool hooksReady = false;
 std::atomic<uint64_t> observed{0};
 std::atomic<bool> maintain{true};
-#ifdef ACTION_SELFTEST
-bool queueFailureForTest = false;
-#endif
 thread_local bool copying = false;
 std::map<RecordKey, void*> records;
 
@@ -122,6 +120,18 @@ constexpr HookProfile kProfiles[] = {
         {0x40,0x53,0x48,0x83,0xEC,0x20,0x48,0x8B,0xD9,0x48,0x83,0xC1,0x08,0xE8,0x8E,0x3E}},
     {kWork, "work", {0x55,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54}, 0x45990,
         {0x48,0x89,0x5C,0x24,0x08,0x48,0x89,0x6C,0x24,0x10,0x56,0x57,0x41,0x56,0x48,0x83}},
+};
+// Exact previously shipped Actions build. Only these independently verified
+// callback entries can remain beneath a new observation hook during upgrade.
+constexpr char kPreviousActionsHash[] = "8be08c6e44f9af86d6fde188a255060bbe53411c5b3c1ab9fab8c8ce0d21a974";
+constexpr wchar_t kPreviousActionsName[] = L"WeChatLocal_8be08c6e44f9af86.dll";
+constexpr HookProfile kPreviousActionsProfiles[] = {
+    {kCopy, "copy", kProfiles[0].original, 0x28600,
+        {0x48,0x89,0x5C,0x24,0x08,0x57,0x48,0x83,0xEC,0x20,0x48,0x8B,0xF9,0x48,0x8B,0x05}},
+    {kExecute, "execute", kProfiles[1].original, 0x2C170,
+        {0x48,0x89,0x5C,0x24,0x10,0x48,0x89,0x74,0x24,0x18,0x57,0x41,0x54,0x41,0x55,0x41}},
+    {kWork, "work", kProfiles[2].original, 0x42480,
+        {0x40,0x53,0x56,0x57,0x41,0x54,0x41,0x55,0x41,0x56,0x41,0x57,0x48,0x81,0xEC,0xA0}},
 };
 bool executableReadable(uintptr_t address, size_t size) {
     if (!address || address > std::numeric_limits<uintptr_t>::max() - size) return false;
@@ -203,8 +213,14 @@ std::string fileSha256(const std::filesystem::path& path) {
 }
 bool legacyIdentityMatches(const HookProfile& profile, const std::wstring& name, const std::string& hash,
     uintptr_t rva, const unsigned char* prefix) {
-    return _wcsicmp(name.c_str(), kLegacyName) == 0 && hash == kLegacyHash &&
-        rva == profile.legacyTargetRva && !std::memcmp(prefix, profile.legacyTargetPrefix.data(), profile.legacyTargetPrefix.size());
+    if (_wcsicmp(name.c_str(), kLegacyName) == 0 && hash == kLegacyHash &&
+        rva == profile.legacyTargetRva && !std::memcmp(prefix, profile.legacyTargetPrefix.data(), profile.legacyTargetPrefix.size())) return true;
+    if (_wcsicmp(name.c_str(), kPreviousActionsName) != 0 || hash != kPreviousActionsHash) return false;
+    for (const auto& previous : kPreviousActionsProfiles) {
+        if (profile.rva == previous.rva && rva == previous.legacyTargetRva &&
+            !std::memcmp(prefix, previous.legacyTargetPrefix.data(), previous.legacyTargetPrefix.size())) return true;
+    }
+    return false;
 }
 void validateLegacyTarget(uintptr_t target, const HookProfile& profile) {
     MEMORY_BASIC_INFORMATION memory{}; HMODULE owner = nullptr;
@@ -257,6 +273,21 @@ RecordKey recordKey(const void* record) {
 }
 uint32_t stamp(const void* record) { return *reinterpret_cast<const uint32_t*>(static_cast<const char*>(record) + 0xD0); }
 uint32_t localId(const void* record) { return *reinterpret_cast<const uint32_t*>(static_cast<const char*>(record) + 0x94); }
+bool hasOwnedDatabaseRecord(const void* record) {
+    if (!readable(record, kRecordSize)) return false;
+    // A58DD0 calls the DB object's clone vtable entry at +20, then transfers its
+    // shared payload/control pair to Record+2C0/+2C8 (A59C5D..A59C81).
+    const auto* bytes = static_cast<const char*>(record);
+    const auto* payload = *reinterpret_cast<void* const*>(bytes + 0x2C0);
+    const auto* owner = *reinterpret_cast<void* const*>(bytes + 0x2C8);
+    return readable(payload, sizeof(uintptr_t)) && readable(owner, 16) &&
+        *reinterpret_cast<const volatile LONG*>(static_cast<const char*>(owner) + 8) > 0;
+}
+bool observableCopyOrigin(uintptr_t caller) {
+    // The reference factory's helper directly copy-constructs its synthetic
+    // source at 24EB6F3. Never replace a real UI/DB record with that source.
+    return !base || caller != base + 0x24EB6F8;
+}
 void release(void* record) {
 #ifdef ACTION_SELFTEST
     delete[] static_cast<unsigned char*>(record);
@@ -348,9 +379,10 @@ void validateRecord(const void* record, const RecordKey& expected, uint32_t time
         throw Rejected("only current account messages in a selected group may be recalled");
     if (!validAge(stamp(record), now)) throw Rejected("outside three minute window or unconfirmed message");
     if (stamp(record) != time || localId(record) != local) throw Rejected("native message locator mismatch");
+    if (!hasOwnedDatabaseRecord(record)) throw Rejected("请在服务端原版微信打开该群后重试");
 }
-void observe(const void* record) {
-    if (!enabled || copying || !readable(record, kRecordSize)) return;
+void observe(const void* record, uintptr_t caller = 0) {
+    if (!enabled || copying || !observableCopyOrigin(caller) || !hasOwnedDatabaseRecord(record)) return;
     const auto key = recordKey(record);
     if (key.first.empty() || !key.second) return;
     std::unique_lock lock(recordsMutex, std::try_to_lock);
@@ -364,8 +396,9 @@ void observe(const void* record) {
     records[key] = saved; ++observed;
 }
 void* copied(void* destination, const void* source) {
+    const auto caller = reinterpret_cast<uintptr_t>(_ReturnAddress());
     auto result = copy(destination, source);
-    try { observe(destination); } catch (...) { /* Optional observation cannot affect WeChat. */ }
+    try { observe(destination, caller); } catch (...) { /* Optional observation cannot affect WeChat. */ }
     return result;
 }
 uintptr_t executing(void* task) {
@@ -392,64 +425,24 @@ uintptr_t working(void* service, void* output, void* vector) {
     return result;
 }
 struct Request { RecordKey record; uint32_t time, local; std::string id; };
-Request parseRequest(const json& body) {
+Request parseRequest(const json& body, bool requestId = true) {
     const auto group = body.at("group").get<std::string>();
     const auto server = body.at("server_id").get<std::string>();
-    const auto id = body.at("request_id").get<std::string>();
-    if (!isHex(id) || !std::regex_match(group, std::regex("[0-9]{5,24}@chatroom")) ||
+    const auto id = requestId ? body.at("request_id").get<std::string>() : std::string();
+    if ((requestId && !isHex(id)) || !std::regex_match(group, std::regex("[0-9]{5,24}@chatroom")) ||
         !std::regex_match(server, std::regex("[1-9][0-9]{0,19}"))) throw Rejected("invalid recall request identifier");
     const auto time = body.at("create_time").get<uint64_t>(), local = body.at("local_id").get<uint64_t>();
     if (!body.at("create_time").is_number_integer() || !body.at("local_id").is_number_integer() ||
-        time > UINT32_MAX || !local || local > UINT32_MAX) throw Rejected("invalid recall message locator");
+        !time || time > UINT32_MAX || !local || local > UINT32_MAX) throw Rejected("invalid recall message locator");
     uint64_t number = 0;
     try { number = std::stoull(server); } catch (...) { throw Rejected("invalid server identifier"); }
     return {{group, number}, static_cast<uint32_t>(time), static_cast<uint32_t>(local), id};
 }
-json receipt(const Request& request) {
-    return {{"status", "queued"}, {"server_id", std::to_string(request.record.second)}, {"request_id", request.id}};
-}
-// Call while holding recordsMutex; inserting a receipt precedes the first native queue call.
-bool reserve(const Request& request) {
-    if (!enabled || !allowed.contains(request.record.first)) throw Rejected("recall disabled or group not selected");
-    std::lock_guard lock(attemptsMutex);
-    if (auto found = attempts.find(request.id); found != attempts.end()) {
-        const auto& old = found->second;
-        if (old.record != request.record || old.time != request.time || old.local != request.local)
-            throw Rejected("request_id reused with different message locator");
-        return false;
-    }
-    if (submitted.contains(request.record)) throw Rejected("message already submitted; automatic resubmission forbidden");
-    if (attempts.size() >= kMaxAttempts) throw Rejected("recall receipt cache full; request not submitted");
-    auto found = records.find(request.record);
-    if (found == records.end()) throw Rejected("complete native record unavailable; open the selected group first; no request submitted");
-    validateRecord(found->second, request.record, request.time, request.local, std::time(nullptr));
-    attempts.emplace(request.id, Attempt{request.record, request.time, request.local});
-    submitted.emplace(request.record, request.id);
-    return true;
-}
 json recall(const Request& request) {
-    refreshSetting();
-    std::lock_guard lock(recordsMutex);
-    if (!reserve(request)) return receipt(request);
-    auto found = records.find(request.record); auto record = static_cast<char*>(found->second);
-#ifdef ACTION_SELFTEST
-    if (queueFailureForTest) throw std::runtime_error("simulated queue outcome unknown");
-#else
-    alignas(8) unsigned char task[0x450]{};
-    *reinterpret_cast<uintptr_t*>(task) = base + 0x91137A8;
-    struct Guard { bool previous=copying; Guard() { copying = true; } ~Guard() { copying = previous; } };
-    { Guard guard; copy(task + 8, record); }
-    task[0x448] = 1;
-    std::function<void()> done, error, phase;
-    Shared empty; Options options;
-    native<void*(*)(Options*, void*, void*, void*, Shared*, uint64_t)>(0xF910)
-        (&options, &done, &error, &phase, &empty, 0);
-    // A queue or subsequent transport failure remains an attempted action. Never erase its receipt.
-    native<void(*)(void*, Options*)>(kQueue)(task, &options);
-    native<void(*)(void*)>(kDestroy)(task + 8);
-#endif
-    release(record); records.erase(found);
-    return receipt(request);
+    (void)request;
+    // Cache presence and quote construction do not establish the runtime
+    // context required by this undocumented action queue. Never enter it.
+    throw Rejected("原生撤回接口已停用，请使用服务端原版微信的撤回菜单");
 }
 bool authorized(const httplib::Request& request, httplib::Response& response) {
     const auto provided = request.get_header_value("Authorization"), expected = "Bearer " + authToken;
@@ -463,19 +456,61 @@ void errorResponse(httplib::Response& response, int code, const std::string& sta
     response.set_content(json({{"status", status}, {"error", message}}).dump(), "application/json");
 }
 std::pair<int, json> recallResponse(const std::string& body) {
-    bool reserved = false;
+    bool reserved = false, definitelyNotSubmitted = false;
     try {
         const auto parsed = parseRequest(json::parse(body));
         try { return {200, recall(parsed)}; }
         catch (...) {
-            { std::lock_guard lock(attemptsMutex); reserved = attempts.contains(parsed.id); }
+            {
+                std::lock_guard lock(attemptsMutex);
+                reserved = attempts.contains(parsed.id);
+                definitelyNotSubmitted = !reserved && !submitted.contains(parsed.record);
+            }
             throw;
         }
     } catch (const Rejected& error) {
-        return {400, {{"status", "rejected"}, {"error", error.what()}}};
+        json result = {{"status", "rejected"}, {"error", error.what()}};
+        // This proof is only attached to an exact parsed locator with no receipt
+        // under either request ID or (group, server ID). Reserved/unknown outcomes
+        // never become retryable, even if a later validation rejects that ID.
+        if (definitelyNotSubmitted) result["definite_not_submitted"] = true;
+        return {400, result};
     } catch (const std::exception& error) {
         return {reserved ? 500 : 400, {{"status", reserved ? "uncertain" : "rejected"}, {"error", error.what()}}};
     }
+}
+std::pair<int, json> recordStatusResponse(const std::string& body) {
+    try {
+        const auto parsed = parseRequest(json::parse(body), false);
+        // Read grants without refreshSetting/expiry: polling must not copy,
+        // destroy, reserve, construct or submit any native record.
+        const auto setting = readSetting();
+        std::lock_guard lock(recordsMutex);
+        if (setting.token != authToken || setting.self != initialSelf || !enabled ||
+            !hooksReady || !failure.empty() || !allowed.contains(parsed.record.first) ||
+            !setting.groups.contains(parsed.record.first)) throw Rejected("recall disabled or group not selected");
+        if (!validAge(parsed.time, std::time(nullptr))) throw Rejected("outside three minute window or unconfirmed message");
+        bool ready = false;
+        const auto found = records.find(parsed.record);
+        if (found != records.end()) {
+            validateRecord(found->second, parsed.record, parsed.time, parsed.local, std::time(nullptr));
+            ready = true;
+        }
+        return {200, {{"ready",ready},{"group",parsed.record.first},{"server_id",std::to_string(parsed.record.second)},
+            {"create_time",parsed.time},{"local_id",parsed.local}}};
+    } catch (const std::exception& error) {
+        return {400, {{"status","rejected"},{"error",error.what()}}};
+    }
+}
+std::pair<int, json> recallResultResponse(const std::string& id, const std::string& group) {
+    if (!isHex(id) || !std::regex_match(group, std::regex("[0-9]{5,24}@chatroom")))
+        return {400, {{"status","rejected"},{"error","invalid receipt locator"}}};
+    std::lock_guard lock(attemptsMutex);
+    auto found = attempts.find(id);
+    if (found == attempts.end() || found->second.record.first != group) return {404, json::object()};
+    const auto& attempt = found->second;
+    return {200, {{"server_id", std::to_string(attempt.record.second)}, {"request_id", id},
+        {"executed", attempt.executed}, {"processed", attempt.processed}, {"success", attempt.success}}};
 }
 #ifdef WECHAT_QUOTE_ONLY
 // An independently built, hook-free extension. These RVAs and field transfers were
@@ -714,7 +749,7 @@ void routes(httplib::Server& api) {
             {"enabled",enabled.load()},{"selected_groups",allowed.size()},{"hooks_installed",false}});
 #else
         auto health = json({{"pid", GetCurrentProcessId()}, {"version", "4.1.15.13"}, {"api_version", 1},
-            {"capabilities", json::array({"recall"})}, {"enabled", enabled.load()}, {"observed", observed.load()},
+            {"capabilities", json::array({"recall_disabled","record_status"})}, {"enabled", enabled.load()}, {"observed", observed.load()},
             {"records", records.size()}, {"selected_groups", allowed.size()}, {"window_seconds", kWindow}});
 #endif
         if (!failure.empty()) health["error"] = failure;
@@ -749,6 +784,11 @@ void routes(httplib::Server& api) {
         response.set_content(found->second.second.dump(), "application/json");
     });
 #else
+    api.Post("/record-status", [](const auto& request, auto& response) {
+        if (!authorized(request, response)) return;
+        const auto [code, result] = recordStatusResponse(request.body);
+        response.status = code; response.set_content(result.dump(), "application/json");
+    });
     api.Post("/recall", [](const auto& request, auto& response) {
         if (!authorized(request, response)) return;
         const auto [code, result] = recallResponse(request.body);
@@ -757,13 +797,8 @@ void routes(httplib::Server& api) {
     api.Get("/result", [](const auto& request, auto& response) {
         if (!authorized(request, response)) return;
         const auto id = request.get_param_value("request_id"), group = request.get_param_value("group");
-        if (!isHex(id)) { errorResponse(response, 400, "rejected", "invalid request_id"); return; }
-        std::lock_guard lock(attemptsMutex);
-        auto found = attempts.find(id);
-        if (found == attempts.end() || found->second.record.first != group) { response.status = 404; return; }
-        const auto& attempt = found->second;
-        response.set_content(json({{"server_id", std::to_string(attempt.record.second)}, {"request_id", id},
-            {"executed", attempt.executed}, {"processed", attempt.processed}, {"success", attempt.success}}).dump(), "application/json");
+        const auto [code, result] = recallResultResponse(id, group);
+        response.status = code; response.set_content(result.dump(), "application/json");
     });
 #endif
 }
@@ -778,6 +813,11 @@ void initializeHooks() {
     const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
     if (nt->Signature != IMAGE_NT_SIGNATURE || nt->FileHeader.TimeDateStamp != 1789961080 ||
         nt->OptionalHeader.SizeOfImage != 202039296) throw Rejected("unsupported WeChat native module");
+    constexpr unsigned char quoteCopyCall[] = {0x48,0x89,0xF1,0xE8,0x58,0xA4,0xCB,0xFD,
+        0xC6,0x87,0x98,0x04,0,0,0x01};
+    if (!executableReadable(base + 0x24EB6F0, sizeof(quoteCopyCall)) ||
+        std::memcmp(reinterpret_cast<void*>(base + 0x24EB6F0), quoteCopyCall, sizeof(quoteCopyCall)))
+        throw Rejected("native reference source-copy fingerprint mismatch");
     std::array<std::array<unsigned char, 9>, 3> originalEntries{};
     for (size_t i = 0; i < std::size(kProfiles); ++i) {
         const auto& profile = kProfiles[i];
@@ -937,6 +977,21 @@ void selftestHookCompatibility() {
         const auto insideEntry = static_cast<int32_t>(-4); std::memcpy(scratch.data + 1, &insideEntry, sizeof(insideEntry));
         assert(rejects([&] { existingHookTarget(entry, profile); }));
     }
+    for (const auto& profile : kPreviousActionsProfiles) {
+        prepare(profile); assert(existingHookTarget(entry, profile) == target);
+        assert(legacyIdentityMatches(profile,kPreviousActionsName,kPreviousActionsHash,
+            profile.legacyTargetRva,profile.legacyTargetPrefix.data()));
+        assert(!legacyIdentityMatches(profile,kLegacyName,kPreviousActionsHash,
+            profile.legacyTargetRva,profile.legacyTargetPrefix.data()));
+        assert(!legacyIdentityMatches(profile,kPreviousActionsName,kLegacyHash,
+            profile.legacyTargetRva,profile.legacyTargetPrefix.data()));
+        assert(!legacyIdentityMatches(profile,kPreviousActionsName,kPreviousActionsHash,
+            profile.legacyTargetRva+1,profile.legacyTargetPrefix.data()));
+        auto modified=profile.legacyTargetPrefix;modified.back()^=1;
+        assert(!legacyIdentityMatches(profile,kPreviousActionsName,kPreviousActionsHash,
+            profile.legacyTargetRva,modified.data()));
+        assert(rejects([&]{validateHookEntry(entry,profile);})); // Correct bytes in private memory are still untrusted.
+    }
     assert(rejects([] { branchDestination(std::numeric_limits<uintptr_t>::max(), 0); }));
     assert(rejects([] { branchDestination(1, -10); }));
     DWORD previous = 0; assert(VirtualProtect(scratch.data, 4096, PAGE_READWRITE, &previous));
@@ -974,6 +1029,10 @@ int main() {
     startObservation(); assert(enabled); // 1. Config, explicit start and closed config handle.
 
     alignas(8) unsigned char record[kRecordSize]{};
+    alignas(8) unsigned char dbFixture[8]{}, dbOwnerFixture[16]{};
+    *reinterpret_cast<LONG*>(dbOwnerFixture+8)=1;
+    *reinterpret_cast<void**>(record+0x2C0)=dbFixture;
+    *reinterpret_cast<void**>(record+0x2C8)=dbOwnerFixture;
     auto set = [&](size_t offset, const char* text) {
         auto* value = reinterpret_cast<NativeString*>(record + offset);
         value->length = std::strlen(text); value->capacity = value->length < 16 ? 15 : value->length;
@@ -994,16 +1053,56 @@ int main() {
 
     auto now=static_cast<uint32_t>(std::time(nullptr));*reinterpret_cast<uint32_t*>(record+0xD0)=now;
     observe(record);assert(records.size()==1);
+    const auto retained=records.begin()->second;const auto observedBefore=observed.load();
+    base=0x10000000;assert(!observableCopyOrigin(base+0x24EB6F8)&&observableCopyOrigin(base+0x24EB6F7));
+    observe(record,base+0x24EB6F8);assert(records.begin()->second==retained&&observed.load()==observedBefore);base=0;
+    *reinterpret_cast<void**>(record+0x2C0)=nullptr;observe(record);
+    assert(records.begin()->second==retained&&observed.load()==observedBefore&&!hasOwnedDatabaseRecord(record));
+    *reinterpret_cast<void**>(record+0x2C0)=dbFixture;
+    *reinterpret_cast<LONG*>(dbOwnerFixture+8)=0;observe(record);assert(observed.load()==observedBefore);
+    assert(rejects([&]{validateRecord(record,{groupA,7},now,9,now);}));
+    *reinterpret_cast<LONG*>(dbOwnerFixture+8)=1;assert(hasOwnedDatabaseRecord(record));
     set(0x70,groupB);observe(record);assert(records.size()==2); // 4. Same server ID in different selected groups cannot collide.
     config["groups"]=json::array({groupB});save();refreshSetting();assert(records.size()==1&&records.begin()->first.first==groupB);
     set(0x70,groupA);observe(record);assert(records.size()==1); // 5. Hot revocation releases records and blocks observation.
 
+    auto statusRequest=json({{"group",groupB},{"server_id","7"},{"create_time",now},{"local_id",9}});
+    const auto statusCount=observed.load();const auto recordCount=records.size();
+    assert(recordStatusResponse(statusRequest.dump()).second["ready"]==true);
+    assert(recordStatusResponse(statusRequest.dump()).second["ready"]==true);
+    assert(records.size()==recordCount&&observed.load()==statusCount&&attempts.empty()&&submitted.empty());
+    auto missingStatus=statusRequest;missingStatus["server_id"]="8";
+    assert(recordStatusResponse(missingStatus.dump()).first==200&&recordStatusResponse(missingStatus.dump()).second["ready"]==false);
+    missingStatus=statusRequest;missingStatus["local_id"]=10;assert(recordStatusResponse(missingStatus.dump()).first==400);
+    missingStatus=statusRequest;missingStatus["create_time"]=uint64_t(now)+1;assert(recordStatusResponse(missingStatus.dump()).first==400);
+    config["groups"]=json::array();save();assert(recordStatusResponse(statusRequest.dump()).first==400);
+    assert(records.size()==recordCount&&attempts.empty()); // Polling re-reads grants without native expiry/destruction.
+    config["groups"]=json::array({groupB});save();
+
     auto request=parseRequest(json({{"group",groupB},{"server_id","7"},{"create_time",now},{"local_id",9},{"request_id",std::string(64,'b')}}));
-    assert(recall(request)["status"]=="queued");assert(attempts.size()==1);
-    assert(recall(request)["status"]=="queued");assert(attempts.size()==1);
+    assert(rejects([&]{recall(request);}));assert(attempts.empty()&&submitted.empty());
+    assert(rejects([&]{recall(request);}));assert(attempts.empty()&&submitted.empty());
     auto changed=request;changed.local=10;assert(rejects([&]{recall(changed);}));
     changed=request;changed.id=std::string(64,'c');assert(rejects([&]{recall(changed);}));
-    changed=request;changed.id=std::string(64,'d');changed.record.second=8;assert(rejects([&]{recall(changed);})); // 6. Stable idempotency, mismatch, no-record failure.
+    changed=request;changed.id=std::string(64,'d');changed.record.second=8;assert(rejects([&]{recall(changed);}));
+    assert(attempts.empty()&&submitted.empty()&&records.size()==recordCount); // Even a ready native cache cannot enable legacy recall.
+    auto neverSubmitted=json({{"group",groupB},{"server_id","8"},{"create_time",now},{"local_id",9},{"request_id",std::string(64,'d')}});
+    auto noSubmit=recallResponse(neverSubmitted.dump());
+    assert(noSubmit.first==400&&noSubmit.second["status"]=="rejected"&&noSubmit.second["definite_not_submitted"]==true);
+    assert(noSubmit.second["error"]=="原生撤回接口已停用，请使用服务端原版微信的撤回菜单");
+    assert(attempts.empty()&&submitted.empty());
+    // Synthetic historical receipts exercise read-only recovery; no action ever ran.
+    attempts.emplace(request.id,Attempt{request.record,request.time,request.local,true,false,false});
+    submitted.emplace(request.record,request.id);
+    const auto oldReceipt=recallResultResponse(request.id,groupB);
+    assert(oldReceipt.first==200&&oldReceipt.second["executed"]==true&&oldReceipt.second["processed"]==false);
+    assert(recallResultResponse(request.id,groupB).second==oldReceipt.second&&attempts.size()==1&&submitted.size()==1);
+    assert(recallResultResponse(request.id,groupA).first==404&&recallResultResponse(std::string(64,'0'),groupB).first==404);
+    auto priorId=neverSubmitted;priorId["request_id"]=request.id;
+    assert(!recallResponse(priorId.dump()).second.contains("definite_not_submitted"));
+    auto priorRecord=neverSubmitted;priorRecord["server_id"]="7";
+    assert(!recallResponse(priorRecord.dump()).second.contains("definite_not_submitted"));
+    assert(!recallResponse("not JSON").second.contains("definite_not_submitted"));
 
     stop();assert(!enabled&&records.empty());assert(rejects([&]{recall(request);}));
     startObservation();assert(enabled); // 7. Stop and restart reuse the same module without unloading.
@@ -1016,13 +1115,20 @@ int main() {
     auth.headers.clear();assert(!authorized(auth,response)&&response.status==401); // 9. Strict config/request parsing and token.
     set(0x70,groupB);*reinterpret_cast<uint64_t*>(record+0xB8)=20;observe(record);
     auto uncertain=json({{"group",groupB},{"server_id","20"},{"create_time",now},{"local_id",9},{"request_id",std::string(64,'f')}});
-    queueFailureForTest=true;auto result=recallResponse(uncertain.dump());assert(result.first==500&&result.second["status"]=="uncertain");
-    queueFailureForTest=false;assert(recallResponse(uncertain.dump()).first==200);assert(attempts.size()==2);
-    uncertain["local_id"]=10;assert(recallResponse(uncertain.dump()).first==400);assert(recallResponse("not JSON").first==400); // 10. Post-reservation failures remain uncertain and never resubmit.
+    const auto historical=parseRequest(uncertain);
+    attempts.emplace(historical.id,Attempt{historical.record,historical.time,historical.local,true,false,false});
+    submitted.emplace(historical.record,historical.id);
+    auto result=recallResponse(uncertain.dump());assert(result.first==400&&result.second["status"]=="rejected");
+    assert(!result.second.contains("definite_not_submitted")&&attempts.size()==2&&submitted.size()==2);
+    assert(recallResponse(uncertain.dump()).first==400&&attempts.size()==2);
+    assert(recallResultResponse(historical.id,groupB).second["processed"]==false);
+    uncertain["local_id"]=10;assert(recallResponse(uncertain.dump()).first==400);
+    assert(!recallResponse(uncertain.dump()).second.contains("definite_not_submitted"));
+    assert(recallResponse("not JSON").first==400); // 10. Historical uncertain receipts cannot reactivate the disabled native queue.
     for(uint64_t id=100;id<150;++id){*reinterpret_cast<uint64_t*>(record+0xB8)=id;observe(record);}assert(records.size()==kMaxRecords);
     {std::lock_guard lock(recordsMutex);expire(static_cast<std::time_t>(now)+kWindow);}assert(records.empty()); // 11. Bounded cache and expiry release owned native copies.
     stop();std::filesystem::remove(configPath);
-    std::cout << "PASS 15 offline action checks including pinned hook identity, malformed chain rejection, retained MinHook trampoline and SHA256; no WeChat process or native action was used\n";
+    std::cout << "PASS offline action checks: legacy recall always rejected, no queue/receipt creation, historical receipts read-only, strict retry proof, copy-source guard, pinned hook identity and SHA256; no WeChat process or native action was used\n";
     return 0;
 }
 #endif

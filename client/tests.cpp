@@ -1347,6 +1347,7 @@ class ClientTests : public QObject
         const qint64 now = 1'800'000'000'000LL;
         QJsonObject message{{"id", "outgoing"},
                             {"outgoing", true},
+                            {"text", "已确认的文本"},
                             {"status", "sent"},
                             {"source_id", "confirmed"},
                             {"timestamp", now - 180000}};
@@ -1371,11 +1372,35 @@ class ClientTests : public QObject
         }
         message["recall_status"] = "failed";
         QVERIFY(!canRecallMessage(message, now));
+        message["recall_retryable"] = true;
+        QVERIFY(canRecallMessage(message, now));
+        for (const auto state : {"pending", "uncertain", "recalled"})
+        {
+            message["recall_status"] = state;
+            QVERIFY(!canRecallMessage(message, now));
+        }
+        message["recall_status"] = "failed";
+        message["timestamp"] = now - 180000;
+        QVERIFY(!canRecallMessage(message, now));
+        message["timestamp"] = now;
+        message["outgoing"] = false;
+        QVERIFY(!canRecallMessage(message, now));
+        message["outgoing"] = true;
+        message["recall_retryable"] = false;
         message["recall_status"] = "";
         message["source_id"] = "";
         QVERIFY(!canRecallMessage(message, now));
         message["source_id"] = "confirmed";
         message["outgoing"] = false;
+        QVERIFY(!canRecallMessage(message, now));
+        message["outgoing"] = true;
+        message["media"] = QJsonArray{QJsonObject{{"kind", "file"}}};
+        QVERIFY(!canRecallMessage(message, now));
+        message["media"] = QJsonArray{};
+        message["quote"] = QJsonObject{{"id", "original"}};
+        QVERIFY(!canRecallMessage(message, now));
+        message["quote"] = QJsonObject{};
+        message["text"] = "";
         QVERIFY(!canRecallMessage(message, now));
     }
     void contextMenusCopyQuoteMentionAndUseReferenceHighlight()
@@ -1424,6 +1449,18 @@ class ClientTests : public QObject
         const auto ratio = menu->devicePixelRatioF();
         QCOMPARE(image.pixelColor(qRound((rect.left() + 3) * ratio), qRound(rect.center().y() * ratio)),
                  QColor("#00c777"));
+        delete menu;
+        auto failed = model.rows.first();
+        failed["recall_status"] = "failed";
+        failed["recall_retryable"] = true;
+        model.upsert(failed);
+        menu = view.contextMenuFor(model.index(0), false);
+        QVERIFY(menu->findChild<QAction *>("recallMessage"));
+        delete menu;
+        failed["recall_status"] = "uncertain";
+        model.upsert(failed);
+        menu = view.contextMenuFor(model.index(0), false);
+        QVERIFY(!menu->findChild<QAction *>("recallMessage"));
         delete menu;
     }
     void menusHaveARealTransparentSoftShadowAndLightBorder()

@@ -7,11 +7,13 @@ use crate::{
 };
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::{
     borrow::Cow,
     collections::{BTreeSet, HashMap, VecDeque},
     io::Read,
     path::{Path, PathBuf},
+    time::{Duration, Instant},
 };
 use uuid::Uuid;
 
@@ -140,6 +142,139 @@ impl Local {
             }
         }
         Ok(None)
+    }
+    fn recall_record(&mut self, group: &str, key: &str, now: f64) -> Result<Value> {
+        ensure!(self.allowed.contains(group), "撤回群尚未获准");
+        let locator = locator(group, key)?;
+        let row = self.db.reload(group, &locator)?;
+        let raw = self.db.raw_message(
+            group,
+            row["local_id"].as_i64().context("撤回消息编号缺失")?,
+            text(&row, "shard"),
+        )?;
+        recall_target(group, &row, &raw, &self.db.wxid, now)
+    }
+    fn recall_prepare(&mut self, group: &str, key: &str, now: f64) -> Result<Value> {
+        let mut info = self.recall_record(group, key, now)?;
+        // Only the requested target's fingerprint is persisted, never chat history or UI pointers.
+        info.as_object_mut().unwrap().remove("ui_text");
+        Ok(info)
+    }
+    fn recall_snapshot(&mut self, group: &str, key: &str, now: f64) -> Result<Value> {
+        let started = Instant::now();
+        let history = self.db.recall_history_snapshot()?;
+        let mut info = self.recall_record(group, key, now)?;
+        let locator = info["locator"].clone();
+        let group_name = recall_group_name(&self.db.groups()?, group)?;
+        self.db.verify_recall_name(group, &group_name)?;
+
+        let mut before = None;
+        let mut scanned = 0;
+        let mut context: Vec<RecallText> = Vec::new();
+        let mut context_bytes = 0;
+        let mut broken = false;
+        // Gather a bounded UI context; the separate streaming pass proves uniqueness.
+        'history: while scanned < 1000 && context.len() < UI_CONTEXT_MESSAGES {
+            let rows = self
+                .db
+                .older(group, before.as_ref(), 61.min(1000 - scanned))?;
+            if rows.is_empty() {
+                break;
+            }
+            scanned += rows.len();
+            before = rows.last().cloned();
+            for row in rows {
+                if text(&row, "type") != "文本" {
+                    continue;
+                }
+                let raw = self.db.raw_message(
+                    group,
+                    row["local_id"].as_i64().context("撤回上下文编号缺失")?,
+                    text(&row, "shard"),
+                )?;
+                if let Ok(entry) = recall_text(group, &row, &raw, &self.db.wxid) {
+                    if context.len() == UI_CONTEXT_MESSAGES
+                        || context_bytes + entry.text.len() > UI_CONTEXT_BYTES
+                    {
+                        break 'history;
+                    }
+                    if let Some(newer) = context.last_mut() {
+                        newer.break_before = broken;
+                    }
+                    broken = false;
+                    context_bytes += entry.text.len();
+                    context.push(entry);
+                } else {
+                    broken = true;
+                }
+            }
+        }
+        let context = recall_context(context, &locator, text(&info, "ui_text"))?;
+        let unique = self.recall_unique_contexts(
+            group,
+            &history,
+            &context,
+            &locator,
+            started,
+            RecallScanLimits::default(),
+        )?;
+
+        // History and raw rows are separate reads; fail closed if the target changed meanwhile.
+        let current = self.db.reload(group, &locator)?;
+        let raw = self.db.raw_message(
+            group,
+            current["local_id"].as_i64().context("撤回消息编号缺失")?,
+            text(&current, "shard"),
+        )?;
+        let current = recall_target(group, &current, &raw, &self.db.wxid, now)?;
+        unchanged_recall_target(&info, &current)?;
+        ensure!(
+            recall_group_name(&self.db.groups()?, group)? == group_name,
+            "完整历史校验期间群名称发生变化，撤回未提交"
+        );
+        self.db.verify_recall_history_snapshot(&history)?;
+        self.db.verify_recall_name(group, &group_name)?;
+        info["group_name"] = json!(group_name);
+        info["ui_context"] = json!(context);
+        info["ui_unique_contexts"] = json!(unique);
+        info["ui_history_gate"] = self.db.ui_history_gate(&history);
+        Ok(info)
+    }
+    fn recall_unique_contexts(
+        &mut self,
+        group: &str,
+        snapshot: &crate::db::RecallHistorySnapshot,
+        context: &[Value],
+        target: &Value,
+        started: Instant,
+        limits: RecallScanLimits,
+    ) -> Result<Vec<Value>> {
+        let mut proof = RecallUniqueness::new(context, target)?;
+        let mut position = None;
+        let mut scanned = 0;
+        loop {
+            limits.check(started, scanned)?;
+            let rows = self
+                .db
+                .recall_history_page(group, snapshot, position.as_ref())?;
+            limits.check(started, scanned)?;
+            if rows.is_empty() {
+                self.db.verify_recall_history_snapshot(snapshot)?;
+                return proof.finish(true);
+            }
+            for row in &rows {
+                scanned += 1;
+                limits.check(started, scanned)?;
+                proof.observe(group, row, &self.db.wxid)?;
+            }
+            position = rows.last().cloned();
+        }
+    }
+    fn recall_refresh(&mut self, group: &str, info: &Value, now: f64) -> Result<Value> {
+        let key = source(group, &info["locator"])?;
+        let current = self.recall_snapshot(group, &key, now)?;
+        unchanged_recall_target(info, &current)?;
+        Ok(current)
     }
 }
 impl Drop for Local {
@@ -553,68 +688,45 @@ impl Backend for Local {
     fn recall_info(&mut self, group: &str, key: &str, now: f64) -> Result<Value> {
         ensure!(
             self.actions.is_some() && self.actions_error.is_empty(),
-            "微信原生撤回尚不可用：{}",
+            "微信菜单撤回尚不可用：{}",
             self.actions_error
         );
-        ensure!(self.allowed.contains(group), "撤回群尚未获准");
-        let locator = locator(group, key)?;
-        let row = self.db.reload(group, &locator)?;
-        ensure!(
-            row["sender_id"] == 2
-                && self.identity(group, &row)?.1 == self.db.wxid
-                && !system_message(&row),
-            "只能撤回当前账号自己的消息"
-        );
-        let stamp = row["create_time"].as_i64().context("原微信消息时间无效")?;
-        ensure!(
-            now >= stamp as f64 && now - (stamp as f64) < 180.0,
-            "已超过3分钟撤回时限"
-        );
-        let server = self.server_id(group, &row)?;
-        ensure!(!server.is_empty(), "原微信消息未确认");
-        Ok(
-            json!({"server_id":server,"create_time":stamp,"local_id":locator["local_id"],"locator":locator}),
-        )
+        self.recall_prepare(group, key, now)
     }
     fn recall_submit(&mut self, group: &str, info: &Value, id: &str) -> Result<()> {
-        ensure!(self.allowed.contains(group), "该群已取消转发，撤回未提交");
+        let fresh = (|| {
+            ensure!(self.actions_error.is_empty(), "{}", self.actions_error);
+            let mut fresh = self.recall_refresh(group, info, crate::now())?;
+            let (pid, base) = crate::native::verified_ui_process()?;
+            fresh["ui_account_gate"] = crate::db::verify_ui_account(&self.db.wxid, pid, base)?;
+            recall_time(&fresh["create_time"], crate::now())?;
+            Ok(fresh)
+        })()
+        .map_err(|error: anyhow::Error| {
+            anyhow::Error::new(crate::recall::DefinitelyNotSubmitted)
+                .context(format!("微信撤回前检查失败，未提交：{error}"))
+        })?;
         self.actions
             .as_mut()
-            .context("微信撤回组件未连接")?
-            .submit(group, info, id)
+            .ok_or_else(|| {
+                anyhow::Error::new(crate::recall::DefinitelyNotSubmitted)
+                    .context("微信撤回组件未连接")
+            })?
+            .submit(group, &fresh, id)
     }
-    fn recall_progress(&mut self, group: &str, info: &Value, id: &str) -> Result<Option<bool>> {
+    fn recall_progress(&mut self, group: &str, info: &Value, _id: &str) -> Result<Option<bool>> {
         let row = self.db.reload(group, &info["locator"])?;
         let server = self.server_id(group, &row)?;
         let body = text(&row, "content");
         let revoked = system_message(&row)
+            && !text(info, "server_id").is_empty()
             && server == text(info, "server_id")
             && xml(body).is_ok_and(|doc| {
                 doc.root_element().has_tag_name("sysmsg")
                     && doc.root_element().attribute("type") == Some("revokemsg")
                     && doc.descendants().any(|node| node.has_tag_name("revokemsg"))
             });
-        let Some(actions) = self.actions.as_mut() else {
-            return Ok(None);
-        };
-        let Some(progress) = actions.progress(group, id)? else {
-            return Ok(None);
-        };
-        ensure!(
-            progress["server_id"] == info["server_id"],
-            "微信撤回回执来源不一致"
-        );
-        if progress["processed"] == true && progress["success"] == false {
-            return Ok(Some(false));
-        }
-        if progress["executed"] == true
-            && progress["processed"] == true
-            && progress["success"] == true
-            && revoked
-        {
-            return Ok(Some(true));
-        }
-        Ok(None)
+        Ok(revoked.then_some(true))
     }
     fn release(&mut self) {
         self.db.release();
@@ -721,6 +833,299 @@ fn submission_preflight(
     result.map_err(|error| {
         anyhow::Error::new(Rejected).context(format!("微信发送前检查失败，消息未提交：{error}"))
     })
+}
+
+const UI_CONTEXT_MESSAGES: usize = 200;
+const UI_CONTEXT_BYTES: usize = 1024 * 1024;
+
+struct RecallText {
+    cursor: (i64, String, i64),
+    text: String,
+    outgoing: bool,
+    break_before: bool,
+}
+
+fn recall_text(group: &str, row: &Value, raw: &Value, wxid: &str) -> Result<RecallText> {
+    // This validator only decodes/cross-checks DB fields; it never accesses the quote component.
+    crate::quotes::prepare_source(group, row, raw, wxid)
+        .context("撤回定位仅支持已确认、可完整读取的原微信纯文本")?;
+    let (body, actor) = message_identity(group, row, wxid, |id| Ok(id.to_owned()))?;
+    let outgoing = row["sender_id"] == 2;
+    ensure!(!outgoing || actor == wxid, "撤回消息归属发生变化");
+    let locator = locator(group, &source(group, row)?)?;
+    Ok(RecallText {
+        cursor: recall_cursor(&locator)?,
+        text: body,
+        outgoing,
+        break_before: false,
+    })
+}
+
+fn recall_cursor(locator: &Value) -> Result<(i64, String, i64)> {
+    Ok((
+        locator["sort_seq"].as_i64().context("撤回游标无效")?,
+        locator["shard"].as_str().context("撤回分片无效")?.into(),
+        locator["local_id"].as_i64().context("撤回编号无效")?,
+    ))
+}
+
+fn recall_target(group: &str, row: &Value, raw: &Value, wxid: &str, now: f64) -> Result<Value> {
+    let entry = recall_text(group, row, raw, wxid)?;
+    ensure!(entry.outgoing, "只能撤回当前账号自己的消息");
+    recall_time(&row["create_time"], now)?;
+    let prepared = crate::quotes::prepare_source(group, row, raw, wxid)?;
+    let locator = locator(group, &source(group, row)?)?;
+    Ok(
+        json!({"group":group,"server_id":prepared["server_id"],"create_time":row["create_time"],
+        "local_id":row["local_id"],"locator":locator,
+        "ui_text_hash":hex::encode(Sha256::digest(entry.text.as_bytes())),"ui_text":entry.text}),
+    )
+}
+
+fn recall_time(stamp: &Value, now: f64) -> Result<()> {
+    let stamp = stamp.as_i64().context("原微信消息时间无效")?;
+    ensure!(
+        stamp > 0 && now.is_finite() && now >= stamp as f64 && now - (stamp as f64) < 180.0,
+        "已超过3分钟撤回时限"
+    );
+    Ok(())
+}
+
+fn recall_group_name(groups: &[Value], group: &str) -> Result<String> {
+    let mut matches = groups.iter().filter(|row| text(row, "username") == group);
+    let target = matches.next().context("当前群已不在本机微信群列表中")?;
+    ensure!(matches.next().is_none(), "本机微信群编号不唯一");
+    let name = text(target, "name");
+    ensure!(
+        !name.trim().is_empty() && !name.contains('\0'),
+        "当前群名称无效"
+    );
+    ensure!(
+        groups
+            .iter()
+            .filter(|row| text(row, "name") == name)
+            .count()
+            == 1,
+        "本机微信存在同名群，无法安全定位撤回菜单"
+    );
+    Ok(name.to_owned())
+}
+
+fn recall_context(
+    mut entries: Vec<RecallText>,
+    target: &Value,
+    target_text: &str,
+) -> Result<Vec<Value>> {
+    entries.sort_by(|left, right| left.cursor.cmp(&right.cursor));
+    let mut bytes = 0;
+    let count = entries
+        .iter()
+        .rev()
+        .take(UI_CONTEXT_MESSAGES)
+        .take_while(|entry| {
+            bytes += entry.text.len();
+            bytes <= UI_CONTEXT_BYTES
+        })
+        .count();
+    entries.drain(..entries.len() - count);
+    let target = recall_cursor(target)?;
+    ensure!(
+        entries
+            .iter()
+            .filter(|entry| entry.cursor == target)
+            .count()
+            == 1,
+        "目标不在可唯一验证的最近文本记录中，撤回未提交"
+    );
+    entries
+        .into_iter()
+        .map(|entry| {
+            let target = entry.cursor == target;
+            ensure!(
+                !target || (entry.outgoing && entry.text == target_text),
+                "撤回上下文中的目标内容或归属已变化"
+            );
+            let mut value = json!({"text":entry.text,"outgoing":entry.outgoing,"target":target});
+            if entry.break_before {
+                value["break_before"] = true.into();
+            }
+            Ok(value)
+        })
+        .collect()
+}
+
+#[derive(Clone, Copy)]
+struct RecallScanLimits {
+    rows: usize,
+    duration: Duration,
+}
+impl Default for RecallScanLimits {
+    fn default() -> Self {
+        Self {
+            rows: 200_000,
+            duration: Duration::from_secs(10),
+        }
+    }
+}
+impl RecallScanLimits {
+    fn check(self, started: Instant, rows: usize) -> Result<()> {
+        ensure!(
+            rows <= self.rows && started.elapsed() < self.duration,
+            "完整历史唯一性校验超时或超过20万条容量，撤回未提交"
+        );
+        Ok(())
+    }
+}
+
+struct RecallCandidate {
+    start: usize,
+    texts: Vec<String>,
+    target_offset: usize,
+    matches: u8,
+    includes_target: bool,
+}
+struct RecallUniqueness {
+    candidates: Vec<RecallCandidate>,
+    target: (i64, String, i64),
+    previous: Option<(i64, String, i64)>,
+    window: VecDeque<((i64, String, i64), String)>,
+}
+impl RecallUniqueness {
+    fn new(context: &[Value], target: &Value) -> Result<Self> {
+        let targets: Vec<_> = context
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| entry["target"] == true)
+            .map(|(index, _)| index)
+            .collect();
+        ensure!(
+            targets.len() == 1 && !context.is_empty(),
+            "缺少可验证的目标文本，撤回未提交"
+        );
+        let target_index = targets[0];
+        let mut candidates = Vec::new();
+        for length in 1..=3.min(context.len()) {
+            for start in
+                target_index.saturating_sub(length - 1)..=target_index.min(context.len() - length)
+            {
+                if context[start + 1..start + length]
+                    .iter()
+                    .any(|entry| entry["break_before"] == true)
+                {
+                    continue;
+                }
+                let texts: Vec<_> = (0..length)
+                    .map(|offset| text(&context[start + offset], "text").to_owned())
+                    .collect();
+                ensure!(
+                    texts.iter().all(|text| !text.is_empty()),
+                    "连续文本原文无效，撤回未提交"
+                );
+                candidates.push(RecallCandidate {
+                    start,
+                    texts,
+                    target_offset: target_index - start,
+                    matches: 0,
+                    includes_target: false,
+                });
+            }
+        }
+        ensure!(
+            !candidates.is_empty(),
+            "目标附近文本存在不可验证的断点，撤回未提交"
+        );
+        Ok(Self {
+            candidates,
+            target: recall_cursor(target)?,
+            previous: None,
+            window: VecDeque::new(),
+        })
+    }
+    fn observe(&mut self, group: &str, row: &Value, wxid: &str) -> Result<()> {
+        let cursor = recall_cursor(row)?;
+        ensure!(
+            self.previous
+                .as_ref()
+                .is_none_or(|previous| previous < &cursor),
+            "完整历史分页未严格前进，撤回未提交"
+        );
+        self.previous = Some(cursor.clone());
+        if row["is_text"] != true {
+            return Ok(());
+        }
+        // Unknown text cannot establish global absence of a duplicate; reject the entire proof.
+        ensure!(
+            row["local_type"] == 1
+                && row["content"].is_string()
+                && !text(row, "sender_username").is_empty(),
+            "群历史存在无法完整验证的纯文本，撤回未提交"
+        );
+        let (body, _) = message_identity(group, row, wxid, |id| Ok(id.to_owned()))?;
+        ensure!(!body.is_empty(), "群历史存在空白原文，撤回未提交");
+        self.window.push_back((cursor, body));
+        if self.window.len() > 3 {
+            self.window.pop_front();
+        }
+        for candidate in &mut self.candidates {
+            if self.window.len() < candidate.texts.len() {
+                continue;
+            }
+            let offset = self.window.len() - candidate.texts.len();
+            if self
+                .window
+                .iter()
+                .skip(offset)
+                .zip(&candidate.texts)
+                .all(|((_, body), expected)| body == expected)
+            {
+                candidate.matches = candidate.matches.saturating_add(1).min(2);
+                candidate.includes_target |=
+                    self.window[offset + candidate.target_offset].0 == self.target;
+            }
+        }
+        Ok(())
+    }
+    fn finish(self, complete: bool) -> Result<Vec<Value>> {
+        ensure!(complete, "历史扫描未完成，不能证明唯一位置，撤回未提交");
+        let shortest = self
+            .candidates
+            .iter()
+            .filter(|candidate| candidate.matches == 1 && candidate.includes_target)
+            .map(|candidate| candidate.texts.len())
+            .min();
+        let unique: Vec<_> = self
+            .candidates
+            .into_iter()
+            .filter(|candidate| {
+                candidate.matches == 1
+                    && candidate.includes_target
+                    && Some(candidate.texts.len()) == shortest
+            })
+            .map(|candidate| json!({"start":candidate.start,"length":candidate.texts.len()}))
+            .collect();
+        ensure!(
+            !unique.is_empty(),
+            "目标原文及附近文本在全群历史中不唯一，撤回未提交"
+        );
+        Ok(unique)
+    }
+}
+
+fn unchanged_recall_target(previous: &Value, current: &Value) -> Result<()> {
+    for field in [
+        "group",
+        "server_id",
+        "create_time",
+        "local_id",
+        "locator",
+        "ui_text_hash",
+    ] {
+        ensure!(
+            !previous[field].is_null() && previous[field] == current[field],
+            "撤回原消息的 {field} 已变化，未使用旧记录执行"
+        );
+    }
+    Ok(())
 }
 
 fn locator(group: &str, key: &str) -> Result<Value> {

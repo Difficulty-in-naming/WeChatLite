@@ -74,6 +74,7 @@ async fn main() -> std::process::ExitCode {
         case!(actions::native_quote_and_reply_have_independent_utf8_capacity_before_enqueue),
         case!(actions::pending_recall_survives_restart_as_check_and_never_reissues_action),
         case!(actions::failed_or_uncertain_confirmation_preserves_body_and_does_not_retry),
+        case!(actions::only_proven_unsubmitted_recall_can_be_explicitly_retried_with_fresh_authorization),
         case!(history::pages_beyond_initial_40_are_ordered_deduplicated_and_end_only_after_native_eof),
         case!(history::timeout_is_pending_and_same_cursor_requests_share_one_native_task),
         case!(history::group_and_before_validation_read_only_client_and_mid_request_revocation),

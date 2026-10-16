@@ -208,7 +208,9 @@ pub fn run(mode: &str, directory: &Path) -> Result<()> {
                 if command["op"] == "recall" && text.starts_with("recall hold") {
                     continue;
                 }
-                let status = if text.starts_with("recall fail") {
+                let not_submitted =
+                    text.starts_with("recall unsubmitted") && command["explicit_retry"] != true;
+                let status = if not_submitted || text.starts_with("recall fail") {
                     "failed"
                 } else if text.starts_with("recall uncertain") {
                     "uncertain"
@@ -216,7 +218,7 @@ pub fn run(mode: &str, directory: &Path) -> Result<()> {
                     "recalled"
                 };
                 emit(
-                    json!({"type":"recall_ack","id":row["id"],"status":status,"error":if status=="recalled"{""}else{"Fixture confirmation unavailable"}}),
+                    json!({"type":"recall_ack","id":row["id"],"recall_attempt":row["recall_attempt"].as_str().unwrap_or(""),"status":status,"error":if status=="recalled"{""}else{"Fixture confirmation unavailable"},"definite_not_submitted":not_submitted || text.starts_with("recall uncertain forged proof")}),
                 )?;
             }
             "history" => {

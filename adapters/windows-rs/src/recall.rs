@@ -3,8 +3,32 @@ use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+// A positive proof from local preconditions or the UI helper before menu Invoke.
+// A generic Rejected/worker failure does not establish that nothing was queued.
+#[derive(Debug)]
+pub struct DefinitelyNotSubmitted;
+impl std::fmt::Display for DefinitelyNotSubmitted {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("微信撤回未提交")
+    }
+}
+impl std::error::Error for DefinitelyNotSubmitted {}
+
+fn unsubmitted(record: &Value) -> bool {
+    !matches!(text(&record["ack"], "status"), "uncertain" | "recalled")
+        && record["index"] == 0
+        && record["parts"].as_array().is_some_and(|parts| {
+            !parts.is_empty()
+                && parts.iter().enumerate().all(|(index, part)| {
+                    part["submitted"] != true
+                        || (index == 0 && part["definite_not_submitted"] == true)
+                })
+        })
+}
+
 pub struct RecallJob {
     id: String,
+    attempt: String,
     group: String,
     record: Value,
     check_only: bool,
@@ -16,15 +40,29 @@ impl RecallJob {
     pub fn group(&self) -> &str {
         &self.group
     }
+    pub fn attempt(&self) -> &str {
+        &self.attempt
+    }
     pub fn new<A: Backend>(
         access: &mut A,
         store: &Receipts,
         message: &Value,
         check_only: bool,
+        explicit_retry: bool,
         now: f64,
     ) -> Result<Self> {
         let id = text(message, "id").to_owned();
         let group = text(message, "group").to_owned();
+        let attempt = text(message, "recall_attempt").to_owned();
+        ensure!(
+            attempt.is_empty()
+                || (attempt.len() == 32 && attempt.bytes().all(|value| value.is_ascii_hexdigit())),
+            "撤回轮次无效"
+        );
+        ensure!(
+            check_only || !attempt.is_empty(),
+            "旧版撤回只能查询结果，未重新执行"
+        );
         ensure!(
             !id.is_empty() && id.len() <= 256 && !group.is_empty(),
             "撤回目标编号无效"
@@ -62,8 +100,22 @@ impl RecallJob {
             )?)
         );
         let key = format!("recall:{id}");
-        let record = if let Some(record) = store.state(&key)? {
+        let previous = store.state(&key)?;
+        if let Some(record) = &previous {
             ensure!(record["hash"] == hash, "撤回目标发生变化，未重复提交");
+        }
+        let retry = explicit_retry
+            && !check_only
+            && previous.as_ref().is_some_and(|record| {
+                record["ack"]["status"] == "failed"
+                    && record["ack"]["definite_not_submitted"] == true
+                    && unsubmitted(record)
+            });
+        let check_only = check_only
+            || previous
+                .as_ref()
+                .is_some_and(|record| text(record, "recall_attempt") != attempt && !retry);
+        let record = if let Some(record) = previous.filter(|_| !retry) {
             record
         } else {
             ensure!(!check_only, "撤回未提交，未发现本机持久记录");
@@ -84,12 +136,14 @@ impl RecallJob {
                 );
                 parts.push(json!({"info":info,"request_id":request_id}));
             }
-            let record = json!({"hash":hash,"parts":parts,"index":0,"started":now});
+            let record =
+                json!({"hash":hash,"parts":parts,"index":0,"started":now,"recall_attempt":attempt});
             store.set(&key, &record)?;
             record
         };
         Ok(Self {
             id,
+            attempt,
             group,
             record,
             check_only,
@@ -99,10 +153,13 @@ impl RecallJob {
         store.set(&format!("recall:{}", self.id), &self.record)
     }
     fn finish(&mut self, store: &Receipts, status: &str, error: &str) -> Result<Value> {
-        let mut ack = json!({"type":"recall_ack","id":self.id,"status":status});
+        let mut ack =
+            json!({"type":"recall_ack","id":self.id,"recall_attempt":self.attempt,"status":status});
         if !error.is_empty() {
             ack["error"] = json!(error);
         }
+        ack["definite_not_submitted"] =
+            json!(status == "failed" && !self.attempt.is_empty() && unsubmitted(&self.record));
         self.record["ack"] = ack.clone();
         self.save(store)?;
         Ok(ack)
@@ -121,8 +178,26 @@ impl RecallJob {
         allowed: bool,
         now: f64,
     ) -> Result<Option<Value>> {
+        if let Some(current) = store.state(&format!("recall:{}", self.id))? {
+            if text(&current, "recall_attempt") != self.attempt
+                || current["recall_attempt"] != self.record["recall_attempt"]
+            {
+                // A newer explicit retry owns the durable receipt. An old check
+                // must neither queue nor overwrite its unsubmitted state.
+                return Ok(Some(
+                    json!({"type":"recall_ack","id":self.id,"recall_attempt":self.attempt,
+                    "status":"uncertain","definite_not_submitted":false,"error":"旧撤回轮次已结束，未重复执行"}),
+                ));
+            }
+            self.record = current;
+        }
         if let Some(ack) = self.record.get("ack") {
-            return Ok(Some(ack.clone()));
+            let mut ack = ack.clone();
+            ack["recall_attempt"] = json!(self.attempt);
+            if self.attempt.is_empty() {
+                ack["definite_not_submitted"] = json!(false);
+            }
+            return Ok(Some(ack));
         }
         let result = self.step(access, store, allowed, now);
         match result {
@@ -170,8 +245,12 @@ impl RecallJob {
             if let Err(error) = access.recall_submit(&self.group, info, request_id) {
                 if error.downcast_ref::<Rejected>().is_some() {
                     self.record["parts"][index]["rejected"] = json!(true);
-                    self.save(store)?;
                 }
+                if error.downcast_ref::<DefinitelyNotSubmitted>().is_some() {
+                    self.record["parts"][index]["definite_not_submitted"] = json!(true);
+                    self.record["parts"][index]["rejected"] = json!(true);
+                }
+                self.save(store)?;
                 return Err(error);
             }
         }
@@ -198,5 +277,42 @@ impl RecallJob {
                 Ok(false)
             }
         }
+    }
+}
+
+pub fn construction_failure(
+    store: &Receipts,
+    message: &Value,
+    check_only: bool,
+    error: &anyhow::Error,
+) -> Result<Value> {
+    let previous = store.state(&format!("recall:{}", text(message, "id")))?;
+    let attempt = text(message, "recall_attempt");
+    let definite = !check_only
+        && attempt.len() == 32
+        && attempt.bytes().all(|value| value.is_ascii_hexdigit())
+        && previous.as_ref().is_none_or(|record| {
+            (text(record, "recall_attempt") == attempt
+                || (record["ack"]["status"] == "failed"
+                    && record["ack"]["definite_not_submitted"] == true))
+                && unsubmitted(record)
+        });
+    Ok(
+        json!({"type":"recall_ack","id":message["id"],"recall_attempt":attempt,"status":"failed",
+        "error":error.to_string(),"definite_not_submitted":definite}),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminal_unknown_or_confirmed_ack_cannot_be_reclassified_from_missing_part_flags() {
+        for status in ["uncertain", "recalled"] {
+            let record = json!({"index":0,"parts":[{}],"ack":{"status":status}});
+            assert!(!unsubmitted(&record));
+        }
+        assert!(unsubmitted(&json!({"index":0,"parts":[{}]})));
     }
 }

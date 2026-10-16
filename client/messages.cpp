@@ -42,9 +42,12 @@ bool canRecallMessage(const QJsonObject &message, qint64 now)
     const auto status = message["status"].toString();
     const auto recall = message["recall_status"].toString();
     const auto age = now - message["timestamp"].toInteger();
+    const bool retry = recall == "failed" && message["recall_retryable"].toBool();
     return message["outgoing"].toBool() && (status == "sent" || status == "received") &&
+           !message["text"].toString().isEmpty() && message["media"].toArray().isEmpty() &&
+           message["quote"].toObject().isEmpty() &&
            !message["source_id"].toString().isEmpty() && !message["id"].toString().isEmpty() &&
-           recall.isEmpty() && age >= 0 && age < 180000;
+           (recall.isEmpty() || retry) && age >= 0 && age < 180000;
 }
 QString messageQuoteLabel(const QJsonObject &quote)
 {

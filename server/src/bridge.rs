@@ -72,12 +72,14 @@ pub async fn start(app: Arc<App>, mut receiver: mpsc::Receiver<Value>) -> Result
                             .db(move |s| {
                                 s.finish_recall(
                                     &message.id,
+                                    &message.recall_attempt,
                                     status,
                                     if status == "failed" {
                                         "超过撤回时限，演示撤回未执行"
                                     } else {
                                         ""
                                     },
+                                    status == "failed",
                                 )
                             })
                             .await
@@ -368,7 +370,10 @@ async fn run_stream<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
             }
             if ready && !recovering.is_empty() {
                 for message in recovering.drain(..) {
-                    if recalling.insert(message.id.clone()) {write_command(app,input,json!({"op":"recall_check","message":message})).await?;}
+                    let snapshot=message;
+                    let Some(message)=app.db({let id=snapshot.id.clone();move|store|store.message(&id)}).await? else {continue;};
+                    if message.recall_status!="pending" || message.recall_attempt!=snapshot.recall_attempt {continue;}
+                    if recalling.insert((message.id.clone(),message.recall_attempt.clone())) {write_command(app,input,json!({"op":"recall_check","recall_attempt":message.recall_attempt,"message":message})).await?;}
                 }
             }
             if ready && inflight.is_none() && pending {
@@ -473,9 +478,10 @@ async fn run_stream<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                         },
                         "recall_ack"=>{
                             let id=value["id"].as_str().unwrap_or("").to_owned();
-                            if recalling.remove(&id) {
-                                let status=value["status"].as_str().unwrap_or("uncertain").to_owned();let error=value["error"].as_str().unwrap_or("").to_owned();
-                                for event in app.db(move|s|s.finish_recall(&id,&status,&error)).await? {app.publish(event);}
+                            let attempt=value["recall_attempt"].as_str().unwrap_or("").to_owned();
+                            if recalling.remove(&(id.clone(),attempt.clone())) {
+                                let status=value["status"].as_str().unwrap_or("uncertain").to_owned();let error=value["error"].as_str().unwrap_or("").to_owned();let definite=value["definite_not_submitted"]==true;
+                                for event in app.db(move|s|s.finish_recall(&id,&attempt,&status,&error,definite)).await? {app.publish(event);}
                             }
                         },
                         "warning"=>{
@@ -517,15 +523,23 @@ async fn run_stream<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                         }
                     } else if command["op"]=="recall" {
                         let id=command["message"]["id"].as_str().unwrap_or("").to_owned();
-                        if recalling.contains(&id){continue;}
+                        let attempt=command["message"]["recall_attempt"].as_str().unwrap_or("").to_owned();
+                        if recalling.contains(&(id.clone(),attempt.clone())){continue;}
                         let Some(message)=app.db(move|s|s.message(&id)).await? else {continue;};
-                        if message.recall_status!="pending"{continue;}
+                        if message.recall_status!="pending" || message.recall_attempt!=attempt {continue;}
+                        if message.recall_attempt.is_empty() {
+                            if !ready { recovering.push(message); }
+                            else if recalling.insert((message.id.clone(),String::new())) {
+                                write_command(app,input,json!({"op":"recall_check","recall_attempt":"","message":message})).await?;
+                            }
+                            continue;
+                        }
                         let selected=app.forwarding.read().await;
                         let clients=app.clients.read().await;
                         if !selected.contains(&message.group) || !crate::access::can_submit(&clients,&message.recall_client,&message.group) || crate::store::check_recall(&message,chrono::Utc::now().timestamp_millis()).is_err() {
-                            for event in app.db(move|s|s.finish_recall(&message.id,"failed","群或客户端发送权限已取消，或超过撤回时限，未提交微信")).await?{app.publish(event);}
+                            for event in app.db(move|s|s.finish_recall(&message.id,&message.recall_attempt,"failed","群或客户端发送权限已取消，或超过撤回时限，未提交微信",true)).await?{app.publish(event);}
                         } else if !ready {recovering.push(message);}
-                        else {recalling.insert(message.id.clone());write_command(app,input,json!({"op":"recall","message":message})).await?;}
+                        else {recalling.insert((message.id.clone(),message.recall_attempt.clone()));write_command(app,input,json!({"op":"recall","recall_attempt":message.recall_attempt,"message":message,"explicit_retry":command["explicit_retry"]==true})).await?;}
                     } else {
                         let selected=app.forwarding.read().await;
                         let clients=app.clients.read().await;
@@ -670,6 +684,26 @@ mod tests {
             .unwrap()
             .unwrap();
         serde_json::from_str(&line).unwrap()
+    }
+
+    async fn recall_barrier(
+        output: &mut WriteHalf<DuplexStream>,
+        events: &mut tokio::sync::broadcast::Receiver<Value>,
+    ) {
+        emit(
+            output,
+            json!({"type":"warning","group":"g","text":"offline recall barrier"}),
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if events.recv().await.unwrap()["text"] == "offline recall barrier" {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -1060,7 +1094,7 @@ mod tests {
         assert_eq!(check["message"]["id"], source.id);
         emit(
             &mut output,
-            json!({"type":"recall_ack","id":source.id,"status":"recalled"}),
+            json!({"type":"recall_ack","id":source.id,"recall_attempt":check["recall_attempt"],"status":"recalled"}),
         )
         .await;
         assert!(
@@ -1071,6 +1105,163 @@ mod tests {
         assert_eq!(
             app.store.message(&source.id).unwrap().unwrap().status,
             "recalled"
+        );
+        app.shutdown.send_replace(true);
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn late_old_recall_ack_cannot_finish_or_unlock_a_new_explicit_attempt() {
+        let temp = tempfile::tempdir().unwrap();
+        let (app, receiver) = crate::test_app(temp.path());
+        let mut source = message("nonce-recall");
+        source.status = "sent".into();
+        source.source_id = "native".into();
+        source.timestamp = chrono::Utc::now().timestamp_millis();
+        app.store.insert_message(&mut source).unwrap();
+        let first = app
+            .store
+            .begin_recall(&source.id, source.timestamp)
+            .unwrap()
+            .0;
+        let (task, mut output, mut input) = fixture(app.clone(), receiver).await;
+        emit(&mut output, json!({"type":"status","ready":true})).await;
+        let check = next(&mut input).await;
+        assert_eq!(check["op"], "recall_check");
+        assert_eq!(check["recall_attempt"], first.recall_attempt);
+        app.store
+            .finish_recall(
+                &source.id,
+                &first.recall_attempt,
+                "failed",
+                "not submitted",
+                true,
+            )
+            .unwrap();
+        let second = app
+            .store
+            .begin_recall(&source.id, source.timestamp + 1)
+            .unwrap()
+            .0;
+        assert_ne!(first.recall_attempt, second.recall_attempt);
+        app.commands
+            .send(json!({"op":"recall","message":second,"explicit_retry":true}))
+            .await
+            .unwrap();
+        let current = next(&mut input).await;
+        assert_eq!(current["op"], "recall");
+        assert_eq!(current["recall_attempt"], second.recall_attempt);
+        let mut events = app.events.subscribe();
+        for ack in [
+            json!({"type":"recall_ack","id":source.id,"recall_attempt":first.recall_attempt,"status":"failed","definite_not_submitted":true}),
+            json!({"type":"recall_ack","id":source.id,"recall_attempt":first.recall_attempt,"status":"recalled"}),
+            json!({"type":"recall_ack","id":source.id,"status":"recalled"}),
+        ] {
+            emit(&mut output, ack).await;
+        }
+        recall_barrier(&mut output, &mut events).await;
+        let saved = app.store.message(&source.id).unwrap().unwrap();
+        assert_eq!(saved.recall_attempt, second.recall_attempt);
+        assert_eq!(saved.recall_status, "pending");
+        assert!(!saved.recall_retryable);
+        assert_eq!(saved.text, source.text);
+        emit(&mut output, json!({"type":"recall_ack","id":source.id,"recall_attempt":second.recall_attempt,"status":"recalled"})).await;
+        recall_barrier(&mut output, &mut events).await;
+        assert_eq!(
+            app.store.message(&source.id).unwrap().unwrap().status,
+            "recalled"
+        );
+        app.shutdown.send_replace(true);
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn stale_recovery_snapshot_is_skipped_before_a_new_explicit_request_is_dispatched() {
+        let temp = tempfile::tempdir().unwrap();
+        let (app, receiver) = crate::test_app(temp.path());
+        let mut source = message("stale-recovery");
+        source.status = "sent".into();
+        source.source_id = "native".into();
+        source.timestamp = chrono::Utc::now().timestamp_millis();
+        app.store.insert_message(&mut source).unwrap();
+        let first = app
+            .store
+            .begin_recall(&source.id, source.timestamp)
+            .unwrap()
+            .0;
+        let (task, mut output, mut input) = fixture(app.clone(), receiver).await;
+        app.store
+            .finish_recall(
+                &source.id,
+                &first.recall_attempt,
+                "failed",
+                "not submitted",
+                true,
+            )
+            .unwrap();
+        let second = app
+            .store
+            .begin_recall(&source.id, source.timestamp + 1)
+            .unwrap()
+            .0;
+        let mut events = app.events.subscribe();
+        emit(&mut output, json!({"type":"status","ready":true})).await;
+        recall_barrier(&mut output, &mut events).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), input.next())
+                .await
+                .is_err()
+        );
+        app.commands
+            .send(json!({"op":"recall","message":first,"explicit_retry":false}))
+            .await
+            .unwrap();
+        app.commands
+            .send(json!({"op":"recall","message":second,"explicit_retry":true}))
+            .await
+            .unwrap();
+        let command = next(&mut input).await;
+        assert_eq!(command["op"], "recall");
+        assert_eq!(command["recall_attempt"], second.recall_attempt);
+        assert_eq!(command["explicit_retry"], true);
+        emit(&mut output, json!({"type":"recall_ack","id":source.id,"recall_attempt":second.recall_attempt,"status":"failed","definite_not_submitted":true})).await;
+        recall_barrier(&mut output, &mut events).await;
+        assert!(
+            app.store
+                .message(&source.id)
+                .unwrap()
+                .unwrap()
+                .recall_retryable
+        );
+        app.shutdown.send_replace(true);
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn legacy_pending_recovery_is_read_only_and_cannot_gain_retry_proof() {
+        let temp = tempfile::tempdir().unwrap();
+        let (app, receiver) = crate::test_app(temp.path());
+        let mut source = message("legacy-pending");
+        source.status = "sent".into();
+        source.source_id = "native".into();
+        source.timestamp = chrono::Utc::now().timestamp_millis();
+        source.recall_status = "pending".into();
+        app.store.insert_message(&mut source).unwrap();
+        let (task, mut output, mut input) = fixture(app.clone(), receiver).await;
+        emit(&mut output, json!({"type":"status","ready":true})).await;
+        let command = next(&mut input).await;
+        assert_eq!(command["op"], "recall_check");
+        assert_eq!(command["recall_attempt"], "");
+        let mut events = app.events.subscribe();
+        emit(&mut output, json!({"type":"recall_ack","id":source.id,"status":"failed","definite_not_submitted":true})).await;
+        recall_barrier(&mut output, &mut events).await;
+        let saved = app.store.message(&source.id).unwrap().unwrap();
+        assert_eq!(saved.recall_status, "failed");
+        assert!(!saved.recall_retryable);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), input.next())
+                .await
+                .is_err()
         );
         app.shutdown.send_replace(true);
         task.await.unwrap().unwrap();

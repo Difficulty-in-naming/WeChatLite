@@ -86,6 +86,10 @@ pub struct ChatMessage {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub recall_error: String,
     #[serde(default)]
+    pub recall_retryable: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub recall_attempt: String,
+    #[serde(default)]
     pub outgoing: bool,
 }
 

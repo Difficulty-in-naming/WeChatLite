@@ -602,6 +602,8 @@ impl Store {
             message.quote = current.quote;
             message.recall_status = current.recall_status;
             message.recall_error = current.recall_error;
+            message.recall_retryable = current.recall_retryable;
+            message.recall_attempt = current.recall_attempt;
             message.recall_client = current.recall_client;
             message.access_client = current.access_client;
         }
@@ -688,7 +690,10 @@ impl Store {
             .optional()?
             .context("消息不存在")?;
         let mut message: ChatMessage = serde_json::from_str(&body)?;
-        if message.status == "recalled" || !message.recall_status.is_empty() {
+        if message.status == "recalled"
+            || (!message.recall_status.is_empty()
+                && !(message.recall_status == "failed" && message.recall_retryable))
+        {
             return Ok((message, None));
         }
         check_recall(&message, now)?;
@@ -703,6 +708,8 @@ impl Store {
         message.recall_status = "pending".into();
         message.recall_client = client.to_owned();
         message.recall_error.clear();
+        message.recall_retryable = false;
+        message.recall_attempt = uuid::Uuid::new_v4().simple().to_string();
         tx.execute(
             "UPDATE messages SET body=?1 WHERE id=?2",
             params![serde_json::to_string(&message)?, message.id],
@@ -720,7 +727,14 @@ impl Store {
             .collect()
     }
 
-    pub fn finish_recall(&self, id: &str, status: &str, error: &str) -> Result<Vec<Value>> {
+    pub fn finish_recall(
+        &self,
+        id: &str,
+        attempt: &str,
+        status: &str,
+        error: &str,
+        definite_not_submitted: bool,
+    ) -> Result<Vec<Value>> {
         let mut conn = self.db.lock().unwrap();
         let tx = conn.transaction()?;
         let body: Option<String> = tx
@@ -730,11 +744,16 @@ impl Store {
             return Ok(Vec::new());
         };
         let mut message: ChatMessage = serde_json::from_str(&body)?;
-        if message.status == "recalled"
+        if message.recall_attempt != attempt
+            || message.status == "recalled"
             || !["pending", "uncertain"].contains(&message.recall_status.as_str())
         {
             return Ok(Vec::new());
         }
+        message.recall_retryable = status == "failed"
+            && definite_not_submitted
+            && !attempt.is_empty()
+            && message.recall_status == "pending";
         if status == "recalled" {
             message.status = "recalled".into();
             message.text.clear();
@@ -1613,19 +1632,23 @@ mod tests {
         stale_reply.status = "sent".into();
         assert!(store.begin_recall("source", 1001).unwrap().1.is_some());
         assert!(store.begin_recall("source", 1002).unwrap().1.is_none());
+        let attempt = store.message("source").unwrap().unwrap().recall_attempt;
         drop(store);
         let store = Store::open(&path).unwrap();
         assert_eq!(store.pending_recalls().unwrap().len(), 1);
         assert_eq!(
             store
-                .finish_recall("source", "uncertain", "等待确认")
+                .finish_recall("source", &attempt, "uncertain", "等待确认", false)
                 .unwrap()
                 .len(),
             1
         );
         assert_eq!(store.message("source").unwrap().unwrap().text, "你好");
         assert_eq!(
-            store.finish_recall("source", "recalled", "").unwrap().len(),
+            store
+                .finish_recall("source", &attempt, "recalled", "", false)
+                .unwrap()
+                .len(),
             2
         );
         let late_reply = store.update_message(&stale_reply).unwrap();
@@ -1677,5 +1700,127 @@ mod tests {
         assert!(check_recall(&m, 1001).is_ok());
         m.status = "uncertain".into();
         assert!(check_recall(&m, 1001).is_err());
+    }
+
+    #[test]
+    fn recall_retry_needs_persisted_prequeue_proof_and_revalidates_current_message() {
+        for (status, proof, retryable) in [
+            ("failed", true, true),
+            ("failed", false, false),
+            ("uncertain", true, false),
+            ("uncertain", false, false),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let store = Store::open(&temp.path().join("store.db")).unwrap();
+            let mut original = message("source");
+            original.outgoing = true;
+            original.status = "sent".into();
+            original.source_id = "confirmed-source".into();
+            original.timestamp = 1000;
+            store.insert_message(&mut original).unwrap();
+            let attempt = store.begin_recall("source", 1001).unwrap().0.recall_attempt;
+            store
+                .finish_recall("source", &attempt, status, "fixture", proof)
+                .unwrap();
+            let saved = store.message("source").unwrap().unwrap();
+            assert_eq!(saved.recall_retryable, retryable);
+            if status == "uncertain" {
+                store
+                    .finish_recall(
+                        "source",
+                        &attempt,
+                        "failed",
+                        "late proof cannot erase uncertainty",
+                        true,
+                    )
+                    .unwrap();
+                assert!(!store.message("source").unwrap().unwrap().recall_retryable);
+            }
+            let mut late = original.clone();
+            late.status = "sent".into();
+            assert_eq!(
+                store.update_message(&late).unwrap()["message"]["recall_retryable"],
+                retryable
+            );
+            if retryable {
+                assert!(store.begin_recall("source", 181000).is_err());
+                assert!(store.message("source").unwrap().unwrap().recall_retryable);
+            }
+            let (retried, event) = store
+                .begin_recall_as("source", 1002, "current-client")
+                .unwrap();
+            assert_eq!(event.is_some(), retryable);
+            if retryable {
+                assert_eq!(retried.recall_status, "pending");
+                assert!(!retried.recall_retryable);
+                assert!(retried.recall_error.is_empty());
+                assert_eq!(retried.recall_client, "current-client");
+            }
+        }
+    }
+
+    #[test]
+    fn recall_attempt_is_transactionally_matched_and_legacy_pending_never_becomes_retryable() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(&temp.path().join("store.db")).unwrap();
+        let mut original = message("source");
+        original.outgoing = true;
+        original.status = "sent".into();
+        original.source_id = "native".into();
+        original.timestamp = 1000;
+        store.insert_message(&mut original).unwrap();
+        let first = store.begin_recall("source", 1001).unwrap().0;
+        assert_eq!(first.recall_attempt.len(), 32);
+        assert_eq!(
+            store.begin_recall("source", 1002).unwrap().0.recall_attempt,
+            first.recall_attempt
+        );
+        store
+            .finish_recall(
+                "source",
+                &first.recall_attempt,
+                "failed",
+                "never queued",
+                true,
+            )
+            .unwrap();
+        let second = store.begin_recall("source", 1003).unwrap().0;
+        assert_ne!(first.recall_attempt, second.recall_attempt);
+        for status in ["failed", "uncertain", "recalled"] {
+            assert!(
+                store
+                    .finish_recall("source", &first.recall_attempt, status, "late", true)
+                    .unwrap()
+                    .is_empty()
+            );
+            let current = store.message("source").unwrap().unwrap();
+            assert_eq!(current.recall_attempt, second.recall_attempt);
+            assert_eq!(current.recall_status, "pending");
+            assert!(!current.recall_retryable);
+            assert_eq!(current.text, original.text);
+        }
+        assert!(
+            !store
+                .finish_recall("source", &second.recall_attempt, "recalled", "", false)
+                .unwrap()
+                .is_empty()
+        );
+
+        original.id = "legacy".into();
+        original.source_id = "legacy-native".into();
+        original.recall_status = "pending".into();
+        original.recall_attempt.clear();
+        store.insert_message(&mut original).unwrap();
+        assert!(
+            store
+                .finish_recall("legacy", "unrelated", "recalled", "", false)
+                .unwrap()
+                .is_empty()
+        );
+        store
+            .finish_recall("legacy", "", "failed", "legacy read-only", true)
+            .unwrap();
+        assert!(!store.message("legacy").unwrap().unwrap().recall_retryable);
+        assert!(store.begin_recall("legacy", 1004).unwrap().1.is_none());
     }
 }

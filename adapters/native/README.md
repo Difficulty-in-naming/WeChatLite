@@ -1,10 +1,11 @@
 This directory builds two independent modules for the version-verified Windows
-bridge: `WeChatActions.dll` recalls a recent own message using an observed native
-record; `WeChatQuote.dll` creates a native type-57 text reference using verified
+bridge: `WeChatActions.dll` retains legacy observation/status diagnostics but
+unconditionally disables its undocumented recall queue; `WeChatQuote.dll` creates a native type-57 text reference using verified
 same-group database fields. Quote installs no observation hooks. Neither module
 loads itself into any process; the Rust adapter performs WeChat version/hash
 checks and explicit loading. The external `nen/work/WeChat-Hook` checkout is
-unchanged. The existing Actions binary retains its independent fingerprint.
+unchanged. Each Actions and Quote build has its own pinned binary fingerprint;
+packages and the Rust loader must use the matching fingerprint files.
 
 Build and offline verification, from the workspace root:
 
@@ -52,42 +53,75 @@ Actions API version 1:
 
 | Route | Request | Response |
 | --- | --- | --- |
-| `GET /health` | None | `pid`, `version="4.1.15.13"`, `api_version=1`, `capabilities=["recall"]`, `enabled`, `observed`, `records`, `selected_groups`, `window_seconds=180`; optional `error` prevents use. |
+| `GET /health` | None | `pid`, `version="4.1.15.13"`, `api_version=1`, `capabilities=["recall_disabled","record_status"]`, `enabled`, `observed`, `records`, `selected_groups`, `window_seconds=180`; optional `error` prevents use. |
 | `POST /start` | `{}` | Revalidate current config, enable observation for selected groups, return `{"enabled":true}`. |
 | `POST /stop` | `{}` | Disable observation, release copied records, return `{"disabled":true,"record_memory_released":true}`. |
-| `POST /recall` | `group`, decimal-string `server_id`, integer `create_time` seconds, integer `local_id`, 64-hex `request_id` | `status="queued"`, `server_id`, `request_id`. |
+| `POST /recall` | `group`, decimal-string `server_id`, integer `create_time` seconds, integer `local_id`, 64-hex `request_id` | Always HTTP 400 `status="rejected"`: use the original WeChat UI menu. The implementation contains no native recall queue call. |
+| `POST /record-status` | `group`, decimal-string `server_id`, integer `create_time` seconds, integer `local_id` | `ready`, `group`, `server_id`, `create_time`, `local_id`. Checks the existing cache only, without constructing, copying, expiring, destroying or queuing native objects. No pointers are returned. |
 | `GET /result?request_id=<id>&group=<group>` | The original request ID and group | `server_id`, `request_id`, boolean `executed`, `processed`, `success`. Unknown or mismatched requests return 404. |
 
-Loading creates hooks with record observation disabled. The Rust adapter calls
-`/start` during authorization before submitting newly requested messages. The
-same resident module supports `/stop` followed by `/start`; hooks are never
+This legacy module is not the forwarding adapter's recall implementation; recall
+uses the original WeChat UI menu. Loading the optional diagnostic module creates
+hooks with record observation disabled. The same resident module supports `/stop` followed by `/start`; hooks are never
 unloaded while callbacks might use them. Configuration is reread every second
 and synchronously before every action. Deselected groups' copied records are
 released. A changed account or token disables actions and clears records.
 
-A source must have a complete native record observed in this process, belong
+A cached source must have a native record observed in this process, belong
 to the current account and currently selected group, have a nonzero server ID,
 and match the requested local ID and creation time. Time must satisfy
 `0 <= now - create_time < 180` seconds. No native record is reconstructed from
-database fields. Records absent from observation are rejected before submission,
-with an explicit reason. At most 32 copied records are retained, and they expire
+database fields. Records absent from observation report `ready=false`; presence
+does not enable recall submission. At most 32 copied records are retained, and they expire
 after three minutes. The module exposes no message bodies.
 
-Before entering the native action queue, the module retains a receipt under
-`request_id` and `(group, server_id)`. Repeating the same ID and exact locator
-returns the prior queued receipt without entering the queue again. Reusing an ID
-for a different locator or submitting the same source under a different ID is
-rejected. Up to 1,024 receipts remain until WeChat exits, including after `/stop`.
-The Rust adapter persists its own receipt before calling this API to preserve
-that rule across adapter restarts.
+The observer ignores the reference factory's source-copy callsite
+`Weixin.dll+0x24EB6F8`; its exact native call bytes are verified before hooks are
+enabled. Thus a bridge-generated quote source cannot replace an existing real
+UI/database source through that callsite. Cached records must also contain the
+readable, live shared DB-clone pair at `+0x2C0/+0x2C8`, as transferred by the
+native DB-to-record conversion. These are rejection checks, not proof that every
+downstream recall context is complete. A `ready` response reports cache presence
+and the documented checks only; it does not confirm a native recall is safe or
+that a recall has occurred. Polling rereads token/account/group grants without
+calling native constructors, copy/destructors or the action queue.
 
-HTTP 400 means validation rejected this request before a new native submission;
-the JSON response includes `status="rejected"` and its precise `error`. A failure
-after receipt reservation is HTTP 500 with `status="uncertain"`; callers must
-poll existing confirmation rather than resubmit. Native `processed/success`
-only describes the worker result. The Rust adapter must also reread the matching
-database message and verify the expected `sysmsg/revokemsg` before announcing
-successful recall or clearing content in clients.
+The bridge must use WeChat's original UI menu for an actual recall.
+Default-constructing a DB message and supplying its visible fields is not an
+approved substitute for that path. In particular, native quote construction and
+nonempty DB-clone slots do not prove the associated runtime contexts required
+by recall are populated. No `prepare-recall` endpoint is provided.
+
+`POST /recall` is unconditionally rejected before constructing tasks, reserving
+receipts or calling native queues, including when the cache reports `ready=true`.
+The response is `status="rejected"` with a concise explanation that the native
+interface is disabled and the original WeChat menu is required. `/result` keeps
+the legacy read-only receipt format for checking an already recorded outcome;
+it cannot submit, resume, requeue, transfer another DLL's in-memory receipts or
+declare an unknown result successful. Unknown receipt IDs return 404. Existing
+uncertain attempts must remain uncertain until the matching actual
+`sysmsg/revokemsg` is confirmed in the database. Only then may clients clear
+the message content.
+
+Only an exact successfully parsed request whose ID has never been reserved and
+whose `(group, server_id)` has never been submitted can additionally carry
+`definite_not_submitted=true` on a validation rejection. Callers may use that
+explicit proof for a later user-requested retry through the original WeChat UI.
+An old ID with a changed locator, a new ID for an already submitted message,
+malformed input, native worker failure or an unknown result never carries that
+proof. Repeated or uncertain submissions must still use their saved receipt.
+
+Hook upgrades trust only the exact original native entries or the two explicitly
+fingerprinted historical builds: the original `df39db26...` component and shipped
+Actions `8be08c6e...`. Each existing MinHook relay must point into the expected
+loaded image with its exact full-file hash, filename, callback RVA and prefix;
+the image is pinned while its trampoline is retained. Unknown builds or modified
+chains require a normal WeChat restart rather than broader hook trust. The
+offline tests cover both known profiles, rejection of private/modified targets,
+source-copy pollution, missing DB ownership, read-only polling and the strict
+no-submission retry proof. They also assert that valid locators, an enabled cache,
+repeated requests and synthetic historical uncertain receipts can never create
+an action attempt or enter the disabled native queue.
 
 The quote loader uses a different root,
 `data/adapter/native-quotes/<binary-hash>/native.json`, with its own token/port,

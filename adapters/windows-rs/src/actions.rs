@@ -1,143 +1,41 @@
-use crate::{
-    engine::{Rejected, text},
-    native::{NativeClient, NativeHttpError},
-};
-use anyhow::{Context, Result, ensure};
-use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
+use crate::{native::NativeClient, recall::DefinitelyNotSubmitted};
+use anyhow::Result;
+use serde_json::Value;
 use std::{collections::BTreeSet, path::PathBuf};
 
-// This exact Actions DLL has the same 4.1.15.13 recall ABI/hooks as native/src/actions.cpp.
-// Remove this compatibility pin when that recall implementation or its ABI changes.
-const COMPATIBLE_ACTIONS_HASH: &str =
-    "8be08c6e44f9af86d6fde188a255060bbe53411c5b3c1ab9fab8c8ce0d21a974";
-
 pub struct Actions {
-    client: NativeClient,
-    root: PathBuf,
-    connected: bool,
+    allowed: BTreeSet<String>,
 }
 impl Actions {
-    pub fn new(directory: PathBuf, wxid: &str) -> Result<Self> {
-        // Revoke stale permissions even when the optional DLL is missing or cannot be read.
+    pub fn new(directory: PathBuf, _wxid: &str) -> Result<Self> {
+        // Retire the old native queue before enabling the UI route.
         let mut previous = NativeClient::new(directory.join("native-actions"));
         previous.restrict(&[])?;
-        drop(previous);
-        let hash = include_str!("../vendor/WeChatActions.sha256").trim();
-        ensure!(
-            hash.len() == 64 && hash.bytes().all(|c| c.is_ascii_hexdigit()),
-            "撤回组件尚未构建或指纹缺失"
-        );
-        let executable = std::env::current_exe()?;
-        let path = executable
-            .parent()
-            .context("程序目录缺失")?
-            .join("WeChatActions.dll");
-        let binary = std::fs::read(path).context("缺少独立撤回组件 WeChatActions.dll")?;
-        ensure!(
-            hex::encode(Sha256::digest(&binary)) == hash,
-            "独立撤回组件指纹不匹配"
-        );
-        let (binary, hash) = if hash != COMPATIBLE_ACTIONS_HASH {
-            match NativeClient::compatible_loaded_binary(
-                &directory.join("native-actions"),
-                COMPATIBLE_ACTIONS_HASH,
-            )? {
-                Some(binary) => (binary, COMPATIBLE_ACTIONS_HASH),
-                None => (binary, hash),
-            }
-        } else {
-            (binary, hash)
-        };
-        let mut client = NativeClient::with_binary(
-            directory.join("native-actions"),
-            binary,
-            hash,
-            json!({"self_wxid":wxid}),
-        );
-        client.restrict(&[])?;
         Ok(Self {
-            client,
-            root: directory,
-            connected: false,
+            allowed: BTreeSet::new(),
         })
     }
     pub fn select(&mut self, groups: &BTreeSet<String>) -> Result<()> {
-        let list: Vec<_> = groups.iter().cloned().collect();
-        if list.is_empty() {
-            self.client.restrict(&[])?;
-            if self.connected {
-                let _ = self.client.request("/stop", Some(&json!({})));
-            }
-            self.connected = false;
-            return Ok(());
-        }
-        let health = self
-            .client
-            .connect(&list, &self.root.join("feishu/media"))?;
-        ensure!(
-            health["capabilities"]
-                .as_array()
-                .is_some_and(|list| list.iter().any(|cap| cap == "recall")),
-            "当前原生组件不支持撤回"
-        );
-        let response = self.client.request("/start", Some(&json!({})))?;
-        ensure!(response["enabled"] == true, "微信撤回观察未启用");
-        self.connected = true;
+        self.allowed = groups.clone();
         Ok(())
     }
     pub fn submit(&mut self, group: &str, info: &Value, id: &str) -> Result<()> {
-        ensure!(self.connected, "微信撤回观察未启用");
-        let response=self.client.request("/recall",Some(&json!({"group":group,"server_id":info["server_id"],"create_time":info["create_time"],"local_id":info["local_id"],"request_id":id})))
-            .map_err(|error|if error.downcast_ref::<NativeHttpError>().is_some_and(NativeHttpError::definite_rejection){anyhow::Error::new(Rejected).context(format!("微信撤回未提交：{error}"))}else{error})?;
-        ensure!(
-            response["status"] == "queued"
-                && response["server_id"] == info["server_id"]
-                && response["request_id"] == id,
-            "撤回提交结果未获确认，未重复提交"
-        );
-        Ok(())
-    }
-    pub fn progress(&mut self, group: &str, id: &str) -> Result<Option<Value>> {
-        ensure!(
-            group
-                .bytes()
-                .all(|c| c.is_ascii_alphanumeric() || b"@_-".contains(&c))
-                && id.len() == 64
-                && id.bytes().all(|c| c.is_ascii_hexdigit()),
-            "撤回查询编号无效"
-        );
-        if !self.connected && !self.client.attach_existing()? {
-            return Ok(None);
-        }
-        match self
-            .client
-            .request(&format!("/result?request_id={id}&group={group}"), None)
+        if !self.allowed.contains(group)
+            || info["group"].as_str() != Some(group)
+            || id.len() != 64
+            || !id.bytes().all(|byte| byte.is_ascii_hexdigit())
         {
-            Ok(value) => {
-                ensure!(text(&value, "request_id") == id, "撤回回执编号不匹配");
-                Ok(Some(value))
-            }
-            Err(error)
-                if error
-                    .downcast_ref::<NativeHttpError>()
-                    .is_some_and(|error| error.code == 404) =>
-            {
-                Ok(None)
-            }
-            Err(error) => Err(error),
+            return Err(anyhow::Error::new(DefinitelyNotSubmitted)
+                .context("撤回群未获准或请求信息无效，未操作微信"));
         }
-    }
-}
-impl Drop for Actions {
-    fn drop(&mut self) {
-        let _ = self.select(&BTreeSet::new());
+        crate::chat_activation::recall(info)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     #[test]
     fn stale_authorization_is_cleared_even_before_optional_dll_loading() {
         let temp = tempfile::tempdir().unwrap();
@@ -152,5 +50,43 @@ mod tests {
         let config: Value = serde_json::from_slice(&std::fs::read(&old).unwrap()).unwrap();
         assert_eq!(config["groups"], json!([]));
         drop(actions);
+    }
+
+    #[test]
+    fn selecting_groups_and_rejecting_invalid_requests_never_opens_wechat() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut actions = Actions::new(temp.path().to_owned(), "wxid_fixture").unwrap();
+        let group = "12345@chatroom";
+        let info = json!({"group":group});
+        let id = "a".repeat(64);
+        assert!(
+            actions
+                .submit(group, &info, &id)
+                .unwrap_err()
+                .downcast_ref::<DefinitelyNotSubmitted>()
+                .is_some()
+        );
+        actions.select(&BTreeSet::from([group.to_owned()])).unwrap();
+        for (target, body, request_id) in [
+            ("54321@chatroom", info.clone(), id.as_str()),
+            (group, json!({}), id.as_str()),
+            (group, info.clone(), "invalid-request"),
+        ] {
+            assert!(
+                actions
+                    .submit(target, &body, request_id)
+                    .unwrap_err()
+                    .downcast_ref::<DefinitelyNotSubmitted>()
+                    .is_some()
+            );
+        }
+        actions.select(&BTreeSet::new()).unwrap();
+        assert!(
+            actions
+                .submit(group, &info, &id)
+                .unwrap_err()
+                .downcast_ref::<DefinitelyNotSubmitted>()
+                .is_some()
+        );
     }
 }

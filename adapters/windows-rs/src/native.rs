@@ -85,23 +85,6 @@ impl NativeClient {
         }
     }
 
-    pub fn compatible_loaded_binary(
-        root: &Path,
-        known_hash: &'static str,
-    ) -> Result<Option<Vec<u8>>> {
-        ensure!(valid_token(known_hash), "兼容组件静态指纹无效");
-        let prefix = &known_hash[..16];
-        if !root
-            .join(prefix)
-            .join(format!("WeChatLocal_{prefix}.dll"))
-            .try_exists()?
-        {
-            return Ok(None);
-        }
-        let (_, loaded) = platform::main_process()?;
-        compatible_binary(root, known_hash, &loaded)
-    }
-
     pub fn connect(&mut self, groups: &[String], media_root: &Path) -> Result<Value> {
         let groups = normalized_groups(groups)?;
         ensure!(!groups.is_empty(), "需要明确选择可同步的微信群");
@@ -475,6 +458,15 @@ pub fn verify_wechat() -> Result<()> {
     platform::main_process().map(|_| ())
 }
 
+pub fn verified_ui_process() -> Result<(u32, usize)> {
+    let (pid, modules) = platform::main_process()?;
+    let client = modules
+        .iter()
+        .find(|module| module.name == "weixin.dll")
+        .context("微信主模块不可用")?;
+    Ok((pid, client.base))
+}
+
 pub fn request_id(key: &str) -> String {
     hex::encode(Sha256::digest(key.as_bytes()))
 }
@@ -615,53 +607,6 @@ struct Module {
     name: String,
     base: usize,
     path: PathBuf,
-}
-
-fn compatible_binary(root: &Path, known_hash: &str, loaded: &[Module]) -> Result<Option<Vec<u8>>> {
-    let root = std::path::absolute(root)?;
-    ensure!(valid_token(known_hash), "兼容组件静态指纹无效");
-    let prefix = &known_hash[..16];
-    let name = format!("WeChatLocal_{prefix}.dll");
-    let destination = root.join(prefix).join(&name);
-    let Some(module) = loaded
-        .iter()
-        .find(|module| same_path(&module.path, &destination))
-    else {
-        return Ok(None);
-    };
-    for path in [&destination, &module.path] {
-        for ancestor in path.ancestors() {
-            let metadata = fs::symlink_metadata(ancestor)?;
-            ensure!(!metadata.file_type().is_symlink(), "兼容组件路径不能是链接");
-            #[cfg(windows)]
-            {
-                use std::os::windows::fs::MetadataExt;
-                ensure!(
-                    metadata.file_attributes() & 0x400 == 0,
-                    "兼容组件路径不能是重解析点"
-                );
-            }
-        }
-    }
-    let root = root.canonicalize()?;
-    let resolved = destination.canonicalize()?;
-    ensure!(
-        resolved == root.join(prefix).join(name),
-        "兼容组件缓存目录越界"
-    );
-    let file = File::open(&destination)?;
-    ensure!(file.metadata()?.is_file(), "兼容组件不是常规文件");
-    let mut bytes = Vec::new();
-    file.take(32 * 1024 * 1024 + 1).read_to_end(&mut bytes)?;
-    ensure!(
-        bytes.len() <= 32 * 1024 * 1024 && hex::encode(Sha256::digest(&bytes)) == known_hash,
-        "已加载兼容组件的完整指纹不匹配"
-    );
-    ensure!(
-        same_path(&module.path, &resolved),
-        "已加载兼容组件路径发生变化"
-    );
-    Ok(Some(bytes))
 }
 
 fn validate_client(path: &Path, digest: &str) -> Result<()> {
@@ -1128,133 +1073,6 @@ mod tests {
         assert!(
             validate_client(Path::new("fixture/4.1.15.13/Weixin.dll"), &"0".repeat(64)).is_err()
         );
-    }
-
-    fn cached_module(root: &Path, hash: &str, bytes: &[u8]) -> Module {
-        let prefix = &hash[..16];
-        let path = root.join(prefix).join(format!("WeChatLocal_{prefix}.dll"));
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(&path, bytes).unwrap();
-        let path = path.canonicalize().unwrap();
-        Module {
-            name: path.file_name().unwrap().to_string_lossy().into_owned(),
-            base: 0,
-            path,
-        }
-    }
-
-    #[test]
-    fn compatible_binary_requires_exact_own_cache_path_and_loaded_module() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap().join("native-actions");
-        assert!(
-            compatible_binary(&root, BRIDGE_HASH, &[])
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            compatible_binary(
-                Path::new("absent-relative-native-actions"),
-                BRIDGE_HASH,
-                &[]
-            )
-            .unwrap()
-            .is_none()
-        );
-        let loaded = cached_module(&root, BRIDGE_HASH, BRIDGE);
-        assert!(
-            compatible_binary(&root, BRIDGE_HASH, &[])
-                .unwrap()
-                .is_none()
-        );
-        let elsewhere = cached_module(&temp.path().join("another-service"), BRIDGE_HASH, BRIDGE);
-        assert!(
-            compatible_binary(&root, BRIDGE_HASH, &[elsewhere])
-                .unwrap()
-                .is_none()
-        );
-        let renamed = loaded.path.with_file_name("other.dll");
-        fs::copy(&loaded.path, &renamed).unwrap();
-        let alias = Module {
-            name: "other.dll".into(),
-            base: 0,
-            path: renamed,
-        };
-        assert!(
-            compatible_binary(&root, BRIDGE_HASH, &[alias])
-                .unwrap()
-                .is_none()
-        );
-        assert_eq!(
-            compatible_binary(&root, BRIDGE_HASH, &[loaded])
-                .unwrap()
-                .unwrap(),
-            BRIDGE
-        );
-    }
-
-    #[test]
-    fn compatible_binary_checks_the_full_digest_and_never_rewrites_a_loaded_file() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap().join("native-actions");
-        let loaded = cached_module(&root, BRIDGE_HASH, BRIDGE);
-        let same_prefix = format!("{}{}", &BRIDGE_HASH[..16], "f".repeat(48));
-        assert!(compatible_binary(&root, &same_prefix, std::slice::from_ref(&loaded)).is_err());
-        fs::write(&loaded.path, b"untrusted cached DLL").unwrap();
-        assert!(compatible_binary(&root, BRIDGE_HASH, std::slice::from_ref(&loaded)).is_err());
-        assert_eq!(fs::read(&loaded.path).unwrap(), b"untrusted cached DLL");
-        assert!(compatible_binary(&root, "not-a-static-full-digest", &[]).is_err());
-    }
-
-    #[cfg(any(unix, windows))]
-    #[test]
-    fn compatible_binary_rejects_linked_cache_paths() {
-        let temp = tempfile::tempdir().unwrap();
-        let base = temp.path().canonicalize().unwrap();
-        let outside = cached_module(&base.join("outside"), BRIDGE_HASH, BRIDGE);
-        let root = base.join("native-actions");
-        let prefix = &BRIDGE_HASH[..16];
-        #[cfg(unix)]
-        {
-            let destination = root.join(prefix).join(format!("WeChatLocal_{prefix}.dll"));
-            fs::create_dir_all(destination.parent().unwrap()).unwrap();
-            std::os::unix::fs::symlink(&outside.path, &destination).unwrap();
-            assert!(compatible_binary(&root, BRIDGE_HASH, std::slice::from_ref(&outside)).is_err());
-            fs::remove_file(&destination).unwrap();
-            fs::remove_dir(destination.parent().unwrap()).unwrap();
-        }
-        #[cfg(windows)]
-        fn junction(target: &Path, link: &Path) {
-            use std::os::windows::process::CommandExt;
-            let output = std::process::Command::new("cmd.exe")
-                .args([
-                    "/D",
-                    "/C",
-                    "mklink",
-                    "/J",
-                    &native_path(link).unwrap(),
-                    &native_path(target).unwrap(),
-                ])
-                .creation_flags(0x08000000)
-                .output()
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "temporary junction fixture failed: {output:?}"
-            );
-        }
-        fs::create_dir_all(&root).unwrap();
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(outside.path.parent().unwrap(), root.join(prefix)).unwrap();
-        #[cfg(windows)]
-        junction(outside.path.parent().unwrap(), &root.join(prefix));
-        assert!(compatible_binary(&root, BRIDGE_HASH, std::slice::from_ref(&outside)).is_err());
-        let linked_root = base.join("linked-native-actions");
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(base.join("outside"), &linked_root).unwrap();
-        #[cfg(windows)]
-        junction(&base.join("outside"), &linked_root);
-        assert!(compatible_binary(&linked_root, BRIDGE_HASH, &[outside]).is_err());
     }
 
     #[test]

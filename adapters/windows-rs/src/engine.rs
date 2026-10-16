@@ -1047,7 +1047,9 @@ impl<A: Backend> Engine<A> {
                 "recall" | "recall_check" => (|| {
                     let message = &command["message"];
                     let id = text(message, "id");
-                    if self.recalls.iter().any(|job| job.id() == id) {
+                    if self.recalls.iter().any(|job| {
+                        job.id() == id && job.attempt() == text(message, "recall_attempt")
+                    }) {
                         return Ok(());
                     }
                     ensure!(self.recalls.len() < 128, "微信撤回队列已满");
@@ -1060,6 +1062,7 @@ impl<A: Backend> Engine<A> {
                         &self.store,
                         message,
                         check_only,
+                        command["explicit_retry"] == true,
                         now,
                     )?;
                     self.recalls.push(job);
@@ -1083,7 +1086,12 @@ impl<A: Backend> Engine<A> {
                     };
                     events.push(json!({"type":"announcement","group":command["group"],"request_id":request,"available":false,"set":false,"author_id":"","author":"","avatar":"","updated_at":null,"text":"","error":"unavailable"}));
                 } else if operation == "recall" || operation == "recall_check" {
-                    events.push(json!({"type":"recall_ack","id":command["message"]["id"],"status":"failed","error":error.to_string()}));
+                    events.push(crate::recall::construction_failure(
+                        &self.store,
+                        &command["message"],
+                        operation == "recall_check",
+                        &error,
+                    )?);
                 } else {
                     let mut warning = json!({"type":"warning","text":error.to_string()});
                     if operation == "activate" {

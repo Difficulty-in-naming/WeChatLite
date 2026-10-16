@@ -20,4 +20,18 @@ fn main() {
     build.compile("wechat_silk");
     println!("cargo:rerun-if-changed=vendor/pilk-0.2.4/src/interface");
     println!("cargo:rerun-if-changed=vendor/pilk-0.2.4/src/SKP_SILK_SRC");
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        cc::Build::new()
+            .cpp(true)
+            .std("c++17")
+            .flag_if_supported("/utf-8")
+            .flag_if_supported("/EHsc")
+            .flag_if_supported("/Gy")
+            .file("native/chat_ui.cpp")
+            .compile("wechat_chat_ui");
+        for library in ["ole32", "oleaut32", "user32", "uuid"] {
+            println!("cargo:rustc-link-lib={library}");
+        }
+    }
+    println!("cargo:rerun-if-changed=native/chat_ui.cpp");
 }

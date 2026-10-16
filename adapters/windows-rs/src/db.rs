@@ -15,7 +15,7 @@ use rusqlite::{
 };
 use serde_json::{Value, json};
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     fs::File,
     io::Read,
     path::{Path, PathBuf},
@@ -23,6 +23,91 @@ use std::{
 };
 
 const NEGATIVE_LIMIT: usize = 128;
+pub const RECALL_HISTORY_PAGE: usize = 200;
+const RECALL_HISTORY_TEXT: usize = 32 * 1024;
+
+#[derive(Clone, PartialEq)]
+pub struct RecallHistorySnapshot {
+    files: BTreeMap<String, PathBuf>,
+    versions: BTreeMap<String, SnapshotVersion>,
+    #[cfg(test)]
+    fixture_versions: BTreeMap<String, (u64, i64)>,
+}
+
+fn recall_source(rel: &str) -> bool {
+    message_rel(rel)
+        || Path::new(rel)
+            .file_name()
+            .is_some_and(|name| name == "contact.db")
+}
+
+fn signature_value(signature: &crypto::Signature) -> Value {
+    json!({"modified_ns":signature.0,"length":signature.1,
+        "identity":[signature.2.0,signature.2.1]})
+}
+
+/// FFI callback: catalog and file metadata only, without SQL/decryption/process access.
+pub(crate) fn verify_ui_history_gate(gate: &Value) -> Result<()> {
+    let directory = PathBuf::from(gate["account_dir"].as_str().context("历史门禁目录无效")?);
+    ensure!(directory.is_absolute(), "历史门禁目录必须是绝对路径");
+    let expected = gate["files"].as_array().context("历史门禁文件清单无效")?;
+    ensure!(
+        !expected.is_empty() && expected.len() <= 1024,
+        "历史门禁文件清单为空或过大"
+    );
+    let current: BTreeMap<_, _> = collect_files(&directory)?
+        .into_iter()
+        .filter(|(rel, _)| recall_source(rel))
+        .collect();
+    let mut seen = BTreeSet::new();
+    for source in expected {
+        let rel = source["relative"].as_str().context("历史门禁分片无效")?;
+        ensure!(
+            seen.insert(rel) && recall_source(rel),
+            "历史门禁分片重复或无效"
+        );
+        let path = current.get(rel).context("历史门禁原数据库或分片已移除")?;
+        let (main, wal) = crypto::version(path)?.context("历史门禁原数据库已移除")?;
+        ensure!(
+            source["main"] == signature_value(&main)
+                && source["wal"] == wal.as_ref().map(signature_value).unwrap_or(Value::Null),
+            "消息或联系人数据库在菜单执行前发生变化，撤回未提交"
+        );
+    }
+    ensure!(
+        seen.len() == current.len(),
+        "消息或联系人数据库分片清单已变化，撤回未提交"
+    );
+    Ok(())
+}
+
+/// Read only the active account behind the already verified WeChat main process.
+/// The returned pointer profile is ephemeral and must be checked again before UI invocation.
+pub fn verify_ui_account(expected: &str, pid: u32, base: usize) -> Result<Value> {
+    #[cfg(windows)]
+    {
+        let snapshot = windows::current_account(pid, base)?;
+        require_ui_account(expected, &snapshot.accounts)?;
+        Ok(json!({"pid":pid,"module_base":base,"wxid":expected,"roots":snapshot.roots}))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (expected, pid, base);
+        bail!("本机微信账号校验仅支持 Windows")
+    }
+}
+
+fn require_ui_account(expected: &str, accounts: &[String]) -> Result<()> {
+    let accounts: BTreeSet<_> = accounts.iter().map(String::as_str).collect();
+    ensure!(
+        !expected.is_empty()
+            && expected.len() < 128
+            && accounts.len() == 1
+            && accounts.contains(expected),
+        "本机微信当前账号无法唯一确认或已经切换，撤回未提交"
+    );
+    Ok(())
+}
 
 #[derive(Clone, PartialEq)]
 struct PageQuery {
@@ -292,6 +377,19 @@ impl Db {
         statement.query_map([],|r|Ok(json!({"username":string(r,0)?,"name":string(r,1)?,"owner":string(r,2)?,"member_count":r.get::<_,i64>(3)?})))?.collect::<rusqlite::Result<_>>().map_err(Into::into)
     }
 
+    pub fn verify_recall_name(&mut self, group: &str, name: &str) -> Result<()> {
+        let rel = self.contact_rel()?;
+        let mut statement = self.open(&rel)?.prepare("SELECT username FROM contact WHERE delete_flag=0 AND coalesce(nullif(remark,''),nullif(nick_name,''),username)=?1 LIMIT 2")?;
+        let names = statement
+            .query_map([name], |row| string(row, 0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        ensure!(
+            names.len() == 1 && names[0] == group,
+            "本机微信存在同名联系人或会话，无法安全定位撤回菜单"
+        );
+        Ok(())
+    }
+
     pub fn members(&mut self, group: &str) -> Result<Vec<Value>> {
         let rel = self.contact_rel()?;
         let connection = self.open(&rel)?;
@@ -531,6 +629,161 @@ impl Db {
         Ok(rows)
     }
 
+    pub fn recall_history_snapshot(&mut self) -> Result<RecallHistorySnapshot> {
+        #[cfg(test)]
+        let fixture = self.keys.is_empty()
+            && !self.files.is_empty()
+            && self
+                .files
+                .iter()
+                .all(|(rel, path)| !path.exists() && self.connections.contains_key(rel));
+        #[cfg(not(test))]
+        let fixture = false;
+        if !fixture {
+            self.refresh_catalog(true)?;
+        }
+        let files: BTreeMap<_, _> = self
+            .files
+            .iter()
+            .filter(|(rel, _)| recall_source(rel))
+            .map(|(rel, path)| (rel.clone(), path.clone()))
+            .collect();
+        ensure!(
+            files.keys().any(|rel| message_rel(rel)),
+            "完整历史校验缺少消息分片，撤回未提交"
+        );
+        let mut snapshot = RecallHistorySnapshot {
+            files,
+            versions: BTreeMap::new(),
+            #[cfg(test)]
+            fixture_versions: BTreeMap::new(),
+        };
+        for (rel, path) in &snapshot.files {
+            #[cfg(test)]
+            if fixture {
+                let connection = self.connections.get(rel).context("离线历史分片缺失")?;
+                snapshot.fixture_versions.insert(
+                    rel.clone(),
+                    (
+                        connection.total_changes(),
+                        connection.query_row("PRAGMA schema_version", [], |row| row.get(0))?,
+                    ),
+                );
+                continue;
+            }
+            snapshot.versions.insert(
+                rel.clone(),
+                crypto::version(path)?.context("完整历史校验的消息分片已移除")?,
+            );
+        }
+        Ok(snapshot)
+    }
+
+    pub fn verify_recall_history_snapshot(
+        &mut self,
+        snapshot: &RecallHistorySnapshot,
+    ) -> Result<()> {
+        ensure!(
+            self.recall_history_snapshot()? == *snapshot,
+            "完整历史校验期间消息数据库或分片发生变化，撤回未提交"
+        );
+        Ok(())
+    }
+
+    pub fn ui_history_gate(&self, snapshot: &RecallHistorySnapshot) -> Value {
+        // Synthetic in-memory fixtures have no file signatures and cannot pass the FFI gate.
+        let files: Vec<_> = snapshot
+            .versions
+            .iter()
+            .map(|(relative, (main, wal))| {
+                json!({"relative":relative,"main":signature_value(main),
+                "wal":wal.as_ref().map(signature_value).unwrap_or(Value::Null)})
+            })
+            .collect();
+        json!({"account_dir":self.account_dir.to_string_lossy(),"files":files})
+    }
+
+    /// Strict raw type-1 text, in one fixed-size merged page. Invalid text is explicit, never omitted.
+    pub fn recall_history_page(
+        &mut self,
+        group: &str,
+        snapshot: &RecallHistorySnapshot,
+        position: Option<&Value>,
+    ) -> Result<Vec<Value>> {
+        self.verify_recall_history_snapshot(snapshot)?;
+        let table = format!("Msg_{:x}", Md5::digest(group.as_bytes()));
+        let self_id = self.wxid.clone();
+        let mut result = Vec::new();
+        for rel in snapshot.files.keys().filter(|rel| message_rel(rel)) {
+            let shard = rel.replace('/', "__");
+            let (filter, params) = if let Some(position) = position {
+                let sequence = position["sort_seq"].as_i64().context("完整历史游标无效")?;
+                let cursor_shard = position["shard"].as_str().context("完整历史分片无效")?;
+                let id = position["local_id"].as_i64().context("完整历史编号无效")?;
+                match shard.as_str().cmp(cursor_shard) {
+                    std::cmp::Ordering::Equal => (
+                        "WHERE sort_seq>?1 OR (sort_seq=?1 AND local_id>?2)",
+                        vec![sequence.into(), id.into()],
+                    ),
+                    std::cmp::Ordering::Greater => ("WHERE sort_seq>=?1", vec![sequence.into()]),
+                    std::cmp::Ordering::Less => ("WHERE sort_seq>?1", vec![sequence.into()]),
+                }
+            } else {
+                ("", Vec::<SqlValue>::new())
+            };
+            let connection = self.open(rel)?;
+            if !connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+                [&table],
+                |row| row.get::<_, bool>(0),
+            )? {
+                continue;
+            }
+            // Bound each field before materializing it; corrupt/oversized type-1 rows remain barriers.
+            let sql = format!("SELECT local_id,local_type,real_sender_id,sort_seq,
+                CASE WHEN local_type=1 AND length(message_content)<=2097152 THEN message_content END,
+                CASE WHEN local_type=1 AND length(compress_content)<=2097152 THEN compress_content END
+                FROM {table} {filter} ORDER BY sort_seq ASC,local_id ASC LIMIT {RECALL_HISTORY_PAGE}");
+            let mut statement = connection.prepare(&sql)?;
+            let mut cursor = statement.query(params_from_iter(params))?;
+            while let Some(row) = cursor.next()? {
+                let kind = row.get::<_, i64>(1)?;
+                let sender_id = row.get::<_, i64>(2)?;
+                let mut entry = json!({"local_id":row.get::<_,i64>(0)?,"sort_seq":row.get::<_,i64>(3)?,
+                    "shard":shard,"local_type":kind,"is_text":message_type(kind)=="文本"});
+                if kind == 1 {
+                    let decoded = strict_history_text(row.get_ref(4)?)
+                        .or_else(|_| strict_history_text(row.get_ref(5)?));
+                    if let Ok(body) = decoded {
+                        let sender = if sender_id == 2 {
+                            self_id.clone()
+                        } else if sender_id != 0 {
+                            connection
+                                .query_row(
+                                    "SELECT user_name FROM Name2Id WHERE rowid=?1",
+                                    [sender_id],
+                                    |row| string(row, 0),
+                                )
+                                .optional()?
+                                .unwrap_or_default()
+                        } else {
+                            String::new()
+                        };
+                        entry["content"] = body.into();
+                        entry["sender_id"] = sender_id.into();
+                        entry["sender_username"] = sender.into();
+                    }
+                }
+                result.push(entry);
+            }
+            // Keep at most one page plus one shard's page, regardless of total history size.
+            result.sort_by_key(cursor_tuple);
+            result.truncate(RECALL_HISTORY_PAGE);
+        }
+        self.verify_recall_history_snapshot(snapshot)?;
+        Ok(result)
+    }
+
     pub fn page(&mut self, group: &str, position: &Value, limit: usize) -> Result<Vec<Value>> {
         if limit == 0 {
             return Ok(Vec::new());
@@ -755,6 +1008,35 @@ fn friendly(value: ValueRef<'_>, kind: &str) -> String {
         }
     }
     format!("[{kind}]")
+}
+
+fn strict_history_text(value: ValueRef<'_>) -> Result<String> {
+    let bytes = match value {
+        ValueRef::Text(bytes) | ValueRef::Blob(bytes) => bytes,
+        _ => bail!("原始文本内容不可解码"),
+    };
+    ensure!(bytes.len() <= 2 * 1024 * 1024, "原始文本超过校验容量");
+    let decoded;
+    let bytes = if bytes.starts_with(b"\x28\xb5\x2f\xfd") {
+        let mut decoder = zstd::stream::read::Decoder::new(bytes)?;
+        decoder.window_log_max(23)?;
+        let mut buffer = Vec::new();
+        decoder
+            .take((RECALL_HISTORY_TEXT + 1) as u64)
+            .read_to_end(&mut buffer)?;
+        ensure!(buffer.len() <= RECALL_HISTORY_TEXT, "原始文本超过校验容量");
+        decoded = buffer;
+        decoded.as_slice()
+    } else {
+        bytes
+    };
+    ensure!(bytes.len() <= RECALL_HISTORY_TEXT, "原始文本超过校验容量");
+    let body = std::str::from_utf8(bytes)?.trim();
+    ensure!(
+        !body.is_empty() && !body.contains('\0'),
+        "原始文本为空或包含NUL"
+    );
+    Ok(body.to_owned())
 }
 
 fn protobuf_bytes(mut data: &[u8]) -> Result<Vec<(u64, &[u8])>> {
@@ -1008,6 +1290,131 @@ pub fn scan_memory(visitor: impl FnMut(u32, usize, &[u8]) -> bool) -> Result<()>
 mod tests {
     use super::*;
     use rusqlite::params;
+
+    #[test]
+    fn recall_metadata_gate_detects_new_shards_wal_contact_and_file_changes() {
+        for change in ["shard", "wal", "contact", "main"] {
+            let directory = tempfile::tempdir().unwrap();
+            let messages = directory.path().join("db_storage/message");
+            let contacts = directory.path().join("db_storage/contact");
+            std::fs::create_dir_all(&messages).unwrap();
+            std::fs::create_dir_all(&contacts).unwrap();
+            std::fs::write(messages.join("message_0.db"), b"fixture database").unwrap();
+            std::fs::write(contacts.join("contact.db"), b"fixture contacts").unwrap();
+            let mut db = Db::media_fixture(
+                directory.path().to_owned(),
+                "wxid_fixture",
+                None,
+                HashMap::new(),
+            );
+            let snapshot = db.recall_history_snapshot().unwrap();
+            let gate = db.ui_history_gate(&snapshot);
+            verify_ui_history_gate(&gate).unwrap();
+            match change {
+                "shard" => std::fs::write(messages.join("message_1.db"), b"new shard").unwrap(),
+                "wal" => std::fs::write(messages.join("message_0.db-wal"), b"new WAL").unwrap(),
+                "contact" => {
+                    std::fs::write(contacts.join("contact.db"), b"changed contacts").unwrap()
+                }
+                _ => {
+                    std::fs::write(messages.join("message_0.db"), b"changed main database").unwrap()
+                }
+            }
+            assert!(verify_ui_history_gate(&gate).is_err(), "{change}");
+            assert!(
+                db.verify_recall_history_snapshot(&snapshot).is_err(),
+                "{change}"
+            );
+        }
+        assert!(verify_ui_history_gate(&json!({"account_dir":"relative","files":[]})).is_err());
+    }
+
+    #[test]
+    fn recall_history_pages_are_fixed_200_and_preserve_cross_shard_negative_and_equal_sequences() {
+        let mut db = fixture();
+        let table = format!("Msg_{:x}", Md5::digest(b"g@chatroom"));
+        for rel in ["message/message_0.db", "message/message_1.db"] {
+            db.open(rel)
+                .unwrap()
+                .execute(&format!("DELETE FROM {table}"), [])
+                .unwrap();
+        }
+        for index in 0..405_i64 {
+            let rel = if index % 2 == 0 {
+                "message/message_0.db"
+            } else {
+                "message/message_1.db"
+            };
+            db.open(rel)
+                .unwrap()
+                .execute(
+                    &format!("INSERT INTO {table} VALUES(?1,1,2,1000,'body','',NULL,NULL,0,?2)"),
+                    params![index + 1, index / 2 - 200],
+                )
+                .unwrap();
+        }
+        let snapshot = db.recall_history_snapshot().unwrap();
+        let mut position = None;
+        let mut all = Vec::new();
+        loop {
+            let rows = db
+                .recall_history_page("g@chatroom", &snapshot, position.as_ref())
+                .unwrap();
+            assert!(rows.len() <= RECALL_HISTORY_PAGE);
+            if rows.is_empty() {
+                break;
+            }
+            if all.is_empty() {
+                assert_eq!(rows.len(), 200);
+            }
+            position = rows.last().cloned();
+            all.extend(rows.into_iter().map(|row| cursor_tuple(&row)));
+        }
+        assert_eq!(all.len(), 405);
+        assert!(all.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    #[test]
+    fn recall_strict_history_decoder_does_not_use_lossy_or_truncated_placeholders() {
+        for bytes in [
+            vec![255, 0],
+            vec![0],
+            vec![b'x'; RECALL_HISTORY_TEXT + 1],
+            b"\x28\xb5\x2f\xfdgarbage".to_vec(),
+        ] {
+            assert!(strict_history_text(ValueRef::Blob(&bytes)).is_err());
+        }
+        let compressed = zstd::stream::encode_all(b"fixture text".as_slice(), 1).unwrap();
+        assert_eq!(
+            strict_history_text(ValueRef::Blob(&compressed)).unwrap(),
+            "fixture text"
+        );
+    }
+
+    #[test]
+    fn ui_account_gate_requires_one_current_account_matching_db_without_exposing_ids() {
+        require_ui_account("wxid_fixture", &["wxid_fixture".into()]).unwrap();
+        require_ui_account(
+            "wxid_fixture",
+            &["wxid_fixture".into(), "wxid_fixture".into()],
+        )
+        .unwrap();
+        for (expected, accounts) in [
+            ("wxid_fixture", vec![]),
+            ("wxid_fixture", vec!["wxid_other".into()]),
+            (
+                "wxid_fixture",
+                vec!["wxid_fixture".into(), "wxid_other".into()],
+            ),
+            ("", vec!["".into()]),
+        ] {
+            let error = require_ui_account(expected, &accounts)
+                .unwrap_err()
+                .to_string();
+            assert!(!error.contains("wxid_fixture"));
+            assert!(!error.contains("wxid_other"));
+        }
+    }
 
     fn table_schema(group: &str) -> String {
         let table = format!("Msg_{:x}", Md5::digest(group.as_bytes()));

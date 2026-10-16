@@ -47,6 +47,7 @@ pub fn public(mut value: Value) -> Value {
             obj.remove("path");
             obj.remove("access_client");
             obj.remove("recall_client");
+            obj.remove("recall_attempt");
             for child in obj.values_mut() {
                 *child = public(child.take());
             }
@@ -1050,6 +1051,8 @@ async fn send(
         source_ids: Vec::new(),
         recall_status: String::new(),
         recall_error: String::new(),
+        recall_retryable: false,
+        recall_attempt: String::new(),
         outgoing: true,
     };
     let (stored, event) = app
@@ -1085,7 +1088,8 @@ async fn recall(
     if !existing.outgoing {
         bail_api("只能撤回本人发送的消息")?;
     }
-    if existing.status == "recalled" || !existing.recall_status.is_empty() {
+    let explicit_retry = existing.recall_status == "failed" && existing.recall_retryable;
+    if existing.status == "recalled" || (!existing.recall_status.is_empty() && !explicit_retry) {
         return Ok(Json(public(json!(existing))));
     }
     if app.status.read().await["ready"] != true {
@@ -1106,7 +1110,7 @@ async fn recall(
         .await?;
     if let Some(event) = event {
         app.publish(event);
-        permit.send(json!({"op":"recall","message":message}));
+        permit.send(json!({"op":"recall","recall_attempt":message.recall_attempt,"message":message,"explicit_retry":explicit_retry}));
     }
     Ok(Json(public(json!(message))))
 }

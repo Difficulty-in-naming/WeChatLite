@@ -1934,7 +1934,6 @@ class DesktopTests : public QObject
                            {"sender", "自己"},         {"text", "confirmed own message"},
                            {"outgoing", true},         {"status", "sent"},
                            {"source_id", "wx-source"}, {"timestamp", QDateTime::currentMSecsSinceEpoch()}};
-        recalledMessage["quote"] = QJsonObject{{"id", "latest"}, {"sender", "成员"}, {"text", "latest text"}};
         transport->event({{"type", "message"}, {"message", recalledMessage}});
         const auto staleHistory = QJsonDocument(sourceHistory).toJson(QJsonDocument::Compact);
         heldHistory->write("HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: application/json\r\n"

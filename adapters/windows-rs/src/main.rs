@@ -1,5 +1,6 @@
 mod access;
 mod actions;
+mod chat_activation;
 mod db;
 mod engine;
 mod media;

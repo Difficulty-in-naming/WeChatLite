@@ -311,6 +311,9 @@ impl Backend for Fake {
     fn recall_submit(&mut self, _: &str, _: &Value, id: &str) -> Result<()> {
         self.calls.push(format!("recall:{id}"));
         if self.mode == "reject" {
+            return Err(crate::recall::DefinitelyNotSubmitted.into());
+        }
+        if self.mode == "reject_unproven" {
             return Err(Rejected.into());
         }
         if self.mode == "lost" {
@@ -1077,6 +1080,7 @@ fn recalled_message() -> Value {
     m["outgoing"] = json!(true);
     m["timestamp"] = json!(1_000_000);
     m["source_id"] = json!("wx:g:message__message_0.db:1:10");
+    m["recall_attempt"] = json!("a".repeat(32));
     m
 }
 #[test]
@@ -1179,4 +1183,244 @@ fn recall_lost_response_is_uncertain_and_never_resubmits() {
     );
     engine.cycle(&[cmd], 1004.0);
     assert_eq!(engine.access.calls.len(), 1);
+}
+
+#[test]
+fn recall_prequeue_rejection_retries_only_on_an_explicit_action_and_survives_restart() {
+    let (temp, mut engine) = setup(json!(["g"]));
+    engine.access.mode = "reject";
+    let m = recalled_message();
+    let command = json!({"op":"recall","message":m});
+    let result = engine.cycle(&[command.clone()], 1002.0);
+    assert!(result.iter().any(|event| event["type"] == "recall_ack"
+        && event["status"] == "failed"
+        && event["definite_not_submitted"] == true));
+    assert_eq!(engine.access.calls.len(), 1);
+    engine.access.mode = "confirm";
+    engine.cycle(&[command.clone()], 1003.0);
+    engine.cycle(
+        &[json!({"op":"recall_check","message":m,"explicit_retry":true})],
+        1003.5,
+    );
+    assert_eq!(engine.access.calls.len(), 1);
+    let access = engine.access.clone();
+    drop(engine);
+    let mut engine = Engine::new(access, temp.path().to_owned(), &json!(["g"]), 1004.0).unwrap();
+    engine.cycle(&[json!({"op":"recall_check","message":m})], 1004.0);
+    assert_eq!(engine.access.calls.len(), 1);
+    let result = engine.cycle(
+        &[json!({"op":"recall","message":m,"explicit_retry":true})],
+        1005.0,
+    );
+    assert!(
+        result
+            .iter()
+            .any(|event| event["type"] == "recall_ack" && event["status"] == "recalled")
+    );
+    assert_eq!(engine.access.calls.len(), 2);
+    engine.cycle(
+        &[json!({"op":"recall","message":m,"explicit_retry":true})],
+        1006.0,
+    );
+    assert_eq!(engine.access.calls.len(), 2);
+}
+
+#[test]
+fn recall_queued_unknown_worker_rejection_and_unproven_failure_can_never_retry() {
+    for mode in ["lost", "reject_result", "reject_unproven", "wait"] {
+        let (_temp, mut engine) = setup(json!(["g"]));
+        engine.access.mode = mode;
+        let m = recalled_message();
+        let first = engine.cycle(&[json!({"op":"recall","message":m})], 1002.0);
+        if mode == "wait" {
+            engine.cycle(&[], 1033.0);
+        }
+        assert!(
+            !first
+                .iter()
+                .any(|event| event["type"] == "recall_ack"
+                    && event["definite_not_submitted"] == true),
+            "{mode}"
+        );
+        engine.access.mode = "confirm";
+        engine.cycle(
+            &[json!({"op":"recall","message":m,"explicit_retry":true})],
+            1034.0,
+        );
+        assert_eq!(engine.access.calls.len(), 1, "{mode}");
+    }
+}
+
+#[test]
+fn recall_partial_submission_never_becomes_retryable_when_a_later_part_is_rejected() {
+    let (_temp, mut engine) = setup(json!(["g"]));
+    let mut m = recalled_message();
+    m["source_ids"] = json!([m["source_id"], "wx:g:message__message_0.db:2:11"]);
+    engine.cycle(&[json!({"op":"recall","message":m})], 1002.0);
+    engine.access.mode = "reject";
+    let result = engine.cycle(&[], 1003.0);
+    assert!(result.iter().any(|event| event["type"] == "recall_ack"
+        && event["status"] == "uncertain"
+        && event["definite_not_submitted"] == false));
+    engine.access.mode = "confirm";
+    engine.cycle(
+        &[json!({"op":"recall","message":m,"explicit_retry":true})],
+        1004.0,
+    );
+    assert_eq!(engine.access.calls.len(), 2);
+}
+
+#[test]
+fn recall_explicit_retry_revalidates_age_source_and_current_policy_before_submission() {
+    for change in [
+        json!({"timestamp":700000}),
+        json!({"outgoing":false}),
+        json!({"source_id":"wx:h:message__message_0.db:1:10"}),
+    ] {
+        let (_temp, mut engine) = setup(json!(["g"]));
+        engine.access.mode = "reject";
+        let mut m = recalled_message();
+        engine.cycle(&[json!({"op":"recall","message":m})], 1002.0);
+        for (key, value) in change.as_object().unwrap() {
+            m[key] = value.clone();
+        }
+        engine.access.mode = "confirm";
+        engine.cycle(
+            &[json!({"op":"recall","message":m,"explicit_retry":true})],
+            1003.0,
+        );
+        assert_eq!(engine.access.calls.len(), 1);
+    }
+    let (_temp, mut engine) = setup(json!(["g"]));
+    engine.access.mode = "reject";
+    let m = recalled_message();
+    engine.cycle(&[json!({"op":"recall","message":m})], 1002.0);
+    engine.cycle(&[json!({"op":"configure","groups":[]})], 1003.0);
+    engine.access.mode = "confirm";
+    engine.cycle(
+        &[json!({"op":"recall","message":m,"explicit_retry":true})],
+        1004.0,
+    );
+    assert_eq!(engine.access.calls.len(), 1);
+}
+
+#[test]
+fn recall_recovery_of_a_saved_unattempted_first_part_never_queues_by_itself() {
+    let (_temp, mut engine) = setup(json!(["g"]));
+    let m = recalled_message();
+    crate::recall::RecallJob::new(&mut engine.access, &engine.store, &m, false, false, 1002.0)
+        .unwrap();
+    let result = engine.cycle(&[json!({"op":"recall_check","message":m})], 1003.0);
+    assert!(result.iter().any(|event| event["type"] == "recall_ack"
+        && event["status"] == "failed"
+        && event["definite_not_submitted"] == true));
+    assert!(engine.access.calls.is_empty());
+    engine.cycle(
+        &[json!({"op":"recall","message":m,"explicit_retry":true})],
+        1004.0,
+    );
+    assert_eq!(engine.access.calls.len(), 1);
+}
+
+#[test]
+fn recall_old_check_cannot_overwrite_or_swallow_a_new_explicit_attempt_in_the_same_cycle() {
+    let (_temp, mut engine) = setup(json!(["g"]));
+    engine.access.mode = "reject";
+    let old = recalled_message();
+    engine.cycle(&[json!({"op":"recall","message":old})], 1002.0);
+    let mut new = old.clone();
+    new["recall_attempt"] = json!("b".repeat(32));
+    engine.access.mode = "confirm";
+    let first = engine.cycle(
+        &[
+            json!({"op":"recall_check","message":old}),
+            json!({"op":"recall","message":new,"explicit_retry":true}),
+        ],
+        1003.0,
+    );
+    assert!(first.iter().any(|ack| ack["type"] == "recall_ack"
+        && ack["recall_attempt"] == old["recall_attempt"]
+        && ack["definite_not_submitted"] == false));
+    assert_eq!(engine.access.calls.len(), 1);
+    let current = engine
+        .store
+        .state(&format!("recall:{}", text(&old, "id")))
+        .unwrap()
+        .unwrap();
+    assert_eq!(current["recall_attempt"], new["recall_attempt"]);
+    assert!(current.get("ack").is_none());
+    let mut late_check =
+        crate::recall::RecallJob::new(&mut engine.access, &engine.store, &old, true, false, 1003.5)
+            .unwrap();
+    let late_ack = late_check
+        .advance(&mut engine.access, &engine.store, true, 1003.5)
+        .unwrap()
+        .unwrap();
+    assert_eq!(late_ack["recall_attempt"], old["recall_attempt"]);
+    assert_eq!(late_ack["definite_not_submitted"], false);
+    assert!(
+        engine
+            .store
+            .state(&format!("recall:{}", text(&old, "id")))
+            .unwrap()
+            .unwrap()
+            .get("ack")
+            .is_none()
+    );
+    let result = engine.cycle(&[], 1004.0);
+    assert!(result.iter().any(|ack| ack["type"] == "recall_ack"
+        && ack["recall_attempt"] == new["recall_attempt"]
+        && ack["status"] == "recalled"));
+    assert_eq!(engine.access.calls.len(), 2);
+}
+
+#[test]
+fn recall_unknown_old_generation_and_legacy_checks_never_queue_or_gain_retry_proof() {
+    let (_temp, mut engine) = setup(json!(["g"]));
+    engine.access.mode = "wait";
+    let old = recalled_message();
+    engine.cycle(&[json!({"op":"recall","message":old})], 1002.0);
+    let mut new = old.clone();
+    new["recall_attempt"] = json!("b".repeat(32));
+    engine.cycle(
+        &[json!({"op":"recall","message":new,"explicit_retry":true})],
+        1003.0,
+    );
+    engine.cycle(&[], 1033.0);
+    let events = engine.cycle(&[], 1034.0);
+    assert!(
+        !events
+            .iter()
+            .any(|ack| ack["definite_not_submitted"] == true)
+    );
+    assert_eq!(engine.access.calls.len(), 1);
+
+    let (_temp, mut engine) = setup(json!(["g"]));
+    let mut legacy = recalled_message();
+    crate::recall::RecallJob::new(
+        &mut engine.access,
+        &engine.store,
+        &legacy,
+        false,
+        false,
+        1002.0,
+    )
+    .unwrap();
+    let key = format!("recall:{}", text(&legacy, "id"));
+    let mut saved = engine.store.state(&key).unwrap().unwrap();
+    saved.as_object_mut().unwrap().remove("recall_attempt");
+    engine.store.set(&key, &saved).unwrap();
+    legacy.as_object_mut().unwrap().remove("recall_attempt");
+    for operation in ["recall_check", "recall"] {
+        let events = engine.cycle(
+            &[json!({"op":operation,"message":legacy,"explicit_retry":true})],
+            1003.0,
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|ack| ack["definite_not_submitted"] == true)
+        );
+        assert!(engine.access.calls.is_empty());
+    }
 }
