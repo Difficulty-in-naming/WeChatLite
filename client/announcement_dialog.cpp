@@ -2,6 +2,7 @@
 #include "messages.h"
 #include "transport.h"
 #include <QCloseEvent>
+#include <QApplication>
 #include <QDateTime>
 #include <QDesktopServices>
 #include <QHBoxLayout>
@@ -42,7 +43,7 @@ void showPlainAnnouncement(QTextBrowser *view, const QString &text)
         QTextCharFormat format;
         format.setAnchor(true);
         format.setAnchorHref(url.toString(QUrl::FullyEncoded));
-        format.setForeground(QColor("#334e88"));
+        format.setForeground(qApp->palette().color(QPalette::Link));
         format.setFontUnderline(true);
         cursor.mergeCharFormat(format);
     }
@@ -61,12 +62,6 @@ AnnouncementDialog::AnnouncementDialog(Transport *service, const QString &group,
     setAttribute(Qt::WA_DeleteOnClose);
     resize(552, 642);
     setMinimumSize(400, 360);
-    setStyleSheet(
-        "#announcementDialog { background:#fafafa; }"
-        "#announcementBody { background:transparent; border:0; padding:0; color:#19191a; }"
-        "#announcementUpdated, #announcementState, #announcementReadOnly { color:#9f9fa6; font-size:12px; }"
-        "#announcementRetry { background:transparent; color:#334e88; border:0; padding:3px; }"
-    );
     auto *outer = new QVBoxLayout(this);
     outer->setContentsMargins(24, 22, 24, 20);
     outer->setSpacing(0);

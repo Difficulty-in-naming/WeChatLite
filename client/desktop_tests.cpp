@@ -4,6 +4,9 @@
 #include "connection_info.h"
 #include "history_browser.h"
 #include "messages.h"
+#include "preferences_dialog.h"
+#include "media_storage.h"
+#include "theme.h"
 #include "test_tls_identity.h"
 #include "tunnel_session.h"
 #include "voice_player.h"
@@ -20,6 +23,7 @@
 #include <QDir>
 #include <QFile>
 #include <QJsonDocument>
+#include <QImage>
 #include <QLabel>
 #include <QLineEdit>
 #include <QListWidget>
@@ -191,18 +195,20 @@ class DesktopTests : public QObject
     void chatHasOnlySendHeaderEntriesAndWindowControls()
     {
         const auto buttons = window->findChildren<QPushButton *>();
-        QCOMPARE(buttons.size(), 7);
+        QCOMPARE(buttons.size(), 8);
         for (auto *button : buttons)
         {
             QVERIFY(button->objectName() == "sendButton" || button->objectName() == "windowButton" ||
                     button->objectName() == "closeWindow" || button->objectName() == "historyButton" ||
-                    button->objectName() == "announcementButton");
+                    button->objectName() == "announcementButton" || button->objectName() == "preferencesButton");
             QVERIFY(button->toolTip().isEmpty());
-            if (button->objectName() == "historyButton" || button->objectName() == "announcementButton")
+            if (button->objectName() == "historyButton" || button->objectName() == "announcementButton" ||
+                button->objectName() == "preferencesButton")
             {
                 QVERIFY(button->text().isEmpty());
                 QCOMPARE(button->accessibleName(), button->objectName() == "historyButton" ?
-                    QString("聊天记录") : QString("群公告"));
+                    QString("聊天记录") : button->objectName() == "announcementButton" ?
+                    QString("群公告") : QString("设置"));
                 QVERIFY(!button->icon().isNull());
                 QCOMPARE(button->iconSize(), QSize(20, 20));
                 const auto rendered = button->icon().pixmap(QSize(20, 20)).toImage();
@@ -224,6 +230,78 @@ class DesktopTests : public QObject
             QVERIFY(!entry.contains("服务配置") && !entry.contains("转发群") && !entry.contains("停止"));
         auto *process = window->findChild<QProcess *>();
         QVERIFY(process && process->arguments().contains("--demo"));
+    }
+    void headerSettingsSaveStorageThemeAndSoundWithoutChangingConnection()
+    {
+        const auto before = QSettings().value("downloads").toString();
+        const auto oldSound = QSettings().value("notificationSound", true).toBool();
+        const auto oldTheme = Theme::mode();
+        const auto oldLimit = MediaStorage::cacheLimit();
+        const auto oldUrl = window->findChild<Transport *>()->baseUrl();
+        QDir().mkpath(before);
+        QFile preserved(QDir(before).filePath("settings-keeps-downloads.txt"));
+        QVERIFY(preserved.open(QIODevice::WriteOnly));
+        preserved.write("saved-by-user"); preserved.close();
+        QDir().mkpath(MediaStorage::cacheDirectory());
+        QFile cached(QDir(MediaStorage::cacheDirectory()).filePath("settings-clears-cache.bin"));
+        QVERIFY(cached.open(QIODevice::WriteOnly));
+        cached.write("cached-preview"); cached.close();
+        QTest::mouseClick(window->findChild<QPushButton *>("preferencesButton"), Qt::LeftButton);
+        auto *dialog = window->findChild<PreferencesDialog *>();
+        QVERIFY(dialog && dialog->isVisible());
+        QTRY_VERIFY_WITH_TIMEOUT(!dialog->findChild<QLabel *>("preferencesUsageCache")->text().contains("未统计") &&
+            !dialog->findChild<QLabel *>("preferencesUsageCache")->text().contains("正在统计"), 5000);
+        QTest::mouseClick(dialog->findChild<QPushButton *>("preferencesClearCache"), Qt::LeftButton);
+        QTRY_VERIFY_WITH_TIMEOUT(!QFileInfo::exists(cached.fileName()), 5000);
+        QVERIFY(QFileInfo::exists(preserved.fileName()));
+        QSignalSpy preview(window, &Window::notificationSoundPreviewRequested);
+        auto *navigation = dialog->findChild<QListWidget *>("preferencesNavigation");
+        navigation->setCurrentRow(2);
+        QTest::mouseClick(dialog->findChild<QPushButton *>("preferencesSoundPreview"), Qt::LeftButton);
+        QCOMPARE(preview.size(), 1);
+        dialog->findChild<QLineEdit *>("preferencesDownloads")->setText(files.filePath("new-downloads"));
+        dialog->findChild<QCheckBox *>("preferencesSound")->setChecked(false);
+        auto *theme = dialog->findChild<QComboBox *>("preferencesTheme");
+        theme->setCurrentIndex(theme->findData("dark"));
+        auto *limit = dialog->findChild<QComboBox *>("preferencesCacheLimit");
+        limit->setCurrentIndex(limit->findData(256LL * 1024 * 1024));
+        dialog->accept();
+        QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+        QCOMPARE(QSettings().value("downloads").toString(), files.filePath("new-downloads"));
+        QVERIFY(!QSettings().value("notificationSound").toBool());
+        QCOMPARE(MediaStorage::cacheLimit(), 256LL * 1024 * 1024);
+        QCOMPARE(Theme::mode(), QString("dark"));
+        QVERIFY(Theme::isDark());
+        QCOMPARE(window->findChild<Transport *>()->baseUrl(), oldUrl);
+        const auto capture = qEnvironmentVariable("WECHAT_LITE_CAPTURE_UI");
+        if (!capture.isEmpty() && QGuiApplication::platformName() != "offscreen")
+        {
+            QDir().mkpath(capture);
+            window->grab().save(QDir(capture).filePath("chat-dark.png"));
+        }
+        window->showPreferences();
+        dialog = window->findChild<PreferencesDialog *>();
+        QVERIFY(dialog);
+        QTRY_VERIFY_WITH_TIMEOUT(!dialog->findChild<QLabel *>("preferencesUsageCache")->text().contains("未统计") &&
+            !dialog->findChild<QLabel *>("preferencesUsageCache")->text().contains("正在统计"), 5000);
+        if (!capture.isEmpty() && QGuiApplication::platformName() != "offscreen")
+        {
+            dialog->grab().save(QDir(capture).filePath("settings-storage-dark.png"));
+            auto *pages = dialog->findChild<QListWidget *>("preferencesNavigation");
+            pages->setCurrentRow(1);
+            dialog->grab().save(QDir(capture).filePath("settings-theme-dark.png"));
+            pages->setCurrentRow(2);
+            dialog->grab().save(QDir(capture).filePath("settings-notifications-dark.png"));
+        }
+        dialog->findChild<QLineEdit *>("preferencesDownloads")->setText(before);
+        dialog->findChild<QCheckBox *>("preferencesSound")->setChecked(oldSound);
+        theme = dialog->findChild<QComboBox *>("preferencesTheme");
+        theme->setCurrentIndex(theme->findData(oldTheme));
+        limit = dialog->findChild<QComboBox *>("preferencesCacheLimit");
+        limit->setCurrentIndex(limit->findData(oldLimit));
+        dialog->accept();
+        QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+        QCOMPARE(QSettings().value("downloads").toString(), before);
     }
     void serverForwardingPolicyHotUpdatesClientGroups()
     {
@@ -1795,6 +1873,62 @@ class DesktopTests : public QObject
             QCOMPARE(downloaded.readAll(), contents);
             QCOMPARE(window->findChildren<QDialog *>().size(), dialogs);
         }
+    }
+    void cachedMediaCopiesMergeClicksAndRespectTheCurrentConversation()
+    {
+        FileOpenHandler handler;
+        QDesktopServices::setUrlHandler("file", &handler, "open");
+        const auto reset = qScopeGuard([] { QDesktopServices::unsetUrlHandler("file"); });
+        auto *transport = window->findChild<Transport *>();
+        auto *view = window->findChild<MessageView *>();
+        auto *model = window->findChild<MessageModel *>();
+        auto *groups = window->findChild<QListWidget *>("groups");
+        const auto group = groups->currentItem()->data(Qt::UserRole).toJsonObject()["id"].toString();
+        QString other;
+        for (int row = 0; row < groups->count(); ++row)
+            if (groups->item(row)->data(Qt::UserRole).toJsonObject()["id"].toString() != group)
+                other = groups->item(row)->data(Qt::UserRole).toJsonObject()["id"].toString();
+        QVERIFY(!other.isEmpty());
+        for (int phase = 0; phase < 2; ++phase)
+        {
+            const auto name = QString("cache-copy-%1.png").arg(phase);
+            const auto source = files.filePath(name);
+            QImage image(32, 32, QImage::Format_ARGB32);
+            image.fill(phase ? Qt::blue : Qt::green);
+            QVERIFY(image.save(source));
+            QJsonObject media;
+            bool uploaded = false;
+            QString failure;
+            transport->upload(group, source, name, [&](const QJsonValue &value, const QString &error)
+                { media = value.toObject(); failure = error; uploaded = true; });
+            QTRY_VERIFY_WITH_TIMEOUT(uploaded, 8000);
+            QVERIFY2(failure.isEmpty(), qPrintable(failure));
+            const auto messageId = QString("cached-copy-row-%1").arg(phase);
+            media["kind"] = "image";
+            transport->event({{"type", "message"}, {"created", false}, {"message", QJsonObject{
+                {"id", messageId}, {"group", group}, {"sender", "缓存测试"}, {"status", "received"},
+                {"timestamp", QDateTime::currentMSecsSinceEpoch()}, {"media", QJsonArray{media}}}}});
+            view->scrollToBottom();
+            emit view->viewportChanged();
+            const auto cached = [&]
+            {
+                for (const auto &row : model->rows)
+                    if (row["id"] == messageId)
+                        return row["media"].toArray().first().toObject()["_local"].toString();
+                return QString();
+            };
+            QTRY_VERIFY_WITH_TIMEOUT(!cached().isEmpty() && QFileInfo::exists(cached()), 5000);
+            QVERIFY(MediaStorage::isCachePath(cached()));
+            view->mediaClicked(media, false);
+            view->mediaClicked(media, false); // One cached copy, including when both clicks precede completion.
+            if (phase) window->activateConversation(other);
+            const auto folder = QDir(files.filePath("downloads/" + QDate::currentDate().toString("yyyy-MM-dd")));
+            QTRY_VERIFY_WITH_TIMEOUT(QFileInfo::exists(folder.filePath(name)), 5000);
+            QTest::qWait(80);
+            QCOMPARE(handler.urls.size(), 1);
+            QCOMPARE(folder.entryList({QString("cache-copy-%1*.png").arg(phase)}, QDir::Files).size(), 1);
+        }
+        window->activateConversation(group);
     }
     void voicePlaysInsideChatAndStopsOnClickGroupChangeMinimizeAndRecall()
     {

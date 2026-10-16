@@ -1,5 +1,6 @@
 #include "system_notifier.h"
 #import <Foundation/Foundation.h>
+#import <AppKit/AppKit.h>
 #include <QCryptographicHash>
 #include <QList>
 #include <QMutex>
@@ -47,7 +48,7 @@ struct Dispatch
     Q_UNUSED(center);
     if ([notification.request.identifier hasPrefix:@"wechat-lite."])
         completionHandler(UNNotificationPresentationOptionBanner | UNNotificationPresentationOptionList |
-                          UNNotificationPresentationOptionSound);
+                          (notification.request.content.sound ? UNNotificationPresentationOptionSound : 0));
     else
         completionHandler(UNNotificationPresentationOptionNone);
 }
@@ -95,19 +96,19 @@ class MacNotificationBackend final : public SystemNotifier::Native
             center.delegate = previous;
     }
 
-    void show(const QString &group, const QString &title, const QString &body) override
+    void show(const QString &group, const QString &title, const QString &body, bool sound) override
     {
         // Permission UI may stay open while messages arrive. Keep only the latest per group,
         // with a fixed cap, rather than retaining an unbounded backlog of private content.
         auto existing = std::find_if(pending.begin(), pending.end(),
                                      [&group](const auto &entry) { return entry.group == group; });
         if (existing != pending.end())
-            *existing = {group, title, body};
+            *existing = {group, title, body, sound};
         else
         {
             if (pending.size() == 32)
                 pending.removeFirst();
-            pending.append({group, title, body});
+            pending.append({group, title, body, sound});
         }
         if (checking)
             return;
@@ -165,7 +166,7 @@ class MacNotificationBackend final : public SystemNotifier::Native
             UNMutableNotificationContent *content = [[UNMutableNotificationContent alloc] init];
             content.title = text(entry.title);
             content.body = text(entry.body);
-            content.sound = UNNotificationSound.defaultSound;
+            content.sound = entry.sound ? UNNotificationSound.defaultSound : nil;
             content.threadIdentifier = text(entry.group);
             content.userInfo = @{@"group" : text(entry.group)};
             const auto identifier =
@@ -182,6 +183,7 @@ class MacNotificationBackend final : public SystemNotifier::Native
     struct Pending
     {
         QString group, title, body;
+        bool sound = true;
     };
     std::shared_ptr<Dispatch> dispatch;
     UNUserNotificationCenter *center = nil;
@@ -205,4 +207,9 @@ std::unique_ptr<SystemNotifier::Native> SystemNotifier::createNative(SystemNotif
         Q_UNUSED(exception);
         return {};
     }
+}
+
+void SystemNotifier::previewSound()
+{
+    if (!disabled()) NSBeep();
 }

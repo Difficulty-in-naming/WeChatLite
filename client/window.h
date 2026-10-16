@@ -27,6 +27,7 @@ class VoicePlayer;
 class QMenu;
 class HistoryBrowser;
 class AnnouncementDialog;
+class PreferencesDialog;
 
 class Window : public QMainWindow
 {
@@ -34,11 +35,13 @@ class Window : public QMainWindow
   public:
     explicit Window(bool demo = false, const QString &tunnelExecutable = {});
     void showSettings();
+    void showPreferences();
     void startDemo();
     void activateConversation(const QString &id);
     QMenu *groupContextMenuFor(const QString &id);
   signals:
     void systemNotificationRequested(const QString &groupId, const QString &title, const QString &body);
+    void notificationSoundPreviewRequested();
 
   protected:
     void closeEvent(QCloseEvent *event) override;
@@ -77,6 +80,8 @@ class Window : public QMainWindow
     void refreshReeditLinks();
     void locateQuote(const QJsonObject &quote);
     void updateNativeFrame();
+    void refreshThemeIcons();
+    void pruneMediaCache(qint64 limit, std::function<void(const QString &)> callback = {});
     void updateComposeHeight();
     void send();
     void uploadNext(int index, quint64 generation, const QString &targetGroup);
@@ -85,8 +90,10 @@ class Window : public QMainWindow
     void saveDraft();
     void restoreDraft();
     void notify(const QString &text, bool error = false);
-    void fetchMedia(const QJsonObject &media, bool saveOnly = false, bool thumbnail = false);
+    void fetchMedia(const QJsonObject &media, bool saveOnly = false, bool thumbnail = false, bool resumed = false);
+    void drainMediaQueue();
     void openMedia(const QJsonObject &media, const QString &path);
+    void saveMediaAndMaybeOpen(const QJsonObject &media, const QString &path, bool open);
     void stopVoice();
     void visibleThumbnails();
     QString draftKey() const;
@@ -99,7 +106,9 @@ class Window : public QMainWindow
     QListWidget *groups;
     QLineEdit *groupSearch;
     QLabel *title, *subtitle, *connection, *transferLabel, *attachmentCount, *demoLabel;
-    QPushButton *sendButton, *historyButton, *announcementButton;
+    QPushButton *sendButton = nullptr, *historyButton = nullptr, *announcementButton = nullptr,
+                *preferencesButton = nullptr;
+    QPointer<PreferencesDialog> preferencesDialog;
     QPointer<HistoryBrowser> historyBrowser;
     QPointer<AnnouncementDialog> announcementDialog;
     QString pendingRecordId;
@@ -110,7 +119,7 @@ class Window : public QMainWindow
     QLabel *quoteLabel = nullptr;
     QToolButton *cancelQuoteButton = nullptr;
     VoicePlayer *voicePlayer = nullptr;
-    QString requestedVoiceId, playingVoiceId, voiceGroup;
+    QString requestedVoiceId, playingVoiceId, playingVoicePath, voiceGroup;
     quint64 voiceConversation = 0;
     QJsonObject quotedMessage;
     QJsonObject p2pSettings;
@@ -126,7 +135,8 @@ class Window : public QMainWindow
     quint64 locateGeneration = 0;
     QProcess demoServer;
     QSystemTrayIcon tray;
-    QTimer draftTimer, thumbnailTimer;
+    QTimer draftTimer, thumbnailTimer, cachePruneTimer;
+    bool cacheWorking = false;
     QList<QWidget *> resizeEdges;
     QString groupId, serverUrl, secret, downloadRoot, nickname, clientId, pin, pendingId, demoFailure;
     QString lastError;
@@ -134,7 +144,9 @@ class Window : public QMainWindow
     QHash<QString, QString> downloaded;
     QHash<QString, int> unread;
     QHash<QString, QJsonObject> historyUpdates;
-    QSet<QString> downloading, openRequests;
+    QSet<QString> downloading, openRequests, saveRequests;
+    QSet<QString> queuedMediaIds;
+    QQueue<std::function<void()>> mediaQueue;
     QSet<QString> unavailableOriginals;
     quint64 sendGeneration = 0, groupsGeneration = 0, conversationGeneration = 0, historyGeneration = 0;
     quint64 permissionsGeneration = 0;

@@ -2,6 +2,7 @@
 #include <QCoreApplication>
 #include <QGuiApplication>
 #include <QStandardPaths>
+#include <QSettings>
 #include <QThread>
 
 namespace
@@ -84,12 +85,17 @@ void SystemNotifier::showMessage(const QString &groupId, const QString &title, c
     const auto heading = limitedText(title.isEmpty() ? QStringLiteral("微信轻聊") : title, 128);
     const auto message = limitedText(body, 512);
     emit requested(groupId, heading, message);
+    const auto sound = soundEnabled();
+    emit soundRequested(sound);
     if (!disabled() && native)
-        native->show(groupId, heading, message);
+        native->show(groupId, heading, message, sound);
 }
+
+bool SystemNotifier::soundEnabled() { return QSettings().value("notificationSound", true).toBool(); }
 
 bool SystemNotifier::isActivationRelay() const { return native && native->isActivationRelay(); }
 
 #if !defined(Q_OS_WIN) && !defined(Q_OS_MACOS)
 std::unique_ptr<SystemNotifier::Native> SystemNotifier::createNative(SystemNotifier *) { return {}; }
+void SystemNotifier::previewSound() {}
 #endif

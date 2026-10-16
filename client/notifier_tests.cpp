@@ -5,6 +5,8 @@
 #include <QJsonDocument>
 #include <QProcess>
 #include <QStandardPaths>
+#include <QSettings>
+#include <QTemporaryDir>
 #include <QtTest>
 
 class NotifierTests final : public QObject
@@ -12,6 +14,26 @@ class NotifierTests final : public QObject
     Q_OBJECT
 
   private slots:
+    void soundSettingControlsEachNewNotificationWithoutMutingTheBanner()
+    {
+        QTemporaryDir profile;
+        QSettings::setDefaultFormat(QSettings::IniFormat);
+        QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, profile.path());
+        QCoreApplication::setOrganizationName("WeChatLiteTests");
+        QCoreApplication::setApplicationName("NotificationSound");
+        SystemNotifier notifier;
+        QSignalSpy sound(&notifier, &SystemNotifier::soundRequested);
+        QSignalSpy requested(&notifier, &SystemNotifier::requested);
+        QVERIFY(SystemNotifier::soundEnabled());
+        notifier.showMessage("g", "group", "first");
+        QCOMPARE(sound.takeFirst()[0].toBool(), true);
+        QSettings().setValue("notificationSound", false);
+        notifier.showMessage("g", "group", "second");
+        QCOMPARE(sound.takeFirst()[0].toBool(), false);
+        QCOMPARE(requested.size(), 2);
+        SystemNotifier::previewSound(); // Test mode cannot call an OS sound API.
+        QSettings().remove("notificationSound");
+    }
     void testModeNeverCreatesNativeResourcesOrActivation()
     {
         QVERIFY(QStandardPaths::isTestModeEnabled());

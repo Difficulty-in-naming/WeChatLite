@@ -27,12 +27,16 @@ class HistoryBrowser : public QDialog
     QString group() const { return groupId; }
     void invalidate();
     void updateMessage(const QJsonObject &message);
+    QSet<QString> protectedCachePaths() const;
+    void discardCached(const QStringList &paths);
   signals:
     void recordActivated(const QJsonObject &message, const QJsonObject &media);
+    void cacheUpdated();
 
   protected:
     bool eventFilter(QObject *watched, QEvent *event) override;
     void closeEvent(QCloseEvent *event) override;
+    void changeEvent(QEvent *event) override;
 
   private:
     void resetSearch();
@@ -40,6 +44,7 @@ class HistoryBrowser : public QDialog
     void loadMembers();
     void loadVisibleThumbnails();
     void activate(const QModelIndex &index, const QPoint &point);
+    void updateThemeStyle();
     QPointer<Transport> transport;
     QString groupId, downloadRoot, nextBefore, type = "all";
     QAbstractListModel *records;
@@ -57,4 +62,5 @@ class HistoryBrowser : public QDialog
     quint64 generation = 0;
     int requestsInFlight = 0;
     bool loading = false, hasMore = true, valid = true, allowDownload = false, searchQueued = false;
+    bool updatingThemeStyle = false;
 };

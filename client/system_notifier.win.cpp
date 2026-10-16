@@ -272,7 +272,7 @@ class WindowsNotificationBackend final : public QObject, public SystemNotifier::
 
     bool isActivationRelay() const override { return relay; }
 
-    void show(const QString &group, const QString &title, const QString &body) override
+    void show(const QString &group, const QString &title, const QString &body, bool sound) override
     {
         if (relay)
             return;
@@ -286,8 +286,8 @@ class WindowsNotificationBackend final : public QObject, public SystemNotifier::
             }
             winrt::Windows::Data::Xml::Dom::XmlDocument document;
             const auto xml = QStringLiteral("<toast launch=\"%1\"><visual><binding template=\"ToastGeneric\">"
-                                            "<text/><text/></binding></visual></toast>")
-                                 .arg(encodeGroup(group));
+                                            "<text/><text/></binding></visual>%2</toast>")
+                                 .arg(encodeGroup(group), sound ? QString() : QStringLiteral("<audio silent=\"true\"/>"));
             document.LoadXml(winrt::hstring(xml.toStdWString()));
             const auto text = document.GetElementsByTagName(L"text");
             text.Item(0).AppendChild(document.CreateTextNode(winrt::hstring(title.toStdWString())));
@@ -359,4 +359,9 @@ std::unique_ptr<SystemNotifier::Native> SystemNotifier::createNative(SystemNotif
     {
         return {};
     }
+}
+
+void SystemNotifier::previewSound()
+{
+    if (!disabled()) MessageBeep(MB_OK);
 }

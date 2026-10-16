@@ -2,6 +2,7 @@
 #include "composer.h"
 #include "messages.h"
 #include "recall_drafts.h"
+#include "wechat_emoji.h"
 #include <QApplication>
 #include <QBuffer>
 #include <QClipboard>
@@ -12,6 +13,7 @@
 #include <QDropEvent>
 #include <QFile>
 #include <QImage>
+#include <QGlyphRun>
 #include <QInputMethodEvent>
 #include <QJsonObject>
 #include <QMenu>
@@ -24,6 +26,7 @@
 #include <QSettings>
 #include <QStandardPaths>
 #include <QTemporaryDir>
+#include <QTextLayout>
 #include <QUuid>
 #include <QVBoxLayout>
 #include <QVariantAnimation>
@@ -77,6 +80,189 @@ class ClientTests : public QObject
         QCoreApplication::setApplicationName("Client-" + QUuid::createUuid().toString(QUuid::WithoutBraces));
         QSettings::setDefaultFormat(QSettings::IniFormat);
         QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, settingsDirectory.path());
+    }
+    void bracketEmojiAliasesAreDisplayOnlyAndUnknownNamesStayIntact()
+    {
+        QCOMPARE(wechatDisplayText("[發][红包][凋谢][菜刀][炸弹][便便]"), "🀅🧧🥀🔪💣💩");
+        QCOMPARE(wechatDisplayText("[发][紅包][凋謝][炸彈]"), "🀅🧧🥀💣");
+        QCOMPARE(wechatDisplayText("[微笑][流泪][流淚][捂脸][捂臉][强][強][爱心][愛心]"),
+                 "🙂😢😢🤦🤦👍👍❤️❤️");
+        const QString unknown = "[自定义表情] [not-an-emoji] [微笑但未闭合\n[] [nested[便便] 🧧";
+        QCOMPARE(wechatDisplayText(unknown), unknown);
+        QCOMPARE(wechatDisplayText("前[微笑]中[自定义表情]后[炸弹]"), "前🙂中[自定义表情]后💣");
+        const QString ordinary = "普通文字和 Unicode 🙂 保持不变";
+        QCOMPARE(wechatDisplayText(ordinary), ordinary);
+        QFont base("sans-serif");
+        base.setPixelSize(17);
+        const auto displayFont = wechatDisplayFont(base);
+        QCOMPARE(displayFont.pixelSize(), 17);
+        QCOMPARE(displayFont.families().first(), base.families().first());
+        QVERIFY(displayFont.families().size() > base.families().size());
+        QCOMPARE(wechatDisplayFont(displayFont), displayFont);
+    }
+    void bracketEmojiMeasurementPaintingCopyAndQuoteAgree()
+    {
+        const QString source = "[發][红包][凋谢][菜刀][炸弹][便便]\n[微笑][未知表情]";
+        const QString visible = "🀅🧧🥀🔪💣💩\n🙂[未知表情]";
+        QJsonObject message{{"id", "emoji"}, {"sender", "离线测试"}, {"text", source},
+                            {"quote", QJsonObject{{"id", "source"}, {"sender", "成员"}, {"text", "[红包]原文"}}},
+                            {"timestamp", 1'700'000'000'000LL}};
+        MessageModel model;
+        model.replace({message});
+        QFont font = QApplication::font();
+        font.setPixelSize(16);
+        auto converted = message;
+        converted["text"] = visible;
+        QCOMPARE(MessageDelegate::textHeight(message, 105, font),
+                 MessageDelegate::textHeight(converted, 105, font));
+        MessageDelegate delegate;
+        QStyleOptionViewItem option;
+        option.rect = QRect(0, 0, 420, 300);
+        option.font = font;
+        auto render = [&]
+        {
+            QImage result(option.rect.size(), QImage::Format_RGB32);
+            result.fill(Qt::white);
+            QPainter painter(&result);
+            delegate.paint(&painter, option, model.index(0));
+            return result;
+        };
+        const auto originalImage = render();
+        const auto originalBubble = MessageDelegate::bubbleRect(option, model.index(0));
+        model.replace({converted});
+        QCOMPARE(MessageDelegate::bubbleRect(option, model.index(0)), originalBubble);
+        QCOMPARE(render(), originalImage);
+        model.replace({message});
+        MessageView view;
+        view.setModel(&model);
+        QSignalSpy quote(&view, &MessageView::quoteRequested);
+        auto *menu = view.contextMenuFor(model.index(0), false);
+        QVERIFY(menu);
+        auto *copy = menu->findChild<QAction *>("copyMessage");
+        auto *cite = menu->findChild<QAction *>("quoteMessage");
+        QVERIFY(copy && cite);
+        copy->trigger();
+        QCOMPARE(QApplication::clipboard()->text(), source);
+        cite->trigger();
+        QCOMPARE(quote.count(), 1);
+        QCOMPARE(quote.first().first().toJsonObject()["text"].toString(), source);
+        QCOMPARE(quote.first().first().toJsonObject()["quote"].toObject(), message["quote"].toObject());
+        QCOMPARE(model.rows.first()["text"].toString(), source);
+        QCOMPARE(messageQuoteLabel(message["quote"].toObject()), "成员: 🧧原文");
+        delete menu;
+    }
+    void requestedEmojiHaveRealGlyphsAndRenderInTheNativeMessageView()
+    {
+        const QStringList emoji{"🀅", "🧧", "🥀", "🔪", "💣", "💩"};
+        auto font = wechatDisplayFont(QApplication::font());
+        font.setPixelSize(22);
+        for (const auto &symbol : emoji)
+        {
+            QTextLayout layout(symbol, font);
+            layout.beginLayout();
+            auto line = layout.createLine();
+            line.setLineWidth(100);
+            layout.endLayout();
+            const auto runs = layout.glyphRuns();
+            QVERIFY2(!runs.isEmpty(), qPrintable(symbol));
+            int count = 0;
+            for (const auto &run : runs)
+                for (const auto index : run.glyphIndexes())
+                {
+                    QVERIFY2(index != 0, qPrintable("missing glyph: " + symbol));
+                    ++count;
+                }
+            QVERIFY(count > 0);
+        }
+        MessageModel model;
+        model.replace({QJsonObject{{"id", "emoji-shot"}, {"sender", "离线表情测试"},
+                                   {"text", "[發][红包][凋谢][菜刀][炸弹][便便]"},
+                                   {"timestamp", 1'700'000'000'000LL}},
+                       QJsonObject{{"id", "emoji-reply"}, {"outgoing", true},
+                                   {"text", "简体 [微笑][捂脸][强]，繁體 [流淚][紅包][凋謝]"},
+                                   {"quote", QJsonObject{{"id", "emoji-shot"}, {"sender", "离线表情测试"},
+                                                          {"text", "[發][红包][凋谢][菜刀][炸弹][便便]"}}},
+                                   {"timestamp", 1'700'000'000'001LL}}});
+        MessageView view;
+        view.resize(650, 330);
+        view.setFont(font);
+        view.setModel(&model);
+        view.show();
+        QVERIFY(QTest::qWaitForWindowExposed(&view));
+        QTest::qWait(30);
+        const auto image = view.grab();
+        QVERIFY(!image.isNull());
+        const auto directory = qEnvironmentVariable("WECHAT_LITE_EMOJI_SHOT_DIR");
+        if (!directory.isEmpty())
+        {
+            QVERIFY(QDir().mkpath(directory));
+            QVERIFY(image.save(QDir(directory).filePath("wechat-emoji.png")));
+        }
+    }
+    void messageAndCachedMenuColorsFollowThePaletteWithoutChangingLayout()
+    {
+        struct RestorePalette
+        {
+            QPalette original = qApp->palette();
+            ~RestorePalette() { qApp->setPalette(original); }
+        } restore;
+        auto selectDark = [&](bool dark)
+        {
+            auto palette = restore.original;
+            palette.setColor(QPalette::Window, QColor(dark ? "#202020" : "#fafafa"));
+            qApp->setPalette(palette);
+        };
+        selectDark(false);
+        MessageModel model;
+        model.replace({QJsonObject{{"id", "theme"}, {"sender", "离线成员"}, {"text", "正文 [红包]"},
+                                   {"outgoing", true}, {"quote", QJsonObject{{"id", "source"},
+                                                                           {"sender", "成员"}, {"text", "引用"}}}}});
+        MessageDelegate delegate;
+        QStyleOptionViewItem option;
+        option.rect = QRect(0, 0, 520, 180);
+        option.font = QApplication::font();
+        auto render = [&]
+        {
+            QImage image(option.rect.size(), QImage::Format_RGB32);
+            image.fill(qApp->palette().color(QPalette::Window));
+            QPainter painter(&image);
+            delegate.paint(&painter, option, model.index(0));
+            return image;
+        };
+        const auto bubble = MessageDelegate::bubbleRect(option, model.index(0));
+        const auto quote = MessageDelegate::quoteRect(option, model.index(0));
+        const auto sample = bubble.bottomRight() - QPoint(8, 5);
+        const auto lightImage = render();
+        QCOMPARE(lightImage.pixelColor(sample), QColor("#9df29f"));
+        const QJsonObject member{{"id", "offline"}, {"name", "成员"}};
+        const auto lightAvatar = chatAvatar(member, 36).toImage();
+        MessageView view;
+        view.setModel(&model);
+        auto *menu = view.contextMenuFor(model.index(0), false);
+        QVERIFY(menu);
+        menu->popup(QPoint(40, 40));
+        menu->setActiveAction(nullptr);
+        QTest::qWait(10);
+        auto panelPixel = [menu]
+        {
+            const auto image = menu->grab().toImage();
+            const auto ratio = menu->devicePixelRatioF();
+            return image.pixelColor(qRound(menu->width() / 2.0 * ratio), qRound(27 * ratio));
+        };
+        QCOMPARE(panelPixel(), QColor("#f7f7f7"));
+        selectDark(true);
+        const auto darkImage = render();
+        QCOMPARE(darkImage.pixelColor(sample), QColor("#3c633c"));
+        QCOMPARE(MessageDelegate::bubbleRect(option, model.index(0)), bubble);
+        QCOMPARE(MessageDelegate::quoteRect(option, model.index(0)), quote);
+        QCOMPARE(darkImage.pixelColor(quote.right() - 1, quote.center().y()), QColor("#51565a"));
+        QVERIFY(chatAvatar(member, 36).toImage() != lightAvatar);
+        QCOMPARE(panelPixel(), QColor("#303234")); // The same popup must invalidate its light background cache.
+        selectDark(false);
+        QCOMPARE(panelPixel(), QColor("#f7f7f7"));
+        QCOMPARE(chatAvatar(member, 36).toImage(), lightAvatar);
+        QCOMPARE(render(), lightImage);
+        delete menu;
     }
     void delayedMediaLayoutsKeepTheReadingAnchor_data()
     {

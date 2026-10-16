@@ -13,6 +13,8 @@ class SystemNotifier final : public QObject
     explicit SystemNotifier(QObject *parent = nullptr);
     ~SystemNotifier() override;
     void showMessage(const QString &groupId, const QString &title, const QString &body);
+    static bool soundEnabled();
+    static void previewSound();
     // Filter the native COM-only arguments before handing argv to QCommandLineParser.
     static QStringList applicationArguments();
     // A cold activation forwards to the existing client. Do not construct another Window/helper.
@@ -22,12 +24,13 @@ class SystemNotifier final : public QObject
     void activated(const QString &groupId);
     // Observable intent; test mode emits this without calling any platform API or requesting permission.
     void requested(const QString &groupId, const QString &title, const QString &body);
+    void soundRequested(bool enabled);
 
   private:
     struct Native
     {
         virtual ~Native() = default;
-        virtual void show(const QString &groupId, const QString &title, const QString &body) = 0;
+        virtual void show(const QString &groupId, const QString &title, const QString &body, bool sound) = 0;
         virtual bool isActivationRelay() const { return false; }
     };
     friend class WindowsNotificationBackend;

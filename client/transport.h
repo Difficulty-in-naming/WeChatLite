@@ -26,6 +26,7 @@ class Transport : public QObject
     void download(const QJsonObject &media, const QString &directory,
                   std::function<void(const QString &, const QString &)> callback);
     QUrl baseUrl() const { return base; }
+    bool hasActiveDownloads() const { return !partialDownloads.isEmpty(); }
   signals:
     void event(const QJsonObject &event);
     void connectionChanged(bool connected);
@@ -49,4 +50,5 @@ class Transport : public QObject
     QUrl ownedServer;
     QByteArray ownedToken, ownedPin;
     QSet<class QNetworkReply *> sendReplies;
+    QSet<QString> partialDownloads;
 };

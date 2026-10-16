@@ -4,6 +4,9 @@
 #include "connection_info.h"
 #include "history_browser.h"
 #include "messages.h"
+#include "media_storage.h"
+#include "preferences_dialog.h"
+#include "theme.h"
 #include "smooth_scroll.h"
 #include "voice_player.h"
 #include <QApplication>
@@ -42,6 +45,7 @@
 #include <QShowEvent>
 #include <QSplitter>
 #include <QStandardPaths>
+#include <QThreadPool>
 #include <QSvgRenderer>
 #include <QTcpServer>
 #include <QToolButton>
@@ -49,6 +53,7 @@
 #include <QUuid>
 #include <QWindow>
 #include <algorithm>
+#include <atomic>
 #ifdef Q_OS_WIN
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -96,7 +101,7 @@ static QIcon toolbarIcon(const QString &name)
     pixmap.fill(Qt::transparent);
     QPainter p(&pixmap);
     p.setRenderHint(QPainter::Antialiasing);
-    p.setPen(QPen(QColor("#4b4b4b"), 1.2, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+    p.setPen(QPen(QColor(Theme::isDark() ? "#c9cccb" : "#4b4b4b"), 1.2, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
     p.setBrush(Qt::NoBrush);
     if (name == "pin")
     {
@@ -123,7 +128,29 @@ static QPushButton *iconButton(const QString &icon, const QString &tip,
     result->setIconSize({22, 22});
     result->setFixedSize(26, 26);
     result->setAccessibleName(tip);
+    result->setProperty("toolbarIcon", icon);
     return result;
+}
+
+static QIcon svgIcon(const QString &resource)
+{
+    QFile file(resource);
+    file.open(QIODevice::ReadOnly);
+    auto bytes = file.readAll();
+    if (Theme::isDark()) bytes.replace("#4b4b4b", "#c9cccb");
+    QSvgRenderer svg(bytes);
+    QIcon icon;
+    for (int scale : {1, 2, 3})
+    {
+        QPixmap pixmap(20 * scale, 20 * scale);
+        pixmap.fill(Qt::transparent);
+        QPainter painter(&pixmap);
+        svg.render(&painter);
+        painter.end();
+        pixmap.setDevicePixelRatio(scale);
+        icon.addPixmap(pixmap);
+    }
+    return icon;
 }
 
 Window::Window(bool demo, const QString &tunnelExecutable)
@@ -159,6 +186,7 @@ Window::Window(bool demo, const QString &tunnelExecutable)
     setMinimumSize(760, 660);
     setAcceptDrops(true);
     makeUi();
+    refreshThemeIcons();
     voicePlayer = new VoicePlayer(this);
     connect(voicePlayer, &VoicePlayer::playingChanged, this, [this](bool playing)
     {
@@ -167,6 +195,7 @@ Window::Window(bool demo, const QString &tunnelExecutable)
             if (requestedVoiceId == playingVoiceId)
                 requestedVoiceId.clear();
             playingVoiceId.clear();
+            playingVoicePath.clear();
             if (requestedVoiceId.isEmpty())
                 messages->setVoiceState({}, {});
         }
@@ -180,6 +209,12 @@ Window::Window(bool demo, const QString &tunnelExecutable)
     thumbnailTimer.setInterval(180);
     thumbnailTimer.setSingleShot(true);
     connect(&thumbnailTimer, &QTimer::timeout, this, &Window::visibleThumbnails);
+    cachePruneTimer.setSingleShot(true);
+    cachePruneTimer.setInterval(1000);
+    connect(&cachePruneTimer, &QTimer::timeout, this, [this]
+    {
+        if (downloading.isEmpty()) pruneMediaCache(MediaStorage::cacheLimit());
+    });
     connect(composer, &Composer::filesAttached, &attachments, &AttachmentStore::addFiles);
     connect(composer, &Composer::imageAttached, this,
             [this](const QMimeData *mime) { attachments.addImage(mime); });
@@ -258,6 +293,9 @@ Window::Window(bool demo, const QString &tunnelExecutable)
                     announcementButton->setEnabled(false);
                     stopVoice();
                     openRequests.clear();
+                    saveRequests.clear();
+                    mediaQueue.clear();
+                    queuedMediaIds.clear();
                     ++permissionsGeneration;
                     canSend = canDownload = false;
                     messages->setProperty("canDownload", false);
@@ -334,6 +372,7 @@ Window::Window(bool demo, const QString &tunnelExecutable)
                         activateWindow();
                     });
     menu->addAction("连接与下载设置", this, &Window::showSettings);
+    menu->addAction("设置", this, &Window::showPreferences);
     menu->addSeparator();
     menu->addAction("退出客户端", this,
                     [this]
@@ -427,6 +466,13 @@ void Window::makeUi()
     auto *sideTopLayout = new QHBoxLayout(sideTop);
     sideTopLayout->setContentsMargins(15, 10, 13, 9);
     sideTopLayout->setSpacing(12);
+    preferencesButton = button({}, "preferencesButton");
+    preferencesButton->setAccessibleName("设置");
+    preferencesButton->setFixedSize(26, 26);
+    preferencesButton->setIconSize({20, 20});
+    preferencesButton->setIcon(svgIcon(":/client/icons/settings.svg"));
+    connect(preferencesButton, &QPushButton::clicked, this, &Window::showPreferences);
+    sideTopLayout->addWidget(preferencesButton);
     groupSearch = new QLineEdit;
     groupSearch->setObjectName("search");
     groupSearch->setPlaceholderText("⌕ 搜索");
@@ -499,29 +545,12 @@ void Window::makeUi()
     title->setObjectName("chatTitle");
     title->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
     headerLayout->addWidget(title, 1);
-    const auto headerIcon = [](const QString &resource)
-    {
-        QSvgRenderer svg(resource);
-        QIcon icon;
-        for (int scale : {1, 2, 3})
-        {
-            QPixmap pixmap(20 * scale, 20 * scale);
-            pixmap.fill(Qt::transparent);
-            {
-                QPainter painter(&pixmap);
-                svg.render(&painter);
-            }
-            pixmap.setDevicePixelRatio(scale);
-            icon.addPixmap(pixmap);
-        }
-        return icon;
-    };
     historyButton = button({}, "historyButton");
     historyButton->setAccessibleName("聊天记录");
-    historyButton->setIcon(headerIcon(":/client/icons/history.svg"));
+    historyButton->setIcon(svgIcon(":/client/icons/history.svg"));
     announcementButton = button({}, "announcementButton");
     announcementButton->setAccessibleName("群公告");
-    announcementButton->setIcon(headerIcon(":/client/icons/announcement.svg"));
+    announcementButton->setIcon(svgIcon(":/client/icons/announcement.svg"));
     for (auto *entry : {historyButton, announcementButton})
     {
         entry->setFixedSize(26, 26);
@@ -698,10 +727,39 @@ void Window::showEvent(QShowEvent *event)
 void Window::changeEvent(QEvent *event)
 {
     QMainWindow::changeEvent(event);
+    if (event->type() == QEvent::PaletteChange)
+    {
+        refreshThemeIcons();
+        updateNativeFrame();
+    }
     if (event->type() == QEvent::WindowStateChange && isMinimized())
         stopVoice();
     if (event->type() == QEvent::ActivationChange || event->type() == QEvent::WindowStateChange)
         updateNativeFrame();
+}
+void Window::refreshThemeIcons()
+{
+    if (!preferencesButton || !historyButton || !announcementButton) return;
+    preferencesButton->setIcon(svgIcon(":/client/icons/settings.svg"));
+    historyButton->setIcon(svgIcon(":/client/icons/history.svg"));
+    announcementButton->setIcon(svgIcon(":/client/icons/announcement.svg"));
+    const auto hover = Theme::isDark() ? "#393b3c" : "#eeeef0";
+    for (auto *entry : {preferencesButton, historyButton, announcementButton})
+        entry->setStyleSheet(QString("QPushButton {background:transparent;border:0;border-radius:3px;padding:0;}"
+            "QPushButton:hover {background:%1;}").arg(hover));
+    for (auto *entry : findChildren<QPushButton *>())
+        if (!entry->property("toolbarIcon").toString().isEmpty())
+            entry->setIcon(toolbarIcon(entry->property("toolbarIcon").toString()));
+    if (quoteArea)
+        quoteArea->setStyleSheet(Theme::isDark() ?
+            "#quotePreview {background:transparent;border-left:2px solid #545658;}"
+            "#quoteText {color:#a8aaad;font-size:12px;}"
+            "#cancelQuote {background:#55585a;border:0;color:#dddddd;font-size:12px;border-radius:7px;}"
+            "#cancelQuote:hover {background:#707477;}" :
+            "#quotePreview {background:transparent;border-left:2px solid #e2e2e2;}"
+            "#quoteText {color:#9f9fa6;font-size:12px;}"
+            "#cancelQuote {background:#d9d9d9;border:0;color:white;font-size:12px;border-radius:7px;}"
+            "#cancelQuote:hover {background:#bcbcbc;}");
 }
 void Window::updateNativeFrame()
 {
@@ -719,7 +777,8 @@ void Window::updateNativeFrame()
     }
     const DWMNCRENDERINGPOLICY policy = DWMNCRP_ENABLED;
     DwmSetWindowAttribute(hwnd, DWMWA_NCRENDERING_POLICY, &policy, sizeof(policy));
-    const COLORREF border = isActiveWindow() ? RGB(170, 170, 170) : RGB(190, 190, 190);
+    const COLORREF border = Theme::isDark() ? RGB(80, 82, 82) :
+        (isActiveWindow() ? RGB(170, 170, 170) : RGB(190, 190, 190));
     // Numeric IDs keep this compatible with SDKs that predate Windows 11's frame attributes.
     const auto borderResult = DwmSetWindowAttribute(hwnd, 34, &border, sizeof(border));
     const DWORD corners = isMaximized() ? 1 : 3; // Do not round maximized windows; use small normal corners.
@@ -764,6 +823,110 @@ bool Window::nativeEvent(const QByteArray &type, void *message, qintptr *result)
     }
 #endif
     return QMainWindow::nativeEvent(type, message, result);
+}
+
+void Window::showPreferences()
+{
+    if (preferencesDialog)
+    {
+        preferencesDialog->show(); preferencesDialog->raise(); preferencesDialog->activateWindow();
+        return;
+    }
+    invalidateAuxiliaryWindows();
+    auto *dialog = new PreferencesDialog({downloadRoot, Theme::mode(),
+        QSettings().value("notificationSound", true).toBool(), MediaStorage::cacheLimit()}, this);
+    dialog->setAttribute(Qt::WA_DeleteOnClose);
+    preferencesDialog = dialog;
+    const auto scanGeneration = std::make_shared<std::atomic<quint64>>(0);
+    connect(dialog, &QObject::destroyed, this, [scanGeneration] { scanGeneration->store(0); });
+    connect(dialog, &PreferencesDialog::usageRequested, this, [dialog, scanGeneration](const QString &path, quint64 id)
+    {
+        scanGeneration->store(id);
+        QPointer<PreferencesDialog> target(dialog);
+        QThreadPool::globalInstance()->start([target, path, id, scanGeneration]
+        {
+            const auto usage = MediaStorage::measure(path, [scanGeneration, id] { return scanGeneration->load() != id; });
+            QMetaObject::invokeMethod(qApp, [target, usage, id]
+            { if (target) target->setUsage(id, usage.downloads, usage.cache, usage.error); });
+        });
+    });
+    connect(dialog, &PreferencesDialog::clearCacheRequested, this,
+        [this, dialog, scanGeneration](const QString &, quint64 id)
+        {
+            scanGeneration->store(0);
+            QPointer<PreferencesDialog> target(dialog);
+            pruneMediaCache(0, [target, id](const QString &error)
+                { if (target) target->cacheCleared(id, error); });
+        });
+    connect(dialog, &PreferencesDialog::previewSoundRequested, this, &Window::notificationSoundPreviewRequested);
+    connect(dialog, &PreferencesDialog::applied, this, [this, dialog]
+    {
+        const auto values = dialog->values();
+        if (MediaStorage::isCachePath(values.downloads) ||
+            QDir::cleanPath(values.downloads) == QDir::cleanPath(MediaStorage::cacheDirectory())) return;
+        if (downloadRoot != values.downloads) downloaded.clear();
+        downloadRoot = values.downloads;
+        QSettings settings;
+        settings.setValue("downloads", downloadRoot);
+        settings.setValue("notificationSound", values.notificationSound);
+        settings.setValue("mediaCacheLimit", values.cacheLimitBytes);
+        Theme::apply(values.theme);
+        refreshThemeIcons();
+        cachePruneTimer.start();
+    });
+    dialog->open();
+}
+
+void Window::pruneMediaCache(qint64 limit, std::function<void(const QString &)> callback)
+{
+    if (cacheWorking || !downloading.isEmpty() || transport.hasActiveDownloads())
+    {
+        if (callback) callback("缓存正在使用，请稍后重试。");
+        return;
+    }
+    const auto root = QDir::cleanPath(MediaStorage::cacheDirectory());
+    if (MediaStorage::isCachePath(downloadRoot) || QDir::cleanPath(downloadRoot) == root ||
+        (!QFileInfo(downloadRoot).canonicalFilePath().isEmpty() &&
+         (MediaStorage::isCachePath(QFileInfo(downloadRoot).canonicalFilePath()) ||
+          QFileInfo(downloadRoot).canonicalFilePath() == QDir(root).canonicalPath())))
+    {
+        if (callback) callback("下载目录与缓存重叠，请先选择其他下载位置。");
+        return;
+    }
+    QSet<QString> protectedPaths;
+    for (int row = 0; row < model->rowCount(); ++row)
+        if (messages->visualRect(model->index(row)).intersects(messages->viewport()->rect()))
+            for (const auto &entry : model->rows[row]["media"].toArray())
+                protectedPaths.insert(QFileInfo(entry.toObject()["_local"].toString()).absoluteFilePath());
+    if (downloaded.contains(requestedVoiceId)) protectedPaths.insert(QFileInfo(downloaded[requestedVoiceId]).absoluteFilePath());
+    if (!playingVoicePath.isEmpty()) protectedPaths.insert(QFileInfo(playingVoicePath).absoluteFilePath());
+    for (const auto &id : downloading)
+        if (downloaded.contains(id)) protectedPaths.insert(QFileInfo(downloaded[id]).absoluteFilePath());
+    if (historyBrowser) protectedPaths.unite(historyBrowser->protectedCachePaths());
+    cacheWorking = true;
+    if (historyBrowser) historyBrowser->setProperty("cacheMaintenance", true);
+    QPointer<Window> self(this);
+    QThreadPool::globalInstance()->start([self, limit, protectedPaths, callback]
+    {
+        const auto result = MediaStorage::prune(limit, protectedPaths);
+        QMetaObject::invokeMethod(qApp, [self, result, callback]
+        {
+            if (!self) return;
+            self->cacheWorking = false;
+            QStringList ids;
+            for (auto it = self->downloaded.cbegin(); it != self->downloaded.cend(); ++it)
+                if (result.removed.contains(it.value())) ids.append(it.key());
+            for (const auto &id : ids) { self->downloaded.remove(id); self->model->setLocalMedia(id, {}); }
+            if (self->historyBrowser)
+            {
+                self->historyBrowser->setProperty("cacheMaintenance", false);
+                self->historyBrowser->discardCached(result.removed);
+            }
+            self->thumbnailTimer.start();
+            self->drainMediaQueue();
+            if (callback) callback(result.error);
+        });
+    });
 }
 
 void Window::showSettings()
@@ -1031,6 +1194,9 @@ void Window::clearConversation()
     announcementButton->setEnabled(false);
     stopVoice();
     openRequests.clear();
+    saveRequests.clear();
+    mediaQueue.clear();
+    queuedMediaIds.clear();
     locatingId.clear();
     unavailableOriginals.clear();
     historyUpdates.clear();
@@ -1127,6 +1293,9 @@ void Window::loadPermissions()
                 invalidateAuxiliaryWindows();
                 stopVoice();
                 openRequests.clear();
+                saveRequests.clear();
+                mediaQueue.clear();
+                queuedMediaIds.clear();
             }
             if (!canSend && busy)
             {
@@ -1226,6 +1395,9 @@ void Window::showHistoryBrowser()
     }
     historyBrowser = new HistoryBrowser(&transport, groupId, title->text(), downloadRoot, canDownload, this);
     connect(historyBrowser, &HistoryBrowser::recordActivated, this, &Window::activateHistoryRecord);
+    connect(historyBrowser, &HistoryBrowser::cacheUpdated, this, [this] { cachePruneTimer.start(); });
+    connect(historyBrowser, &QDialog::finished, this, [this] { cachePruneTimer.start(); });
+    historyBrowser->setProperty("cacheMaintenance", cacheWorking);
     historyBrowser->show();
 }
 
@@ -1473,6 +1645,9 @@ void Window::selectGroup(const QString &id, const QString &name)
     saveDraft();
     stopVoice();
     openRequests.clear();
+    saveRequests.clear();
+    mediaQueue.clear();
+    queuedMediaIds.clear();
     locatingId.clear();
     unavailableOriginals.clear();
     historyUpdates.clear();
@@ -2270,15 +2445,16 @@ void Window::notify(const QString &text, bool error)
     if (error)
         lastError = text.left(1200);
 }
-void Window::fetchMedia(const QJsonObject &media, bool saveOnly, bool thumbnail)
+void Window::fetchMedia(const QJsonObject &media, bool saveOnly, bool thumbnail, bool resumed)
 {
     if (!canDownload)
         return;
     const auto id = media["id"].toString();
+    if (saveOnly) saveRequests.insert(id);
     const bool voice = media["kind"] == "voice" && !saveOnly && !thumbnail;
     if (!voice && !saveOnly && !thumbnail)
         openRequests.insert(id);
-    if (voice)
+    if (voice && !resumed)
     {
         if (requestedVoiceId == id)
         {
@@ -2291,35 +2467,61 @@ void Window::fetchMedia(const QJsonObject &media, bool saveOnly, bool thumbnail)
         voiceConversation = conversationGeneration;
         messages->setVoiceState(id, "loading");
     }
-    if (downloaded.contains(id) && QFileInfo::exists(downloaded[id]))
+    if (resumed && voice && requestedVoiceId != id) return;
+    if (downloading.contains(id) || (!resumed && queuedMediaIds.contains(id))) return;
+    const bool cached = downloaded.contains(id) && QFileInfo::exists(downloaded[id]);
+    const bool copy = cached && MediaStorage::isCachePath(downloaded[id]) && (saveOnly || (!thumbnail && !voice));
+    if ((!cached || copy) && (cacheWorking || downloading.size() >= 2))
     {
-        model->setLocalMedia(id, downloaded[id]);
-        if (!thumbnail && !saveOnly)
+        if (!thumbnail && mediaQueue.size() < 16)
         {
-            openRequests.remove(id);
-            openMedia(media, downloaded[id]);
+            const auto scope = chatPreferences.scope();
+            const auto conversation = conversationGeneration;
+            queuedMediaIds.insert(id);
+            mediaQueue.enqueue([this, media, id, thumbnail, scope, conversation]
+            {
+                queuedMediaIds.remove(id);
+                if (scope == chatPreferences.scope() && conversation == conversationGeneration && canDownload)
+                {
+                    const bool wantsVoice = media["kind"] == "voice" && requestedVoiceId == id;
+                    const bool wantsOpen = openRequests.contains(id);
+                    if (wantsVoice || wantsOpen || saveRequests.contains(id))
+                        fetchMedia(media, !wantsVoice && !wantsOpen, thumbnail, true);
+                }
+                else { openRequests.remove(id); saveRequests.remove(id); }
+            });
         }
         return;
     }
-    if (downloading.contains(id))
-        return;
-    if (downloading.size() >= 2)
+    if (cached)
     {
-        if (voice)
-            stopVoice();
-        openRequests.remove(id);
+        if (saveOnly || (!thumbnail && !voice))
+        {
+            const bool requestedOpen = openRequests.remove(id);
+            saveRequests.remove(id);
+            saveMediaAndMaybeOpen(media, downloaded[id], requestedOpen || !saveOnly);
+        }
+        else
+        {
+            model->setLocalMedia(id, downloaded[id]);
+            if (voice) openMedia(media, downloaded[id]);
+        }
         return;
     }
     downloading.insert(id);
-    transport.download(media, downloadRoot,
-                       [this, id, media, saveOnly, thumbnail](const QString &path, const QString &error)
+    const auto scope = chatPreferences.scope();
+    transport.download(media, (thumbnail || voice) && !saveOnly ? MediaStorage::cacheDirectory() : downloadRoot,
+                       [this, id, media, saveOnly, thumbnail, scope](const QString &path, const QString &error)
                        {
                            downloading.remove(id);
+                           QTimer::singleShot(0, this, &Window::drainMediaQueue);
+                           if (scope != chatPreferences.scope()) return;
                            transferLabel->clear();
                            if (!error.isEmpty())
                            {
                                lastError = error;
                                openRequests.remove(id);
+                               saveRequests.remove(id);
                                if (requestedVoiceId == id)
                                {
                                    stopVoice();
@@ -2330,11 +2532,56 @@ void Window::fetchMedia(const QJsonObject &media, bool saveOnly, bool thumbnail)
                            downloaded[id] = path;
                            model->setLocalMedia(id, path);
                            const bool requestedOpen = openRequests.remove(id);
-                           if (requestedOpen || (media["kind"] == "voice" && requestedVoiceId == id))
+                           const bool requestedSave = saveRequests.remove(id);
+                           if (requestedOpen || requestedSave)
+                               saveMediaAndMaybeOpen(media, path, requestedOpen);
+                           else if (media["kind"] == "voice" && requestedVoiceId == id)
                                openMedia(media, path);
                            else if (thumbnail)
                                thumbnailTimer.start();
+                           cachePruneTimer.start();
                        });
+}
+void Window::drainMediaQueue()
+{
+    while (!cacheWorking && downloading.size() < 2 && !mediaQueue.isEmpty())
+        mediaQueue.dequeue()();
+}
+void Window::saveMediaAndMaybeOpen(const QJsonObject &media, const QString &path, bool open)
+{
+    if (!MediaStorage::isCachePath(path))
+    {
+        model->setLocalMedia(media["id"].toString(), path);
+        if (open || (media["kind"] == "voice" && requestedVoiceId == media["id"].toString())) openMedia(media, path);
+        return;
+    }
+    const auto id = media["id"].toString();
+    downloading.insert(id);
+    const auto root = downloadRoot;
+    const auto scope = chatPreferences.scope();
+    const auto conversation = conversationGeneration;
+    QPointer<Window> self(this);
+    QThreadPool::globalInstance()->start([self, media, path, root, open, id, scope, conversation]
+    {
+        QString error;
+        const auto saved = MediaStorage::saveCached(path, root, media["name"].toString(), error);
+        QMetaObject::invokeMethod(qApp, [self, media, saved, error, open, id, root, scope, conversation]
+        {
+            if (!self) return;
+            self->downloading.remove(id);
+            QTimer::singleShot(0, self, &Window::drainMediaQueue);
+            self->cachePruneTimer.start();
+            if (scope != self->chatPreferences.scope() || conversation != self->conversationGeneration ||
+                root != self->downloadRoot || !self->canDownload) return;
+            const bool requestedOpen = self->openRequests.remove(id);
+            self->saveRequests.remove(id);
+            if (!error.isEmpty()) { self->lastError = error; return; }
+            self->downloaded[id] = saved;
+            self->model->setLocalMedia(id, saved);
+            if (open || requestedOpen || (media["kind"] == "voice" && self->requestedVoiceId == id))
+                self->openMedia(media, saved);
+        });
+    });
 }
 void Window::visibleThumbnails()
 {
@@ -2352,7 +2599,7 @@ void Window::visibleThumbnails()
             auto media = entry.toObject();
             auto kind = media["kind"].toString();
             if ((kind == "image" || kind == "gif") && media["size"].toInteger() <= 8 * 1024 * 1024 &&
-                media["_local"].toString().isEmpty())
+                (media["_local"].toString().isEmpty() || !QFileInfo::exists(media["_local"].toString())))
                 fetchMedia(media, false, true);
         }
     }
@@ -2361,6 +2608,7 @@ void Window::stopVoice()
 {
     requestedVoiceId.clear();
     playingVoiceId.clear();
+    playingVoicePath.clear();
     voiceGroup.clear();
     if (voicePlayer)
         voicePlayer->stop();
@@ -2377,12 +2625,14 @@ void Window::openMedia(const QJsonObject &media, const QString &path)
             voiceConversation != conversationGeneration || !canDownload || !isVisible() || isMinimized())
             return;
         playingVoiceId = id;
+        playingVoicePath = path;
         if (voicePlayer->play(path))
             messages->setVoiceState(id, "playing");
         else
         {
             requestedVoiceId.clear();
             playingVoiceId.clear();
+            playingVoicePath.clear();
             messages->setVoiceState(id, "error");
         }
         return;

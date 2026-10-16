@@ -1,8 +1,11 @@
 #include "history_browser.h"
 #include "attachment.h"
 #include "messages.h"
+#include "media_storage.h"
 #include "smooth_scroll.h"
+#include "theme.h"
 #include "transport.h"
+#include "wechat_emoji.h"
 #include <QAbstractListModel>
 #include <QButtonGroup>
 #include <QCache>
@@ -33,6 +36,11 @@ namespace
 constexpr int pageSize = 50;
 constexpr int retainedRecords = 200;
 
+QColor historyColor(const char *light, const char *dark)
+{
+    return QColor(Theme::isDark() ? dark : light);
+}
+
 QString recordText(const QJsonObject &message)
 {
     if (message["status"] == "recalled")
@@ -45,7 +53,7 @@ QString recordText(const QJsonObject &message)
         text = "[消息]";
     // The original stays in the model and can be located; an exceptionally long result
     // must not turn one list row into an unbounded text layout.
-    return text.size() > 1200 ? text.left(1200) + "…" : text;
+    return wechatDisplayText(text.size() > 1200 ? text.left(1200) + "…" : text);
 }
 
 QString mediaLabel(const QJsonObject &media)
@@ -87,7 +95,7 @@ RowLayout layoutRow(const QJsonObject &message, int width, const QFont &font)
     RowLayout result;
     const auto available = qMax(80, width - 94);
     const auto text = recordText(message);
-    const QFontMetrics metrics(font);
+    const QFontMetrics metrics(wechatDisplayFont(font));
     const auto textHeight = text.isEmpty() ? 0 :
         qMin(metrics.lineSpacing() * 8,
              metrics.boundingRect(QRect(0, 0, available, 2000), Qt::TextWordWrap, text).height() + 2);
@@ -234,12 +242,13 @@ class RecordDelegate final : public QStyledItemDelegate
         p->translate(option.rect.topLeft());
         p->setRenderHint(QPainter::Antialiasing);
         p->fillRect(QRect(QPoint(), option.rect.size()),
-                    option.state & QStyle::State_Selected ? QColor("#eeeef0") : QColor("#fafafa"));
+                    option.state & QStyle::State_Selected ? historyColor("#eeeef0", "#333638")
+                                                         : historyColor("#fafafa", "#202020"));
         p->drawPixmap(24, 13, chatAvatar(message, 36));
         auto caption = option.font;
         caption.setPixelSize(12);
         p->setFont(caption);
-        p->setPen(QColor("#9f9fa6"));
+        p->setPen(historyColor("#9f9fa6", "#999ca3"));
         const auto stamp = message["timestamp"].toInteger();
         const auto time = stamp > 0 ? QDateTime::fromMSecsSinceEpoch(stamp).toString("yyyy年M月d日 HH:mm") : "";
         const int timeWidth = QFontMetrics(caption).horizontalAdvance(time);
@@ -247,8 +256,9 @@ class RecordDelegate final : public QStyledItemDelegate
         p->drawText(QRect(70, 10, nameWidth, 21), Qt::AlignVCenter,
             QFontMetrics(caption).elidedText(message["sender"].toString(), Qt::ElideRight, nameWidth));
         p->drawText(QRect(option.rect.width() - timeWidth - 24, 10, timeWidth, 21), Qt::AlignVCenter, time);
-        p->setFont(option.font);
-        p->setPen(message["status"] == "recalled" ? QColor("#9f9fa6") : QColor("#19191a"));
+        p->setFont(wechatDisplayFont(option.font));
+        p->setPen(message["status"] == "recalled" ? historyColor("#9f9fa6", "#999ca3")
+                                                : historyColor("#19191a", "#ededed"));
         p->drawText(layout.text, Qt::TextWordWrap, recordText(message));
         const auto media = message["media"].toArray();
         for (int i = 0; i < layout.media.size(); ++i)
@@ -277,13 +287,13 @@ class RecordDelegate final : public QStyledItemDelegate
                 }
             }
             p->setPen(Qt::NoPen);
-            p->setBrush(QColor("#eeeef0"));
+            p->setBrush(historyColor("#eeeef0", "#303234"));
             p->drawRoundedRect(rect, 4, 4);
-            p->setPen(QColor("#19191a"));
+            p->setPen(historyColor("#19191a", "#ededed"));
             p->drawText(rect.adjusted(10, 5, -10, -22), Qt::AlignVCenter,
                 QFontMetrics(option.font).elidedText(mediaLabel(item), Qt::ElideRight, rect.width() - 20));
             p->setFont(caption);
-            p->setPen(QColor("#9f9fa6"));
+            p->setPen(historyColor("#9f9fa6", "#999ca3"));
             p->drawText(rect.adjusted(10, 29, -10, -4), Qt::AlignVCenter,
                 item["kind"] == "voice" ? "定位到聊天播放" : AttachmentStore::sizeLabel(item["size"].toInteger()));
             p->setFont(option.font);
@@ -303,17 +313,7 @@ HistoryBrowser::HistoryBrowser(Transport *service, const QString &group, const Q
     setAttribute(Qt::WA_DeleteOnClose);
     resize(560, 720);
     setMinimumSize(480, 420);
-    setStyleSheet(
-        "#historyBrowser { background:#fafafa; }"
-        "#historyRecords { background:#fafafa; border:0; outline:0; }"
-        "#historySearch { background:#fafafa; border:1px solid #e3e3e3; border-radius:6px; padding:10px; }"
-        "#historyFilter { background:transparent; color:#334e88; border:0; padding:3px 0; font-size:12px; }"
-        "#historyFilter:checked { color:#07a569; }"
-        "#historyStatus { color:#9f9fa6; font-size:12px; }"
-        "#historyMore { background:transparent; color:#334e88; border:0; padding:5px; }"
-        "QComboBox, QDateEdit { background:#fafafa; border:1px solid #e3e3e3; border-radius:4px; padding:3px; }"
-        "QCheckBox { font-size:12px; }"
-    );
+    updateThemeStyle();
     auto *outer = new QVBoxLayout(this);
     outer->setContentsMargins(0, 18, 0, 10);
     outer->setSpacing(10);
@@ -535,7 +535,7 @@ void HistoryBrowser::loadMembers()
 
 void HistoryBrowser::loadVisibleThumbnails()
 {
-    if (!valid || !transport || !allowDownload || !isVisible() || isMinimized())
+    if (!valid || !transport || !allowDownload || !isVisible() || isMinimized() || property("cacheMaintenance").toBool())
         return;
     const auto rows = static_cast<RecordsModel *>(records);
     for (int row = 0; row < rows->rows.size() && downloading.size() < 2; ++row)
@@ -559,7 +559,7 @@ void HistoryBrowser::loadVisibleThumbnails()
             downloading.insert(id);
             QPointer<HistoryBrowser> self(this);
             const auto requestedGeneration = generation;
-            transport->download(media, downloadRoot,
+            transport->download(media, MediaStorage::cacheDirectory(),
                 [self, id, requestedGeneration](const QString &path, const QString &error)
                 {
                     if (!self)
@@ -577,6 +577,7 @@ void HistoryBrowser::loadVisibleThumbnails()
                     {
                         static_cast<RecordsModel *>(self->records)->localMedia(id, path);
                         self->list->doItemsLayout();
+                        emit self->cacheUpdated();
                     }
                     self->thumbnailTimer.start();
                 });
@@ -584,6 +585,30 @@ void HistoryBrowser::loadVisibleThumbnails()
     }
 }
 
+QSet<QString> HistoryBrowser::protectedCachePaths() const
+{
+    QSet<QString> result;
+    if (!valid || !isVisible()) return result;
+    const auto rows = static_cast<RecordsModel *>(records);
+    for (int row = 0; row < rows->rows.size(); ++row)
+        if (list->visualRect(records->index(row)).intersects(list->viewport()->rect()))
+            for (const auto &entry : rows->rows[row]["media"].toArray())
+                result.insert(QFileInfo(entry.toObject()["_local"].toString()).absoluteFilePath());
+    return result;
+}
+void HistoryBrowser::discardCached(const QStringList &paths)
+{
+    if (!valid) return;
+    thumbnailTimer.start();
+    if (paths.isEmpty()) return;
+    auto *rows = static_cast<RecordsModel *>(records);
+    QSet<QString> ids;
+    for (const auto &row : rows->rows)
+        for (const auto &entry : row["media"].toArray())
+            if (paths.contains(entry.toObject()["_local"].toString()))
+                ids.insert(entry.toObject()["id"].toString());
+    for (const auto &id : ids) rows->localMedia(id, {});
+}
 void HistoryBrowser::activate(const QModelIndex &index, const QPoint &point)
 {
     if (!valid || !index.isValid())
@@ -659,4 +684,41 @@ void HistoryBrowser::closeEvent(QCloseEvent *event)
     searchTimer.stop();
     thumbnailTimer.stop();
     QDialog::closeEvent(event);
+}
+
+void HistoryBrowser::changeEvent(QEvent *event)
+{
+    QDialog::changeEvent(event);
+    if (event->type() == QEvent::PaletteChange || event->type() == QEvent::ApplicationPaletteChange)
+        updateThemeStyle();
+}
+
+void HistoryBrowser::updateThemeStyle()
+{
+    if (updatingThemeStyle)
+        return;
+    const auto style = Theme::isDark() ? QStringLiteral(
+        "#historyBrowser { background:#202020; }"
+        "#historyRecords { background:#202020; border:0; outline:0; }"
+        "#historySearch { background:#292929; border:1px solid #44474b; border-radius:6px; padding:10px; }"
+        "#historyFilter { background:transparent; color:#75bfff; border:0; padding:3px 0; font-size:12px; }"
+        "#historyFilter:checked { color:#49d49a; }"
+        "#historyStatus { color:#999ca3; font-size:12px; }"
+        "#historyMore { background:transparent; color:#75bfff; border:0; padding:5px; }"
+        "QComboBox, QDateEdit { background:#292929; border:1px solid #44474b; border-radius:4px; padding:3px; }"
+        "QCheckBox { font-size:12px; }") : QStringLiteral(
+        "#historyBrowser { background:#fafafa; }"
+        "#historyRecords { background:#fafafa; border:0; outline:0; }"
+        "#historySearch { background:#fafafa; border:1px solid #e3e3e3; border-radius:6px; padding:10px; }"
+        "#historyFilter { background:transparent; color:#334e88; border:0; padding:3px 0; font-size:12px; }"
+        "#historyFilter:checked { color:#07a569; }"
+        "#historyStatus { color:#9f9fa6; font-size:12px; }"
+        "#historyMore { background:transparent; color:#334e88; border:0; padding:5px; }"
+        "QComboBox, QDateEdit { background:#fafafa; border:1px solid #e3e3e3; border-radius:4px; padding:3px; }"
+        "QCheckBox { font-size:12px; }");
+    if (style == styleSheet())
+        return;
+    updatingThemeStyle = true;
+    setStyleSheet(style);
+    updatingThemeStyle = false;
 }

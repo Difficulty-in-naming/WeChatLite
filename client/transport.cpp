@@ -366,6 +366,7 @@ void Transport::download(const QJsonObject &media, const QString &root,
         callback({}, file->errorString());
         return;
     }
+    partialDownloads.insert(partial);
     auto hash = std::make_shared<QCryptographicHash>(QCryptographicHash::Sha256);
     auto failed = std::make_shared<QString>();
     auto *reply = network.get(request("/api/media/" + media["id"].toString()));
@@ -390,7 +391,7 @@ void Transport::download(const QJsonObject &media, const QString &root,
     connect(reply, &QNetworkReply::readyRead, this, drain);
     connect(reply, &QNetworkReply::downloadProgress, this, &Transport::progress);
     connect(reply, &QNetworkReply::finished, this,
-            [reply, file, hash, failed, callback, media, directory, partial, drain]
+            [this, reply, file, hash, failed, callback, media, directory, partial, drain]
             {
                 drain();
                 auto length = file->size();
@@ -421,6 +422,7 @@ void Transport::download(const QJsonObject &media, const QString &root,
                 }
                 if (!error.isEmpty())
                     QFile::remove(partial);
+                partialDownloads.remove(partial);
                 callback(error.isEmpty() ? destination : QString(), error);
                 reply->deleteLater();
             });

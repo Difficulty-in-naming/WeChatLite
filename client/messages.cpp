@@ -1,6 +1,8 @@
 #include "messages.h"
 #include "attachment.h"
 #include "smooth_scroll.h"
+#include "theme.h"
+#include "wechat_emoji.h"
 #include <QApplication>
 #include <QBuffer>
 #include <QCache>
@@ -28,6 +30,11 @@
 #include <algorithm>
 #include <cmath>
 
+static QColor themeColor(const char *light, const char *dark)
+{
+    return QColor(Theme::isDark() ? dark : light);
+}
+
 bool canRecallMessage(const QJsonObject &message, qint64 now)
 {
     const auto status = message["status"].toString();
@@ -41,7 +48,7 @@ QString messageQuoteLabel(const QJsonObject &quote)
 {
     if (quote["unavailable"].toBool())
         return "原消息已撤回或不可用";
-    return quote["sender"].toString() + ": " + quote["text"].toString().replace('\n', ' ');
+    return quote["sender"].toString() + ": " + wechatDisplayText(quote["text"].toString().replace('\n', ' '));
 }
 static QJsonObject redactedMessage(QJsonObject message)
 {
@@ -256,13 +263,13 @@ static qreal layoutText(QTextLayout &layout, int width)
 }
 static QString layoutString(const QJsonObject &message)
 {
-    return message["text"].toString().replace('\n', QChar::LineSeparator);
+    return wechatDisplayText(message["text"].toString()).replace('\n', QChar::LineSeparator);
 }
 int MessageDelegate::textHeight(const QJsonObject &message, int width, const QFont &font)
 {
     if (message["text"].toString().isEmpty())
         return 0;
-    QTextLayout layout(layoutString(message), font);
+    QTextLayout layout(layoutString(message), wechatDisplayFont(font));
     return qCeil(layoutText(layout, width - 20)) + 20;
 }
 static QSize previewSize(const QJsonObject &media)
@@ -303,8 +310,9 @@ static int bubbleWidth(const QJsonObject &message, int viewWidth, const QFont &f
 {
     const int maximum = qMax(100, qMin(540, viewWidth - 150));
     int desired = 36;
-    for (const auto &line : message["text"].toString().split('\n'))
-        desired = qMax(desired, QFontMetrics(font).horizontalAdvance(line) + 20);
+    const QFontMetrics metrics(wechatDisplayFont(font));
+    for (const auto &line : wechatDisplayText(message["text"].toString()).split('\n'))
+        desired = qMax(desired, metrics.horizontalAdvance(line) + 20);
     for (const auto &entry : message["media"].toArray())
         desired = qMax(desired, previewSize(entry.toObject()).width());
     return qMin(maximum, desired);
@@ -380,7 +388,8 @@ static MessageGeometry geometryFor(const QJsonObject &message, const QModelIndex
     {
         const int quoteWidth =
             qMin(qMax(100, qMin(540, row.width() - 150)),
-                 QFontMetrics(smallFont(font)).horizontalAdvance(messageQuoteLabel(quote)) + 20);
+                 QFontMetrics(wechatDisplayFont(smallFont(font)))
+                         .horizontalAdvance(messageQuoteLabel(quote)) + 20);
         geometry.quote = QRect(mine ? geometry.bubble.right() - quoteWidth + 1 : x,
                                geometry.bubble.bottom() + 8, quoteWidth, 18);
     }
@@ -477,7 +486,8 @@ QPixmap chatAvatar(const QJsonObject &entity, int size)
         }
     }
     const auto cacheKey =
-        (source.isNull() ? "avatar-placeholder:" + id + ':' + name : "avatar-rounded:" + fingerprint) + ':' +
+        (source.isNull() ? "avatar-placeholder:" + id + ':' + name + (Theme::isDark() ? ":dark" : ":light")
+                         : "avatar-rounded:" + fingerprint) + ':' +
         QString::number(side);
     QPixmap result;
     if (QPixmapCache::find(cacheKey, &result))
@@ -497,11 +507,12 @@ QPixmap chatAvatar(const QJsonObject &entity, int size)
     }
     else
     {
-        const QColor palette[]{QColor("#cbd9cc"), QColor("#dad2c6"), QColor("#d8d8df"),
-                               QColor("#b9c9d4"), QColor("#d9c5bf"), QColor("#cad5bb")};
+        const QColor palette[]{themeColor("#cbd9cc", "#4a5b4e"), themeColor("#dad2c6", "#5d554a"),
+                               themeColor("#d8d8df", "#535360"), themeColor("#b9c9d4", "#455866"),
+                               themeColor("#d9c5bf", "#624e49"), themeColor("#cad5bb", "#505e46")};
         const auto seed = qHash(id);
         painter.fillRect(result.rect(), palette[seed % 6]);
-        painter.setPen(QColor("#52605b"));
+        painter.setPen(themeColor("#52605b", "#dce5df"));
         auto font = QApplication::font();
         font.setPixelSize(qMax(8, qRound(side * .47)));
         painter.setFont(font);
@@ -524,18 +535,18 @@ void MessageDelegate::paint(QPainter *p, const QStyleOptionViewItem &option, con
     p->setFont(option.font);
     if (!property("locatedId").toString().isEmpty() &&
         property("locatedId").toString() == message["id"].toString())
-        p->fillRect(option.rect, QColor("#eaeaea"));
+        p->fillRect(option.rect, themeColor("#eaeaea", "#353a3e"));
     if (geometry.timeHeight)
     {
         p->setFont(smallFont(option.font));
-        p->setPen(QColor("#9f9fa6"));
+        p->setPen(themeColor("#9f9fa6", "#999ca3"));
         p->drawText(QRect(option.rect.left(), option.rect.top() + 3, option.rect.width(), 20),
                     Qt::AlignCenter, timeLabel(message["timestamp"].toInteger()));
     }
     if (message["status"] == "recalled")
     {
         p->setFont(smallFont(option.font));
-        p->setPen(QColor("#9f9fa6"));
+        p->setPen(themeColor("#9f9fa6", "#999ca3"));
         const auto link = reeditRect(option, index);
         if (link.isEmpty())
             p->drawText(option.rect.adjusted(20, geometry.timeHeight, -20, 0),
@@ -546,7 +557,7 @@ void MessageDelegate::paint(QPainter *p, const QStyleOptionViewItem &option, con
             const int width = QFontMetrics(p->font()).horizontalAdvance("你撤回了一条消息");
             p->drawText(QRect(link.left() - width - 6, link.top(), width, link.height()), Qt::AlignVCenter,
                         "你撤回了一条消息");
-            p->setPen(QColor("#304b82"));
+            p->setPen(themeColor("#304b82", "#75bfff"));
             p->drawText(link, Qt::AlignVCenter, "重新编辑");
         }
         p->restore();
@@ -557,14 +568,14 @@ void MessageDelegate::paint(QPainter *p, const QStyleOptionViewItem &option, con
     if (!mine)
     {
         p->setFont(smallFont(option.font));
-        p->setPen(QColor("#9f9fa6"));
+        p->setPen(themeColor("#9f9fa6", "#999ca3"));
         p->drawText(QRect(bubble.left(), bubble.top() - 20, qMax(200, bubble.width()), 17),
                     Qt::AlignLeft | Qt::AlignVCenter, message["sender"].toString());
     }
     const bool textOnly = media.isEmpty();
     if (geometry.textHeight)
     {
-        const auto background = mine ? QColor("#9df29f") : QColor("#eeeef0");
+        const auto background = mine ? themeColor("#9df29f", "#3c633c") : themeColor("#eeeef0", "#303234");
         p->setPen(Qt::NoPen);
         p->setBrush(background);
         p->drawRoundedRect(QRect(bubble.left(), bubble.top(), bubble.width(), geometry.textHeight), 5, 5);
@@ -574,16 +585,16 @@ void MessageDelegate::paint(QPainter *p, const QStyleOptionViewItem &option, con
                             : QPolygon{{bubble.left() + 1, bubble.top() + 10},
                                        {bubble.left() - 5, bubble.top() + 15},
                                        {bubble.left() + 1, bubble.top() + 20}});
-        p->setFont(option.font);
-        p->setPen(QColor("#19191a"));
-        QTextLayout text(layoutString(message), option.font);
+        p->setFont(wechatDisplayFont(option.font));
+        p->setPen(themeColor("#19191a", "#ededed"));
+        QTextLayout text(layoutString(message), wechatDisplayFont(option.font));
         layoutText(text, bubble.width() - 20);
         text.draw(p, {qreal(bubble.left() + 10), qreal(bubble.top() + 10)});
     }
     else if (textOnly)
     {
         p->setPen(Qt::NoPen);
-        p->setBrush(mine ? QColor("#9df29f") : QColor("#eeeef0"));
+        p->setBrush(mine ? themeColor("#9df29f", "#3c633c") : themeColor("#eeeef0", "#303234"));
         p->drawRoundedRect(bubble, 5, 5);
     }
     for (int i = 0; i < media.size(); ++i)
@@ -600,9 +611,9 @@ void MessageDelegate::paint(QPainter *p, const QStyleOptionViewItem &option, con
             else
             {
                 p->setPen(Qt::NoPen);
-                p->setBrush(QColor("#eeeef0"));
+                p->setBrush(themeColor("#eeeef0", "#303234"));
                 p->drawRoundedRect(rect, 4, 4);
-                p->setPen(QColor("#9f9fa6"));
+                p->setPen(themeColor("#9f9fa6", "#999ca3"));
                 p->setFont(smallFont(option.font));
                 p->drawText(rect, Qt::AlignCenter, kind == "gif" ? "GIF · 点击下载" : "图片 · 点击下载");
             }
@@ -627,9 +638,10 @@ void MessageDelegate::paint(QPainter *p, const QStyleOptionViewItem &option, con
             const auto state = property("voiceId").toString() == item["id"].toString()
                                    ? property("voiceState").toString() : QString{};
             p->setPen(Qt::NoPen);
-            p->setBrush(mine ? QColor("#9df29f") : QColor("#eeeef0"));
+            p->setBrush(mine ? themeColor("#9df29f", "#3c633c") : themeColor("#eeeef0", "#303234"));
             p->drawRoundedRect(rect, 5, 5);
-            p->setPen(QPen(QColor(state == "playing" ? "#078850" : "#444444"), 1.6));
+            p->setPen(QPen(state == "playing" ? themeColor("#078850", "#6ee8aa")
+                                            : themeColor("#444444", "#d6d9db"), 1.6));
             const QPoint center(rect.left() + 16, rect.center().y());
             for (int radius : {4, 8, 12})
                 p->drawArc(QRect(center.x() - radius, center.y() - radius, radius * 2, radius * 2), -50 * 16,
@@ -644,8 +656,8 @@ void MessageDelegate::paint(QPainter *p, const QStyleOptionViewItem &option, con
         }
         else
         {
-            p->setPen(QPen(QColor("#e6e6e6"), 1));
-            p->setBrush(Qt::white);
+            p->setPen(QPen(themeColor("#e6e6e6", "#44474b"), 1));
+            p->setBrush(themeColor("#ffffff", "#292929"));
             p->drawRoundedRect(rect, 4, 4);
             p->setPen(Qt::NoPen);
             p->setBrush(QColor("#e99538"));
@@ -655,12 +667,12 @@ void MessageDelegate::paint(QPainter *p, const QStyleOptionViewItem &option, con
             p->setFont(smallFont(option.font, 11));
             p->drawText(file, Qt::AlignCenter, QFileInfo(item["name"].toString()).suffix().toUpper().left(4));
             p->setFont(option.font);
-            p->setPen(QColor("#19191a"));
+            p->setPen(themeColor("#19191a", "#ededed"));
             p->drawText(rect.adjusted(12, 12, -69, -40), Qt::AlignVCenter,
                         QFontMetrics(option.font)
                             .elidedText(item["name"].toString(), Qt::ElideMiddle, rect.width() - 81));
             p->setFont(smallFont(option.font, 11));
-            p->setPen(QColor("#9f9fa6"));
+            p->setPen(themeColor("#9f9fa6", "#999ca3"));
             p->drawText(rect.adjusted(12, 42, -69, -14), Qt::AlignVCenter,
                         AttachmentStore::sizeLabel(item["size"].toInteger()));
         }
@@ -668,9 +680,10 @@ void MessageDelegate::paint(QPainter *p, const QStyleOptionViewItem &option, con
     if (!geometry.quote.isEmpty())
     {
         const auto rect = geometry.quote;
-        p->fillRect(mine ? rect.right() - 1 : rect.left(), rect.top(), 2, rect.height(), QColor("#e2e2e2"));
-        p->setFont(smallFont(option.font));
-        p->setPen(QColor("#9f9fa6"));
+        p->fillRect(mine ? rect.right() - 1 : rect.left(), rect.top(), 2, rect.height(),
+                    themeColor("#e2e2e2", "#51565a"));
+        p->setFont(wechatDisplayFont(smallFont(option.font)));
+        p->setPen(themeColor("#9f9fa6", "#999ca3"));
         p->drawText(rect.adjusted(8, 0, -8, 0), Qt::AlignVCenter,
                     QFontMetrics(p->font()).elidedText(messageQuoteLabel(message["quote"].toObject()),
                                                        Qt::ElideRight, rect.width() - 16));
@@ -680,8 +693,8 @@ void MessageDelegate::paint(QPainter *p, const QStyleOptionViewItem &option, con
     {
         p->setFont(smallFont(option.font, 11));
         p->setPen(message["status"].toString() == "failed" || message["status"].toString() == "uncertain"
-                      ? QColor("#d8534b")
-                      : QColor("#9f9fa6"));
+                      ? themeColor("#d8534b", "#ff8c85")
+                      : themeColor("#9f9fa6", "#999ca3"));
         p->drawText(QRect(bubble.left(),
                           (geometry.quote.isEmpty() ? bubble.bottom() : geometry.quote.bottom()) + 4,
                           bubble.width(), 17),
@@ -1147,7 +1160,7 @@ class ChatContextMenu : public QMenu
     void paintEvent(QPaintEvent *) override
     {
         const auto ratio = devicePixelRatioF();
-        if (cachedSize != size() || !qFuzzyCompare(cachedRatio, ratio))
+        if (cachedSize != size() || !qFuzzyCompare(cachedRatio, ratio) || cachedDark != Theme::isDark())
             updateBackground(ratio);
         QPainter painter(this);
         painter.setCompositionMode(QPainter::CompositionMode_Source);
@@ -1161,7 +1174,7 @@ class ChatContextMenu : public QMenu
             const auto area = actionGeometry(action);
             if (action->isSeparator())
             {
-                painter.setPen(QColor("#e5e5e5"));
+                painter.setPen(themeColor("#e5e5e5", "#4b4f53"));
                 painter.drawLine(area.left() + 7, area.center().y(), area.right() - 7, area.center().y());
                 continue;
             }
@@ -1169,13 +1182,13 @@ class ChatContextMenu : public QMenu
             if (selected)
             {
                 painter.setPen(Qt::NoPen);
-                painter.setBrush(QColor("#00c777"));
+                painter.setBrush(themeColor("#00c777", "#087f52"));
                 painter.drawRoundedRect(area, 5, 5);
             }
-            const auto color = !action->isEnabled()                      ? QColor("#9f9fa6")
+            const auto color = !action->isEnabled()                      ? themeColor("#9f9fa6", "#777c81")
                                : selected                                ? QColor(Qt::white)
-                               : action->objectName() == "recallMessage" ? QColor("#e55757")
-                                                                         : QColor("#19191a");
+                               : action->objectName() == "recallMessage" ? themeColor("#e55757", "#ff8c85")
+                                                                         : themeColor("#19191a", "#ededed");
             painter.setPen(color);
             const bool checkable = action->isCheckable();
             if (checkable && action->isChecked())
@@ -1198,7 +1211,8 @@ class ChatContextMenu : public QMenu
                 if (icon == "copy")
                 {
                     painter.drawRoundedRect(QRectF(0, 0, 9, 10), 1, 1);
-                    painter.fillRect(QRectF(4, 4, 9, 10), selected ? QColor("#00c777") : QColor("#f7f7f7"));
+                    painter.fillRect(QRectF(4, 4, 9, 10), selected ? themeColor("#00c777", "#087f52")
+                                                                : themeColor("#f7f7f7", "#303234"));
                     painter.drawRoundedRect(QRectF(4, 4, 9, 10), 1, 1);
                 }
                 else if (icon == "quote")
@@ -1259,17 +1273,19 @@ class ChatContextMenu : public QMenu
         }
         QPainter painter(&image);
         painter.setRenderHint(QPainter::Antialiasing);
-        painter.setPen(QPen(QColor("#d6d6d6"), 1));
-        painter.setBrush(QColor("#f7f7f7"));
+        painter.setPen(QPen(themeColor("#d6d6d6", "#4b4f53"), 1));
+        painter.setBrush(themeColor("#f7f7f7", "#303234"));
         painter.drawRoundedRect(panel.adjusted(.5, .5, -.5, -.5), radius, radius);
         painter.end();
         background = QPixmap::fromImage(image);
         cachedSize = size();
         cachedRatio = ratio;
+        cachedDark = Theme::isDark();
     }
     QPixmap background;
     QSize cachedSize;
     qreal cachedRatio = 0;
+    bool cachedDark = false;
 };
 QMenu *createChatContextMenu(QWidget *parent) { return new ChatContextMenu(parent); }
 
@@ -1395,13 +1411,13 @@ void GroupDelegate::paint(QPainter *p, const QStyleOptionViewItem &option, const
     p->save();
     p->setClipRect(rect);
     p->setRenderHint(QPainter::Antialiasing);
-    p->fillRect(rect, selected                                         ? QColor("#15ac70")
-                      : option.state.testFlag(QStyle::State_MouseOver) ? QColor("#e0e0e2")
-                      : group["pinned"].toBool()                       ? QColor("#e6e6e8")
-                                                                       : QColor("#eeeef0"));
+    p->fillRect(rect, selected                                         ? themeColor("#15ac70", "#245c44")
+                      : option.state.testFlag(QStyle::State_MouseOver) ? themeColor("#e0e0e2", "#333638")
+                      : group["pinned"].toBool()                       ? themeColor("#e6e6e8", "#2d3032")
+                                                                       : themeColor("#eeeef0", "#262626"));
     if (!selected)
     {
-        p->setPen(QColor("#dddddf"));
+        p->setPen(themeColor("#dddddf", "#3a3d40"));
         p->drawLine(rect.left() + 56, rect.bottom(), rect.right() - 12, rect.bottom());
     }
     const QRect avatar(rect.left() + 12, rect.top() + 16, 36, 36);
@@ -1410,17 +1426,18 @@ void GroupDelegate::paint(QPainter *p, const QStyleOptionViewItem &option, const
     font.setPixelSize(14);
     font.setWeight(QFont::Normal);
     p->setFont(font);
-    p->setPen(selected ? Qt::white : QColor("#19191a"));
+    p->setPen(selected ? Qt::white : themeColor("#19191a", "#ededed"));
     const auto timestamp = group["timestamp"].toInteger();
     const int textWidth = rect.width() - 69 - (timestamp ? 45 : 0);
     p->drawText(QRect(rect.left() + 57, rect.top() + 11, textWidth, 23), Qt::AlignVCenter,
                 QFontMetrics(font).elidedText(group["name"].toString(), Qt::ElideRight, textWidth));
     font.setPixelSize(12);
-    p->setFont(font);
-    p->setPen(selected ? QColor("#def5ed") : QColor("#9f9fa6"));
+    p->setFont(wechatDisplayFont(font));
+    p->setPen(selected ? QColor("#def5ed") : themeColor("#9f9fa6", "#999ca3"));
     p->drawText(
         QRect(rect.left() + 57, rect.top() + 34, rect.width() - 70, 20), Qt::AlignVCenter,
-        QFontMetrics(font).elidedText(group["preview"].toString(), Qt::ElideRight, rect.width() - 70));
+        QFontMetrics(p->font()).elidedText(wechatDisplayText(group["preview"].toString()),
+                                         Qt::ElideRight, rect.width() - 70));
     if (timestamp)
     {
         font.setPixelSize(10);
