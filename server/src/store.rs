@@ -2,7 +2,7 @@ use crate::{
     access::{ClientRecord, Clients},
     model::{ChatMessage, Group, Media, Member, Quote},
 };
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
 use std::{collections::BTreeSet, path::Path, sync::Mutex};
@@ -29,6 +29,7 @@ impl Store {
             CREATE TABLE IF NOT EXISTS events(seq INTEGER PRIMARY KEY AUTOINCREMENT, body TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS access_clients(id TEXT PRIMARY KEY, token_hash TEXT UNIQUE NOT NULL, body TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS history_sources(group_id TEXT NOT NULL, source_id TEXT NOT NULL, PRIMARY KEY(group_id,source_id));
+            CREATE TABLE IF NOT EXISTS history_imports(group_id TEXT NOT NULL, seq INTEGER NOT NULL, PRIMARY KEY(group_id,seq));
             CREATE TABLE IF NOT EXISTS state(key TEXT PRIMARY KEY, body TEXT NOT NULL);")?;
         let store = Self { db: Mutex::new(db) };
         let pending: Vec<ChatMessage> = {
@@ -430,6 +431,10 @@ impl Store {
         )?;
         let mut event = Self::append_event(&tx, message, true)?;
         if historical {
+            tx.execute(
+                "INSERT INTO history_imports(group_id,seq) VALUES(?1,?2)",
+                params![message.group, message.seq],
+            )?;
             event["historical"] = json!(true);
             tx.execute(
                 "UPDATE events SET body=?1 WHERE seq=?2",
@@ -747,6 +752,54 @@ impl Store {
             .collect::<Result<_>>()?;
         result.reverse();
         Ok(result)
+    }
+
+    pub fn record_snapshot(&self, group: &str) -> Result<i64> {
+        Ok(self.db.lock().unwrap().query_row(
+            "SELECT COALESCE(MAX(seq),0) FROM messages WHERE group_id=?1",
+            [group],
+            |r| r.get(0),
+        )?)
+    }
+    pub fn record_import_head(&self, group: &str) -> Result<i64> {
+        Ok(self.db.lock().unwrap().query_row(
+            "SELECT COALESCE(MAX(seq),0) FROM history_imports WHERE group_id=?1",
+            [group],
+            |r| r.get(0),
+        )?)
+    }
+    pub fn record_rows(
+        &self,
+        group: &str,
+        low: i64,
+        high: i64,
+        before: Option<(i64, i64)>,
+        historical: bool,
+        limit: usize,
+    ) -> Result<Vec<ChatMessage>> {
+        ensure!(limit <= crate::records::SCAN_LIMIT + 1, "记录扫描页过大");
+        let conn = self.db.lock().unwrap();
+        let (time, seq) = before.unwrap_or((i64::MAX, i64::MAX));
+        if before.is_some() {
+            let valid: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM messages WHERE group_id=?1 AND seq=?2)",
+                params![group, seq],
+                |r| r.get(0),
+            )?;
+            ensure!(valid, "记录游标不属于该群或已经失效");
+        }
+        let sql = if historical {
+            "SELECT m.body FROM history_imports h JOIN messages m ON m.seq=h.seq AND m.group_id=h.group_id WHERE h.group_id=?1 AND m.seq>?2 AND m.seq<=?3 AND (CAST(json_extract(m.body,'$.timestamp') AS INTEGER),m.seq)<(?4,?5) ORDER BY CAST(json_extract(m.body,'$.timestamp') AS INTEGER) DESC,m.seq DESC LIMIT ?6"
+        } else {
+            "SELECT m.body FROM messages m WHERE m.group_id=?1 AND m.seq>?2 AND m.seq<=?3 AND (CAST(json_extract(m.body,'$.timestamp') AS INTEGER),m.seq)<(?4,?5) ORDER BY CAST(json_extract(m.body,'$.timestamp') AS INTEGER) DESC,m.seq DESC LIMIT ?6"
+        };
+        let mut statement = conn.prepare(sql)?;
+        statement
+            .query_map(params![group, low, high, time, seq, limit as i64], |r| {
+                r.get::<_, String>(0)
+            })?
+            .map(|row| Ok(serde_json::from_str(&row?)?))
+            .collect()
     }
 
     pub fn history_progress(&self, group: &str) -> Result<crate::history::Progress> {

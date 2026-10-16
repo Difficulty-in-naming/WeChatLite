@@ -36,4 +36,7 @@ add_custom_target(server-gui-runtime ALL
     COMMAND ${CMAKE_COMMAND} -E copy_if_different "${RELAY_EXECUTABLE}" "$<TARGET_FILE_DIR:server-gui-tests>"
     DEPENDS wechat-server server-gui-tests)
 add_test(NAME server-gui-tests COMMAND server-gui-tests -platform offscreen -o server-gui-tests.txt,txt)
+if(APPLE)
+    set_tests_properties(server-gui-tests PROPERTIES ENVIRONMENT "QT_SSL_USE_TEMPORARY_KEYCHAIN=1")
+endif()
 install(TARGETS wechat-server BUNDLE DESTINATION . RUNTIME DESTINATION .)

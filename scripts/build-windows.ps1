@@ -43,6 +43,14 @@ cargo test --locked -p wechat-relay -p wechat-adapter -p wechat-p2p
 if ($LASTEXITCODE) { throw 'Rust relay/adapter tests failed' }
 cargo build --release --locked -p wechat-relay -p wechat-adapter -p wechat-p2p
 if ($LASTEXITCODE) { throw 'Rust relay/adapter build failed' }
+$previousRelayBinary = $env:WECHAT_RELAY_BINARY
+try {
+    $env:WECHAT_RELAY_BINARY = Join-Path $workspace 'target\release\wechat-relay.exe'
+    cargo test --locked -p wechat-p2p --test p2p_e2e -- --ignored --test-threads=1
+    if ($LASTEXITCODE) { throw 'P2P direct/relay application integration failed' }
+} finally {
+    $env:WECHAT_RELAY_BINARY = $previousRelayBinary
+}
 $releaseRuntime = Join-Path $workspace 'target\release'
 Copy-Item -LiteralPath $FFmpeg -Destination (Join-Path $releaseRuntime 'ffmpeg.exe') -Force
 Copy-Item -LiteralPath $actionsBinary -Destination (Join-Path $releaseRuntime 'WeChatActions.dll') -Force

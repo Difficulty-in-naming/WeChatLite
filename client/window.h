@@ -8,6 +8,7 @@
 #include <QJsonObject>
 #include <QMainWindow>
 #include <QProcess>
+#include <QPointer>
 #include <QQueue>
 #include <QSystemTrayIcon>
 #include <QTimer>
@@ -24,6 +25,8 @@ class QScrollArea;
 class QToolButton;
 class VoicePlayer;
 class QMenu;
+class HistoryBrowser;
+class AnnouncementDialog;
 
 class Window : public QMainWindow
 {
@@ -51,6 +54,11 @@ class Window : public QMainWindow
     void makeUi();
     void connectService();
     void loadPermissions();
+    void showHistoryBrowser();
+    void showAnnouncement();
+    void invalidateAuxiliaryWindows();
+    void activateHistoryRecord(const QJsonObject &message, const QJsonObject &media);
+    void playLocatedRecord(const QString &messageId);
     void loadGroups();
     void sortGroups();
     bool rememberMessage(const QJsonObject &message);
@@ -91,7 +99,11 @@ class Window : public QMainWindow
     QListWidget *groups;
     QLineEdit *groupSearch;
     QLabel *title, *subtitle, *connection, *transferLabel, *attachmentCount, *demoLabel;
-    QPushButton *sendButton;
+    QPushButton *sendButton, *historyButton, *announcementButton;
+    QPointer<HistoryBrowser> historyBrowser;
+    QPointer<AnnouncementDialog> announcementDialog;
+    QString pendingRecordId;
+    QJsonObject pendingRecordMedia;
     QScrollArea *attachmentArea;
     QHBoxLayout *attachmentLayout;
     QWidget *quoteArea = nullptr;

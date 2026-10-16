@@ -1,6 +1,8 @@
 #include "window.h"
+#include "announcement_dialog.h"
 #include "composer.h"
 #include "connection_info.h"
+#include "history_browser.h"
 #include "messages.h"
 #include "smooth_scroll.h"
 #include "voice_player.h"
@@ -247,6 +249,9 @@ Window::Window(bool demo, const QString &tunnelExecutable)
                 }
                 else
                 {
+                    invalidateAuxiliaryWindows();
+                    historyButton->setEnabled(false);
+                    announcementButton->setEnabled(false);
                     stopVoice();
                     openRequests.clear();
                     ++permissionsGeneration;
@@ -486,7 +491,21 @@ void Window::makeUi()
     headerLayout->setSpacing(12);
     title = new QLabel("微信轻聊");
     title->setObjectName("chatTitle");
+    title->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
     headerLayout->addWidget(title, 1);
+    historyButton = button("聊天记录", "historyButton");
+    announcementButton = button("群公告", "announcementButton");
+    for (auto *entry : {historyButton, announcementButton})
+    {
+        entry->setFixedHeight(26);
+        entry->setStyleSheet(
+            "QPushButton { background:transparent; border:0; border-radius:3px; padding:3px 6px; font-size:12px; }"
+            "QPushButton:hover { background:#eeeef0; }"
+            "QPushButton:disabled { color:#b0b0b0; }");
+        headerLayout->addWidget(entry);
+    }
+    connect(historyButton, &QPushButton::clicked, this, &Window::showHistoryBrowser);
+    connect(announcementButton, &QPushButton::clicked, this, &Window::showAnnouncement);
     subtitle = new QLabel(header);
     subtitle->hide();
     layout->addWidget(header);
@@ -979,6 +998,9 @@ void Window::cancelSend()
 }
 void Window::clearConversation()
 {
+    invalidateAuxiliaryWindows();
+    historyButton->setEnabled(false);
+    announcementButton->setEnabled(false);
     stopVoice();
     openRequests.clear();
     locatingId.clear();
@@ -1073,6 +1095,7 @@ void Window::loadPermissions()
             messages->setProperty("canDownload", canDownload);
             if (!canDownload)
             {
+                invalidateAuxiliaryWindows();
                 stopVoice();
                 openRequests.clear();
             }
@@ -1144,7 +1167,91 @@ void Window::loadGroups()
                           clearConversation();
                           notify("服务端尚未勾选转发群，请联系服务端管理员选择允许此客户端访问的群。");
                       }
+                      historyButton->setEnabled(connected && !groupId.isEmpty());
+                      announcementButton->setEnabled(connected && !groupId.isEmpty());
                   });
+}
+
+void Window::invalidateAuxiliaryWindows()
+{
+    if (historyBrowser)
+        historyBrowser->invalidate();
+    if (announcementDialog)
+        announcementDialog->invalidate();
+    historyBrowser.clear();
+    announcementDialog.clear();
+    pendingRecordId.clear();
+    pendingRecordMedia = {};
+}
+
+void Window::showHistoryBrowser()
+{
+    if (!connected || groupId.isEmpty())
+        return;
+    if (historyBrowser)
+    {
+        historyBrowser->showNormal();
+        historyBrowser->raise();
+        historyBrowser->activateWindow();
+        return;
+    }
+    historyBrowser = new HistoryBrowser(&transport, groupId, title->text(), downloadRoot, canDownload, this);
+    connect(historyBrowser, &HistoryBrowser::recordActivated, this, &Window::activateHistoryRecord);
+    historyBrowser->show();
+}
+
+void Window::showAnnouncement()
+{
+    if (!connected || groupId.isEmpty())
+        return;
+    if (announcementDialog)
+    {
+        announcementDialog->showNormal();
+        announcementDialog->raise();
+        announcementDialog->activateWindow();
+        return;
+    }
+    announcementDialog = new AnnouncementDialog(&transport, groupId, title->text(), this);
+    announcementDialog->show();
+}
+
+void Window::activateHistoryRecord(const QJsonObject &message, const QJsonObject &media)
+{
+    if (!connected || message["group"] != groupId || groupId.isEmpty() ||
+        message["id"].toString().isEmpty() || !locatingId.isEmpty())
+        return;
+    if (historyBrowser)
+        historyBrowser->hide();
+    showNormal();
+    raise();
+    activateWindow();
+    pendingRecordId = media["kind"] == "voice" && canDownload ? message["id"].toString() : QString();
+    pendingRecordMedia = pendingRecordId.isEmpty() ? QJsonObject{} : media;
+    locateQuote({{"id", message["id"]}, {"group", groupId},
+                 {"unavailable", message["status"] == "recalled"}});
+    if (!pendingRecordId.isEmpty())
+        playLocatedRecord(pendingRecordId);
+    else if (!media.isEmpty() && message["status"] != "recalled")
+        fetchMedia(media);
+}
+
+void Window::playLocatedRecord(const QString &id)
+{
+    if (pendingRecordId != id || pendingRecordMedia.isEmpty())
+        return;
+    for (const auto &message : model->rows)
+        if (message["id"] == id && message["group"] == groupId && message["status"] != "recalled")
+            for (const auto &value : message["media"].toArray())
+            {
+                const auto media = value.toObject();
+                if (media["id"] == pendingRecordMedia["id"] && media["kind"] == "voice")
+                {
+                    pendingRecordId.clear();
+                    pendingRecordMedia = {};
+                    fetchMedia(media);
+                    return;
+                }
+            }
 }
 
 void Window::activateConversation(const QString &id)
@@ -1320,6 +1427,7 @@ void Window::selectGroup(const QString &id, const QString &name)
         notify("附件发送完成后可切换会话", true);
         return;
     }
+    invalidateAuxiliaryWindows();
     saveDraft();
     stopVoice();
     openRequests.clear();
@@ -1345,6 +1453,8 @@ void Window::selectGroup(const QString &id, const QString &name)
     }
     pendingId.clear();
     title->setText(name);
+    historyButton->setEnabled(connected);
+    announcementButton->setEnabled(connected);
     memberCache = {};
     composer->setMembers({});
     restoreDraft();
@@ -1498,6 +1608,7 @@ void Window::handleEvent(const QJsonObject &event)
     }
     else if (type == "reset")
     {
+        invalidateAuxiliaryWindows();
         notificationsSynced = false;
         notificationSyncSeq = 0;
         loadHistory();
@@ -1517,6 +1628,13 @@ void Window::handleEvent(const QJsonObject &event)
     else if (type == "message")
     {
         auto message = event["message"].toObject();
+        if (historyBrowser)
+            historyBrowser->updateMessage(message);
+        if (message["status"] == "recalled" && message["id"] == pendingRecordId)
+        {
+            pendingRecordId.clear();
+            pendingRecordMedia = {};
+        }
         const bool firstSeen = rememberMessage(message);
         const bool historical = event["historical"].toBool();
         const bool visibleHistory = std::any_of(model->rows.cbegin(), model->rows.cend(),
@@ -1909,7 +2027,10 @@ void Window::locateQuote(const QJsonObject &quote)
                                        [this, id, group, conversation]
                                        {
                                            if (group == groupId && conversation == conversationGeneration)
+                                           {
                                                messages->locateMessage(id);
+                                               playLocatedRecord(id);
+                                           }
                                        });
                     notify("已定位原文；向下滚动到底或按 End 返回最新消息");
                 },

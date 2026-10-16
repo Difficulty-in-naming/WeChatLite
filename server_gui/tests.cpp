@@ -305,27 +305,62 @@ class ServerGuiTests : public QObject
             {"token", fixture.secret}, {"tls_cert", certificate.fileName()}, {"p2p", p2p}}).toJson());
         config.close();
         ClientPermissions editor(config.fileName());
+        QJsonObject connection;
+        QString stage;
+        bool timedOut = false;
+        QTimer capture, deadline;
+        capture.setInterval(20);
+        deadline.setSingleShot(true);
+        deadline.setInterval(10000);
+        auto diagnostic = [&]
+        {
+            return QString("Credential fixture stage=%1; created=%2; status=%3")
+                .arg(stage).arg(fixture.created)
+                .arg(editor.findChild<QLabel *>("clientAccessStatus")->text());
+        };
+        auto enterStage = [&](const char *next)
+        {
+            stage = QString::fromLatin1(next);
+            qInfo("Credential fixture stage: %s", next);
+            deadline.start();
+        };
+        connect(&deadline, &QTimer::timeout, &editor, [&]
+        {
+            timedOut = true;
+            capture.stop();
+            qWarning().noquote() << diagnostic();
+            // QDialog::exec can block the mouseClick call before its following QTRY starts.
+            if (auto *dialog = editor.findChild<QDialog *>("clientCredentialDialog"))
+                dialog->reject();
+        });
+        enterStage("refresh TLS administrator catalogue");
         editor.show();
         editor.refresh();
         auto *create = editor.findChild<QPushButton *>("clientAccessNew");
-        QTRY_VERIFY_WITH_TIMEOUT(create->isEnabled(), 5000);
+        QTRY_VERIFY2_WITH_TIMEOUT(create->isEnabled(), qPrintable(diagnostic()), 5000);
         editor.findChild<QLineEdit *>("clientAccessName")->setText("自动连接客户端");
-        QJsonObject connection;
-        QTimer capture;
-        capture.setInterval(20);
         connect(&capture, &QTimer::timeout, &editor, [&]
         {
             auto *dialog = editor.findChild<QDialog *>("clientCredentialDialog");
-            if (!dialog)
+            auto *copy = dialog ? dialog->findChild<QPushButton *>("clientCredentialCopy") : nullptr;
+            if (!dialog || !dialog->isVisible() || !copy || !copy->isVisible() || !copy->isEnabled())
                 return;
-            QTest::mouseClick(dialog->findChild<QPushButton *>("clientCredentialCopy"), Qt::LeftButton);
+            // Stop before any platform clipboard work can process nested events. The production
+            // clicked handler and real clipboard remain under test, without offscreen mouse hit testing.
+            capture.stop();
+            enterStage("copy visible credential dialog to clipboard");
+            copy->click();
+            enterStage("read credential clipboard JSON");
             connection = QJsonDocument::fromJson(QApplication::clipboard()->text().toUtf8()).object();
             dialog->accept();
-            capture.stop();
         });
+        enterStage("clear credential clipboard");
+        QApplication::clipboard()->clear();
+        enterStage("create independent client credential");
         capture.start();
         QTest::mouseClick(editor.findChild<QPushButton *>("clientAccessApply"), Qt::LeftButton);
-        QTRY_VERIFY_WITH_TIMEOUT(!connection.isEmpty(), 5000);
+        QTRY_VERIFY2_WITH_TIMEOUT(!connection.isEmpty() || timedOut, qPrintable(diagnostic()), 5000);
+        QVERIFY2(!timedOut, qPrintable(diagnostic()));
         QCOMPARE(fixture.created, 1);
         QCOMPARE(connection.value("mode").toString(), QString("p2p"));
         QCOMPARE(connection.value("serverUrl").toString(), "p2p://" + QString(64, 'b'));
@@ -334,13 +369,18 @@ class ServerGuiTests : public QObject
         QJsonObject parsed;
         QString error;
         QVERIFY2(ConnectionInfo::parse(QJsonDocument(connection).toJson(), parsed, error), qPrintable(error));
-        QTRY_VERIFY_WITH_TIMEOUT(create->isEnabled(), 5000);
+        enterStage("refresh administrator catalogue after creation");
+        QTRY_VERIFY2_WITH_TIMEOUT(create->isEnabled(), qPrintable(diagnostic()), 5000);
         QTest::mouseClick(create, Qt::LeftButton);
         fixture.available = false;
         editor.findChild<QLineEdit *>("clientAccessName")->setText("未就绪不创建");
+        enterStage("reject unavailable automatic connection without creating a key");
         QTest::mouseClick(editor.findChild<QPushButton *>("clientAccessApply"), Qt::LeftButton);
-        QTRY_VERIFY_WITH_TIMEOUT(editor.findChild<QLabel *>("clientAccessStatus")->text().contains("未创建"), 5000);
+        QTRY_VERIFY2_WITH_TIMEOUT(editor.findChild<QLabel *>("clientAccessStatus")->text().contains("未创建"),
+            qPrintable(diagnostic()), 5000);
+        QVERIFY2(!timedOut, qPrintable(diagnostic()));
         QCOMPARE(fixture.created, 1);
+        deadline.stop();
     }
 };
 

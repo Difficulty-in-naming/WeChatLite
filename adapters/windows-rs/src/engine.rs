@@ -105,6 +105,11 @@ pub struct Step {
 pub trait Backend {
     fn catalog(&mut self) -> Result<Vec<Value>>;
     fn members(&mut self, group: &str) -> Result<Vec<Value>>;
+    fn announcement(&mut self, _group: &str) -> Result<Value> {
+        Ok(
+            json!({"available":false,"set":false,"author_id":"","author":"","avatar":"","updated_at":null,"text":"","error":"unavailable"}),
+        )
+    }
     fn recent(&mut self, group: &str, limit: usize) -> Result<Vec<Value>>;
     fn page(&mut self, group: &str, position: &Value, limit: usize) -> Result<Vec<Value>>;
     fn older(
@@ -957,6 +962,25 @@ impl<A: Backend> Engine<A> {
                         self.jobs.first(),
                     )
                 })(),
+                "announcement" => (|| {
+                    let group = text(command, "group");
+                    let request = text(command, "request_id");
+                    ensure!(
+                        !request.is_empty()
+                            && request.len() <= 128
+                            && !request.chars().any(char::is_control),
+                        "群公告请求编号无效"
+                    );
+                    ensure!(self.watched.contains(group), "该群未获准读取公告");
+                    // This read never calls authorize: reading an announcement cannot enable native sending.
+                    let mut announcement = self.access.announcement(group)?;
+                    ensure!(announcement.is_object(), "群公告读取结果无效");
+                    announcement["type"] = json!("announcement");
+                    announcement["group"] = json!(group);
+                    announcement["request_id"] = json!(request);
+                    events.push(announcement);
+                    Ok(())
+                })(),
                 "receipt" => {
                     self.warned.remove(text(command, "source_id"));
                     self.store
@@ -1008,6 +1032,15 @@ impl<A: Backend> Engine<A> {
                     events.push(json!({"type":"ack","id":id,"status":if self.store.submitted(id)? {"uncertain"} else {"failed"},"error":error.to_string()}));
                 } else if operation == "history" {
                     events.push(json!({"type":"history_done","group":command["group"],"request_id":command["request_id"],"error":error.to_string()}));
+                } else if operation == "announcement" {
+                    let request = text(command, "request_id");
+                    let request = if request.len() <= 128 && !request.chars().any(char::is_control)
+                    {
+                        request
+                    } else {
+                        ""
+                    };
+                    events.push(json!({"type":"announcement","group":command["group"],"request_id":request,"available":false,"set":false,"author_id":"","author":"","avatar":"","updated_at":null,"text":"","error":"unavailable"}));
                 } else if operation == "recall" || operation == "recall_check" {
                     events.push(json!({"type":"recall_ack","id":command["message"]["id"],"status":"failed","error":error.to_string()}));
                 } else {

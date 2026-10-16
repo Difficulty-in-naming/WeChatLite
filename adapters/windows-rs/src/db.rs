@@ -1,3 +1,5 @@
+#[path = "db/announcement.rs"]
+mod announcement;
 #[path = "db/crypto.rs"]
 mod crypto;
 #[cfg(windows)]
@@ -295,6 +297,11 @@ impl Db {
         let connection = self.open(&rel)?;
         let mut statement=connection.prepare("SELECT c.username,c.nick_name,c.remark,c.username=r.owner FROM chat_room r JOIN chatroom_member m ON m.room_id=r.id JOIN contact c ON c.id=m.member_id WHERE r.username=?1 ORDER BY c.username")?;
         statement.query_map([group],|r|Ok(json!({"username":string(r,0)?,"nick_name":string(r,1)?,"remark":string(r,2)?,"is_owner":r.get::<_,bool>(3)?})))?.collect::<rusqlite::Result<_>>().map_err(Into::into)
+    }
+
+    pub fn announcement(&mut self, group: &str) -> Result<Value> {
+        let rel = self.contact_rel()?;
+        announcement::read(self.open(&rel)?, group)
     }
 
     pub fn display_name(&mut self, group: &str, id: &str) -> Result<String> {

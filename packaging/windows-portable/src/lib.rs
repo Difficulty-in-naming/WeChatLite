@@ -120,7 +120,10 @@ pub fn allowed_file(role: &str, path: &str) -> bool {
             name.ends_with(".dll")
         }
         ["licenses", name] => {
-            name.ends_with(".txt") || name.ends_with(".md") || name.ends_with(".h")
+            name.ends_with(".txt")
+                || name.ends_with(".md")
+                || name.ends_with(".h")
+                || *name == "FFmpeg-COPYING.GPLv3"
         }
         ["thirdparty-sources", name] if role == "server" => {
             name.ends_with(".tar.xz")

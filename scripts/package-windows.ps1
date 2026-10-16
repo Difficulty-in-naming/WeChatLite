@@ -73,7 +73,7 @@ $licenses = Join-Path $server 'licenses'
 New-Item -ItemType Directory -Force -Path $licenses | Out-Null
 Copy-Item -LiteralPath 'adapters\native\THIRD_PARTY_NOTICES.md' -Destination (Join-Path $licenses 'native-actions.md')
 Copy-Item -LiteralPath 'adapters\native\third_party\minhook\LICENSE.txt' -Destination (Join-Path $licenses 'MinHook.txt')
-Copy-Item -LiteralPath 'adapters\windows\vendor\WechatAuto-LICENSE.txt' -Destination (Join-Path $licenses 'WechatAuto-Apache-2.0.txt')
+Copy-Item -LiteralPath 'adapters\windows-rs\vendor\WechatAuto-LICENSE.txt' -Destination (Join-Path $licenses 'WechatAuto-Apache-2.0.txt')
 Copy-Item -LiteralPath 'adapters\windows-rs\vendor\pilk-0.2.4\LICENSE' -Destination (Join-Path $licenses 'GPL-3.0.txt')
 Copy-Item -LiteralPath 'adapters\windows-rs\vendor\pilk-0.2.4\src\interface\SKP_Silk_SDK_API.h' -Destination (Join-Path $licenses 'SILK-SDK-source-notice.h')
 $ffmpegVersion = & $FFmpeg -version 2>&1

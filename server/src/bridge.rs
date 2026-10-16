@@ -406,6 +406,7 @@ async fn run_stream<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                             if !selected.contains(&group) {value["error"]=json!("该群已取消转发，历史读取已停止");}
                             app.history.finish(app,value).await?;
                         },
+                        "announcement"=>{app.announcements.finish(value).await;},
                         "message"=>{
                             let historical=value["historical"]==true;
                             let mut body=value["message"].clone();
@@ -476,6 +477,18 @@ async fn run_stream<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                             let mut command=command;if let Some(object)=command.as_object_mut(){object.remove("_access_client");}
                             write_command(app,input,command).await?;
                         }
+                    } else if command["op"]=="announcement" {
+                        let selected=app.forwarding.read().await;
+                        let clients=app.clients.read().await;
+                        let group=command["group"].as_str().unwrap_or("");
+                        if !ready || !selected.contains(group) || !crate::access::can_read(&clients,command["_access_client"].as_str().unwrap_or(""),group) {
+                            let mut rejected=crate::announcement::unavailable(group,false);
+                            rejected["request_id"]=command["request_id"].clone();
+                            app.announcements.finish(rejected).await;
+                        } else {
+                            let mut command=command;if let Some(object)=command.as_object_mut(){object.remove("_access_client");}
+                            write_command(app,input,command).await?;
+                        }
                     } else if command["op"]=="recall" {
                         let id=command["message"]["id"].as_str().unwrap_or("").to_owned();
                         if recalling.contains(&id){continue;}
@@ -502,6 +515,7 @@ async fn run_stream<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     app.history
         .fail_all("本机微信连接中断，历史读取未完成，请重试")
         .await;
+    app.announcements.fail_all().await;
     if let Some(mut message) = inflight {
         message.status = "uncertain".into();
         message.error = "微信确认前连接中断，请核对微信群，未自动重发".into();
@@ -708,6 +722,55 @@ mod tests {
             now,
         );
         assert_eq!(legacy.timestamp, queued);
+    }
+
+    #[tokio::test]
+    async fn announcement_roundtrip_strips_internal_access_and_checks_permission_before_native_read()
+     {
+        let temp = tempfile::tempdir().unwrap();
+        let (app, receiver) = crate::test_app(temp.path());
+        let (task, mut output, mut input) = fixture(app.clone(), receiver).await;
+        emit(&mut output, json!({"type":"status","ready":true})).await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while app.status.read().await["ready"] != true {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let (id, mut reply) = app.announcements.request(&app, "g", "").await.unwrap();
+        let command = next(&mut input).await;
+        assert_eq!(command["op"], "announcement");
+        assert_eq!(command["request_id"], id);
+        assert!(command.get("_access_client").is_none());
+        emit(&mut output,json!({"type":"announcement","group":"g","request_id":id,"available":true,"set":true,"text":"离线公告","author_id":"actor","author":"成员","avatar":"","updated_at":1700000000123i64})).await;
+        tokio::time::timeout(Duration::from_secs(1), reply.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reply.borrow().as_ref().unwrap()["text"], "离线公告");
+        assert!(
+            app.store.events(0).unwrap().is_empty(),
+            "announcements must not enter durable chat replay"
+        );
+        let (_, mut rejected) = app
+            .announcements
+            .request(&app, "g", "missing-client")
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), rejected.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(rejected.borrow().as_ref().unwrap()["available"], false);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), input.next())
+                .await
+                .is_err(),
+            "rejected read reached native adapter"
+        );
+        app.shutdown.send_replace(true);
+        task.await.unwrap().unwrap();
     }
 
     #[tokio::test]

@@ -11,6 +11,8 @@ jobs="${BUILD_JOBS:-3}"
 export CARGO_BUILD_JOBS="$jobs"
 cargo test --locked -p wechat-relay -p wechat-p2p
 cargo build --release --locked -p wechat-relay -p wechat-p2p
+WECHAT_RELAY_BINARY="$PWD/target/release/wechat-relay" \
+  cargo test --locked -p wechat-p2p --test p2p_e2e -- --ignored --test-threads=1
 cmake -S . -B build-macos -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_PREFIX_PATH="$QT_PREFIX" -DCMAKE_OSX_ARCHITECTURES=arm64 \
   -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0
@@ -50,23 +52,8 @@ for role in client server; do
   codesign --force --sign - "$app/Contents/MacOS/$helper"
   codesign --force --sign - "$app"
   codesign --verify --deep --strict --verbose=2 "$app"
-  python3 - "$app" "$binary" "$helper" <<'PY'
-import pathlib, subprocess, sys
-app = pathlib.Path(sys.argv[1])
-for file in app.rglob('*'):
-    if file.is_symlink():
-        assert file.resolve().is_relative_to(app.resolve()), f'External bundle link: {file}'
-    if not file.is_file():
-        continue
-    assert not file.name.endswith(('.exe', '.dll', '.pdb', '.log', '.pyc')), file
-    assert '-tests' not in file.name and file.name != 'QtTest', file
-    if subprocess.check_output(['file', '-b', str(file)], text=True).startswith('Mach-O'):
-        dependencies = subprocess.check_output(['otool', '-L', str(file)], text=True)
-        assert '/opt/homebrew/' not in dependencies and '/Users/' not in dependencies, file
-for name in sys.argv[2:]:
-    file = app / 'Contents/MacOS' / name
-    assert file.is_file() and 'arm64' in subprocess.check_output(['lipo', '-archs', str(file)], text=True)
-PY
+  cmake "-DAPP=$app" "-DAPP_BINARY=$binary" "-DHELPER_BINARY=$helper" \
+    -P scripts/verify-macos-bundle.cmake
   archive="$stage/WeChatLite-$asset-macOS-arm64.dmg"
   hdiutil create -volname "$name" -srcfolder "$stage/$role" -format UDZO "$archive"
   hdiutil verify "$archive"

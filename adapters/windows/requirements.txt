@@ -1,4 +1,0 @@
-wechatauto-replica==1.2.6
-pilk==0.2.4
-psutil>=5.9
-

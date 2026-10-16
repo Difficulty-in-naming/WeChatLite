@@ -4,6 +4,65 @@ use rusqlite::{Connection, params};
 use tempfile::TempDir;
 
 #[test]
+fn announcement_author_and_local_avatar_are_resolved_without_enabling_native_sending() {
+    let temp = TempDir::new().unwrap();
+    let contact = Connection::open_in_memory().unwrap();
+    contact.execute_batch("CREATE TABLE contact(username TEXT,remark TEXT,nick_name TEXT);CREATE TABLE chat_room(username TEXT,ext_buffer BLOB);CREATE TABLE chat_room_info_detail(username_ TEXT,announcement_,announcement_editor_,announcement_publish_time_);INSERT INTO contact VALUES('fixture-editor','Fixture remark','Fixture nick');INSERT INTO chat_room_info_detail VALUES('123456@chatroom','Fixture announcement','fixture-editor',1760000000);").unwrap();
+    let heads = Connection::open_in_memory().unwrap();
+    heads
+        .execute_batch("CREATE TABLE head_image(username TEXT,image_buffer BLOB)")
+        .unwrap();
+    let mut image = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::new_rgb8(2, 2)
+        .write_to(&mut image, image::ImageFormat::Png)
+        .unwrap();
+    heads
+        .execute(
+            "INSERT INTO head_image VALUES('fixture-editor',?1)",
+            [image.into_inner()],
+        )
+        .unwrap();
+    let mut access = Local {
+        db: Db::media_fixture(
+            temp.path().join("fixture-account"),
+            "fixture-self",
+            None,
+            HashMap::from([
+                ("contact/contact.db".into(), contact),
+                ("head_image/head_image.db".into(), heads),
+            ]),
+        ),
+        native: NativeClient::new(temp.path().join("native")),
+        media: Media::new(temp.path().to_owned()),
+        allowed: BTreeSet::new(),
+        directory: temp.path().to_owned(),
+        avatars: HashMap::new(),
+        avatar_order: VecDeque::new(),
+        actions: None,
+        actions_error: String::new(),
+        quotes: None,
+        quotes_error: String::new(),
+    };
+    let announcement = access.announcement("123456@chatroom").unwrap();
+    assert_eq!(announcement["available"], true);
+    assert_eq!(announcement["author"], "Fixture remark");
+    assert_eq!(announcement["author_id"], "fixture-editor");
+    use base64::Engine as _;
+    let avatar = base64::engine::general_purpose::STANDARD
+        .decode(text(&announcement, "avatar"))
+        .unwrap();
+    assert!(avatar.starts_with(&[0xff, 0xd8, 0xff]));
+    let picture = image::load_from_memory(&avatar).unwrap();
+    assert_eq!((picture.width(), picture.height()), (64, 64));
+    assert_eq!(access.avatars.len(), 1);
+    assert!(access.allowed.is_empty());
+    assert!(access.native.pid.is_none());
+    assert!(access.actions.is_none());
+    assert!(access.quotes.is_none());
+    assert!(!temp.path().join("native").exists());
+}
+
+#[test]
 fn timestamps() {
     assert_eq!(timestamp(&json!(1_760_000_000)).unwrap(), 1_760_000_000_000);
     assert_eq!(

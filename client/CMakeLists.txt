@@ -3,6 +3,7 @@ qt_add_executable(wechat-lite
     transport.cpp transport.h messages.cpp messages.h
     attachment.cpp attachment.h voice_player.cpp voice_player.h
     connection_info.cpp connection_info.h tunnel_session.cpp tunnel_session.h
+    history_browser.cpp history_browser.h announcement_dialog.cpp announcement_dialog.h
     chat_preferences.cpp chat_preferences.h system_notifier.cpp system_notifier.h)
 target_link_libraries(wechat-lite PRIVATE Qt6::Widgets Qt6::Network Qt6::WebSockets)
 set_target_properties(wechat-lite PROPERTIES WIN32_EXECUTABLE TRUE MACOSX_BUNDLE TRUE
@@ -35,6 +36,7 @@ add_test(NAME client-tests COMMAND client-tests -platform offscreen -o client-te
 qt_add_executable(desktop-tests desktop_tests.cpp window.cpp window.h composer.cpp composer.h
     transport.cpp transport.h messages.cpp messages.h attachment.cpp attachment.h voice_player.cpp voice_player.h
     connection_info.cpp connection_info.h tunnel_session.cpp tunnel_session.h
+    history_browser.cpp history_browser.h announcement_dialog.cpp announcement_dialog.h
     chat_preferences.cpp chat_preferences.h)
 target_link_libraries(desktop-tests PRIVATE Qt6::Widgets Qt6::Test Qt6::Network Qt6::WebSockets)
 if(WIN32)
@@ -91,5 +93,10 @@ if(MSVC)
     target_compile_options(notifier-tests PRIVATE /utf-8 /W4)
 endif()
 add_test(NAME notifier-tests COMMAND notifier-tests -o notifier-tests.txt,txt)
+if(APPLE)
+    # Local TLS fixtures must not import their keys into a user's login keychain.
+    set_tests_properties(client-tests desktop-tests transport-tests voice-tests
+        connection-tests notifier-tests PROPERTIES ENVIRONMENT "QT_SSL_USE_TEMPORARY_KEYCHAIN=1")
+endif()
 install(TARGETS wechat-lite BUNDLE DESTINATION . RUNTIME DESTINATION .)
 

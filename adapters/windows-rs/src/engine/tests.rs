@@ -1,6 +1,97 @@
 use super::*;
 use tempfile::TempDir;
 
+#[test]
+fn announcement_reads_selected_group_without_authorizing_native_or_changing_message_cursors() {
+    let (_temp, mut engine) = setup(json!(["g"]));
+    engine.last_poll = 1000.0;
+    let cursor = engine.store.state("cursor:g").unwrap();
+    let floor = engine.store.state("watch_floor:g").unwrap();
+    let reads = engine.access.reads;
+    let events = engine.cycle(
+        &[json!({"op":"announcement","group":"g","request_id":"fixture-request"})],
+        1000.1,
+    );
+    let announcement = events
+        .iter()
+        .find(|event| event["type"] == "announcement")
+        .unwrap();
+    assert_eq!(announcement["request_id"], "fixture-request");
+    assert_eq!(announcement["group"], "g");
+    assert_eq!(announcement["available"], true);
+    assert_eq!(announcement["set"], true);
+    assert_eq!(announcement["text"], "Fixture announcement");
+    assert_eq!(announcement["updated_at"], 1_760_000_000_000_i64);
+    assert_eq!(engine.access.calls, vec!["announcement:g"]);
+    assert!(engine.access.allowed.is_empty());
+    assert!(engine.active.is_empty());
+    assert_eq!(engine.access.reads, reads);
+    assert_eq!(engine.store.state("cursor:g").unwrap(), cursor);
+    assert_eq!(engine.store.state("watch_floor:g").unwrap(), floor);
+    let idle = engine.cycle(&[], 1000.2);
+    assert!(!idle.iter().any(|event| event["type"] == "announcement"));
+    assert_eq!(engine.access.calls, vec!["announcement:g"]);
+}
+
+#[test]
+fn announcement_unknown_unselected_revoked_and_invalid_requests_never_read() {
+    let (_temp, mut engine) = setup(json!(["g"]));
+    let request = |group: &str, request: &str| json!({"op":"announcement","group":group,"request_id":request});
+    for command in [
+        request("h", "other"),
+        request("unknown", "unknown"),
+        request("g", ""),
+        request("g", &"x".repeat(129)),
+        request("g", "bad\nrequest"),
+    ] {
+        let events = engine.cycle(&[command], 1000.1);
+        let reply = events
+            .iter()
+            .find(|event| event["type"] == "announcement")
+            .unwrap();
+        assert_eq!(reply["available"], false);
+        assert_eq!(reply["text"], "");
+        assert_eq!(reply["error"], "unavailable");
+    }
+    let events = engine.cycle(
+        &[
+            json!({"op":"configure","groups":[]}),
+            request("g", "revoked"),
+        ],
+        1000.2,
+    );
+    assert!(events.iter().any(|event| event["type"] == "announcement"
+        && event["available"] == false
+        && event["request_id"] == "revoked"));
+    assert!(engine.access.calls.is_empty());
+    assert!(engine.access.allowed.is_empty());
+}
+
+#[test]
+fn announcement_read_failure_is_correlated_unavailable_without_private_diagnostics_or_retry() {
+    let (_temp, mut engine) = setup(json!(["g"]));
+    engine.access.mode = "announcement_error";
+    let events = engine.cycle(
+        &[json!({"op":"announcement","group":"g","request_id":"failure"})],
+        1000.1,
+    );
+    let reply = events
+        .iter()
+        .find(|event| event["type"] == "announcement")
+        .unwrap();
+    assert_eq!(reply["request_id"], "failure");
+    assert_eq!(reply["available"], false);
+    assert_eq!(reply["error"], "unavailable");
+    assert!(
+        !serde_json::to_string(&events)
+            .unwrap()
+            .contains("private details")
+    );
+    engine.cycle(&[], 1001.8);
+    assert_eq!(engine.access.calls, vec!["announcement:g"]);
+    assert!(engine.access.allowed.is_empty());
+}
+
 #[derive(Clone)]
 struct Fake {
     rows: HashMap<String, Vec<Value>>,
@@ -52,6 +143,16 @@ impl Backend for Fake {
             json!({"id":"member-a","name":"Nick"}),
             json!({"id":"member-b","name":"Nick"}),
         ])
+    }
+    fn announcement(&mut self, group: &str) -> Result<Value> {
+        self.calls.push(format!("announcement:{group}"));
+        ensure!(
+            self.mode != "announcement_error",
+            "fixture read failure with private details"
+        );
+        Ok(
+            json!({"available":true,"set":true,"author_id":"fixture-member","author":"Fixture author","avatar":"","updated_at":1_760_000_000_000_i64,"text":"Fixture announcement"}),
+        )
     }
     fn recent(&mut self, g: &str, limit: usize) -> Result<Vec<Value>> {
         self.reads += 1;

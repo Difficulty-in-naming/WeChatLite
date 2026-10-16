@@ -1,7 +1,9 @@
 mod access;
+mod announcement;
 mod bridge;
 mod history;
 mod model;
+mod records;
 mod store;
 mod web;
 
@@ -66,6 +68,7 @@ struct App {
     clients_changed: watch::Sender<()>,
     online_clients: std::sync::Mutex<std::collections::BTreeMap<String, usize>>,
     history: history::Requests,
+    announcements: announcement::Requests,
     p2p_status: RwLock<Value>,
 }
 
@@ -222,6 +225,7 @@ fn test_app(directory: &Path) -> (Arc<App>, mpsc::Receiver<Value>) {
             clients_changed,
             online_clients: Default::default(),
             history: Default::default(),
+            announcements: Default::default(),
             p2p_status: RwLock::new(json!({"enabled":false,"server_id":"","status":"disabled"})),
         }),
         receiver,
@@ -403,6 +407,7 @@ async fn main() -> Result<()> {
         clients_changed,
         online_clients: Default::default(),
         history: Default::default(),
+        announcements: Default::default(),
         p2p_status: RwLock::new(p2p_status),
     });
     let bridge = bridge::start(app.clone(), receiver).await?;

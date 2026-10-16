@@ -1,6 +1,8 @@
 #include "composer.h"
+#include "announcement_dialog.h"
 #include "chat_preferences.h"
 #include "connection_info.h"
+#include "history_browser.h"
 #include "messages.h"
 #include "test_tls_identity.h"
 #include "tunnel_session.h"
@@ -9,9 +11,11 @@
 #include <QApplication>
 #include <QClipboard>
 #include <QComboBox>
+#include <QCheckBox>
 #include <QDataStream>
 #include <QDesktopServices>
 #include <QDateTime>
+#include <QDateEdit>
 #include <QDialog>
 #include <QDir>
 #include <QFile>
@@ -31,6 +35,10 @@
 #include <QTcpSocket>
 #include <QTemporaryDir>
 #include <QToolButton>
+#include <QTextBrowser>
+#include <QTextBlock>
+#include <QTextFragment>
+#include <QTextDocument>
 #include <QUrlQuery>
 #include <QUuid>
 #include <QVBoxLayout>
@@ -45,6 +53,73 @@ class FileOpenHandler : public QObject
     QList<QUrl> urls;
   public slots:
     void open(const QUrl &url) { urls.append(url); }
+};
+
+// A local read-only API fixture. All payloads and credentials below are synthetic.
+class RecordsApiFixture : public QObject
+{
+  public:
+    QTcpServer server;
+    QList<QUrl> requests;
+    QStringList methods;
+    bool clientCredentialOnly = true;
+    std::function<void(QTcpSocket *, const QUrl &)> handler;
+    explicit RecordsApiFixture(QObject *parent = nullptr) : QObject(parent), server(this)
+    {
+        connect(&server, &QTcpServer::newConnection, this, [this]
+        {
+            while (server.hasPendingConnections())
+            {
+                auto *socket = server.nextPendingConnection();
+                auto bytes = std::make_shared<QByteArray>();
+                connect(socket, &QTcpSocket::disconnected, socket, &QObject::deleteLater);
+                connect(socket, &QTcpSocket::readyRead, this, [this, socket, bytes]
+                {
+                    bytes->append(socket->readAll());
+                    if (socket->property("handled").toBool() || !bytes->contains("\r\n\r\n"))
+                        return;
+                    socket->setProperty("handled", true);
+                    const auto first = bytes->left(bytes->indexOf('\n')).split(' ');
+                    const QUrl url("http://localhost" + QString::fromLatin1(first.value(1)));
+                    methods.append(QString::fromLatin1(first.value(0)));
+                    requests.append(url);
+                    QByteArray credential;
+                    int authorizationHeaders = 0;
+                    for (const auto &header : bytes->left(bytes->indexOf("\r\n\r\n")).split('\n'))
+                    {
+                        const auto colon = header.indexOf(':');
+                        if (colon > 0 && header.left(colon).trimmed().compare("authorization", Qt::CaseInsensitive) == 0)
+                        {
+                            credential = header.mid(colon + 1).trimmed();
+                            ++authorizationHeaders;
+                        }
+                    }
+                    clientCredentialOnly &= authorizationHeaders == 1 && credential == "Bearer offline-records-client" &&
+                                            !url.path().startsWith("/api/local/");
+                    if (handler)
+                        handler(socket, url);
+                    else
+                        respond(socket, QJsonObject{});
+                });
+            }
+        });
+    }
+    QString url() const { return "http://127.0.0.1:" + QString::number(server.serverPort()); }
+    int count(const QString &path) const
+    {
+        return int(std::count_if(requests.cbegin(), requests.cend(), [&path](const QUrl &url)
+            { return url.path() == path; }));
+    }
+    static void respond(QTcpSocket *socket, const QJsonValue &value)
+    {
+        if (!socket)
+            return;
+        const auto body = value.isArray() ? QJsonDocument(value.toArray()).toJson(QJsonDocument::Compact) :
+                                           QJsonDocument(value.toObject()).toJson(QJsonDocument::Compact);
+        socket->write("HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: " +
+                      QByteArray::number(body.size()) + "\r\n\r\n" + body);
+        socket->disconnectFromHost();
+    }
 };
 
 class DesktopTests : public QObject
@@ -113,13 +188,17 @@ class DesktopTests : public QObject
         QVERIFY2(failure.isEmpty(), qPrintable(failure));
         QTRY_VERIFY_WITH_TIMEOUT(model->rowCount() >= 4, 8000);
     }
-    void chatHasOnlySendAndWindowControls()
+    void chatHasOnlySendHeaderEntriesAndWindowControls()
     {
         const auto buttons = window->findChildren<QPushButton *>();
-        QCOMPARE(buttons.size(), 5);
+        QCOMPARE(buttons.size(), 7);
         for (auto *button : buttons)
+        {
             QVERIFY(button->objectName() == "sendButton" || button->objectName() == "windowButton" ||
-                    button->objectName() == "closeWindow");
+                    button->objectName() == "closeWindow" || button->objectName() == "historyButton" ||
+                    button->objectName() == "announcementButton");
+            QVERIFY(button->toolTip().isEmpty());
+        }
         auto *tray = window->findChild<QSystemTrayIcon *>();
         QVERIFY(tray && tray->contextMenu());
         QStringList entries;
@@ -163,6 +242,356 @@ class DesktopTests : public QObject
         QVERIFY(configureServerFixture(demoGroups));
         QTRY_COMPARE_WITH_TIMEOUT(mainList->count(), 3, 8000);
         QTRY_VERIFY_WITH_TIMEOUT(window->findChild<MessageModel *>()->rowCount() >= 4, 8000);
+    }
+    void recordBrowserPagesFiltersAndLateResponsesStayBounded()
+    {
+        RecordsApiFixture api;
+        QVERIFY(api.server.listen(QHostAddress::LocalHost, 0));
+        QPointer<QTcpSocket> held;
+        QList<QUrlQuery> queries;
+        api.handler = [&](QTcpSocket *socket, const QUrl &url)
+        {
+            if (url.path().endsWith("/members"))
+            {
+                RecordsApiFixture::respond(socket, QJsonArray{QJsonObject{{"id", "member-1"}, {"name", "合成成员"}}});
+                return;
+            }
+            QCOMPARE(url.path(), QString("/api/records"));
+            const QUrlQuery query(url);
+            queries.append(query);
+            if (query.queryItemValue("q") == "held")
+            {
+                held = socket;
+                return;
+            }
+            if (query.queryItemValue("q") == "pending")
+            {
+                RecordsApiFixture::respond(socket, QJsonObject{{"messages", QJsonArray{}},
+                    {"next_before", QJsonValue(QJsonValue::Null)}, {"has_more", true}, {"pending", true}});
+                return;
+            }
+            QJsonArray entries;
+            QString next;
+            bool hasMore = true;
+            if (query.queryItemValue("type") == "file")
+            {
+                if (!query.hasQueryItem("before"))
+                    next = "file-scan-1"; // Empty filtered pages still make progress.
+                else
+                {
+                    entries.append(QJsonObject{{"id", "matched-file"}, {"group", "records-group"},
+                        {"sender", "合成成员"}, {"text", ""}, {"timestamp", 2000},
+                        {"media", QJsonArray{QJsonObject{{"id", "synthetic-file"}, {"kind", "file"},
+                            {"name", "fixture.txt"}, {"size", 120}}}}});
+                    hasMore = false;
+                }
+            }
+            else
+            {
+                const int page = query.queryItemValue("before").toInt();
+                for (int i = 0; i < 50; ++i)
+                {
+                    const auto id = "record-" + QString::number(page * 50 + i);
+                    entries.append(QJsonObject{{"id", id}, {"group", "records-group"}, {"sender", "合成成员"},
+                        {"sender_id", "member-1"}, {"text", query.queryItemValue("q").isEmpty() ? id : "new filter result"},
+                        {"timestamp", 1000000 - page * 50000 - i * 1000}, {"status", "received"}});
+                }
+                next = QString::number(page + 1);
+            }
+            RecordsApiFixture::respond(socket, QJsonObject{{"messages", entries}, {"next_before", next},
+                {"has_more", hasMore}, {"pending", false}});
+        };
+        Transport transport;
+        transport.configure(api.url(), "offline-records-client");
+        auto *browser = new HistoryBrowser(&transport, "records-group", "合成记录群", files.path(), false);
+        const auto closeBrowser = qScopeGuard([&] { if (browser) delete browser; });
+        browser->show();
+        auto *list = browser->findChild<QListView *>("historyRecords");
+        auto *more = browser->findChild<QPushButton *>("historyMore");
+        auto *search = browser->findChild<QLineEdit *>("historySearch");
+        auto *member = browser->findChild<QComboBox *>("historyMember");
+        QVERIFY(list && more && search && member);
+        QTRY_COMPARE(list->model()->rowCount(), 50);
+        QTRY_COMPARE(member->count(), 2);
+        QTest::qWait(360);
+        QCOMPARE(api.count("/api/records"), 1); // No eager history scan while idle.
+        for (int page = 1; page <= 5; ++page)
+        {
+            QTest::mouseClick(more, Qt::LeftButton);
+            QTRY_COMPARE(api.count("/api/records"), page + 1);
+            QTRY_VERIFY(more->isEnabled());
+        }
+        QCOMPARE(list->model()->rowCount(), 200);
+        QCOMPARE(list->model()->index(0, 0).data(Qt::UserRole).toJsonObject()["id"].toString(), "record-100");
+        QSignalSpy activated(browser, &HistoryBrowser::recordActivated);
+        list->setCurrentIndex(list->model()->index(0, 0));
+        QTest::keyClick(list, Qt::Key_Return);
+        QCOMPARE(activated.size(), 1);
+        QCOMPARE(activated.first()[0].toJsonObject()["id"].toString(), "record-100");
+        for (auto *filter : browser->findChildren<QPushButton *>("historyFilter"))
+            if (filter->property("recordType") == "file")
+                QTest::mouseClick(filter, Qt::LeftButton);
+        QTRY_COMPARE(queries.last().queryItemValue("type"), "file");
+        QTRY_VERIFY(more->isEnabled());
+        QCOMPARE(list->model()->rowCount(), 0);
+        QCOMPARE(more->text(), QString("继续查找"));
+        const auto beforeManual = api.count("/api/records");
+        QTest::qWait(360);
+        QCOMPARE(api.count("/api/records"), beforeManual);
+        QTest::mouseClick(more, Qt::LeftButton);
+        QTRY_COMPARE(list->model()->rowCount(), 1);
+        QVERIFY(!more->isEnabled());
+        QCOMPARE(queries.last().queryItemValue("before"), "file-scan-1");
+        for (auto *filter : browser->findChildren<QPushButton *>("historyFilter"))
+            if (filter->property("recordType") == "all")
+                QTest::mouseClick(filter, Qt::LeftButton);
+        QTRY_COMPARE(list->model()->rowCount(), 50);
+        search->setText("held");
+        QTRY_VERIFY(held);
+        const auto beforeSearch = api.count("/api/records");
+        search->setText("n");
+        search->setText("ne");
+        search->setText("new");
+        QTRY_COMPARE(api.count("/api/records"), beforeSearch + 1);
+        QTRY_COMPARE(list->model()->rowCount(), 50);
+        RecordsApiFixture::respond(held, QJsonObject{{"messages", QJsonArray{QJsonObject{{"id", "stale"},
+            {"group", "records-group"}, {"text", "must not replace newer filters"}}}}, {"has_more", false}});
+        QTest::qWait(40);
+        QCOMPARE(list->model()->index(0, 0).data(Qt::UserRole).toJsonObject()["text"].toString(), "new filter result");
+        QVERIFY(!queries.last().hasQueryItem("before"));
+        auto *enabled = browser->findChild<QCheckBox *>("historyDateEnabled");
+        auto *day = browser->findChild<QDateEdit *>("historyDate");
+        day->setDate(QDate(2026, 4, 5));
+        enabled->setChecked(true);
+        member->setCurrentIndex(1);
+        QTRY_COMPARE(queries.last().queryItemValue("member"), "member-1");
+        QCOMPARE(queries.last().queryItemValue("start").toLongLong(), day->date().startOfDay().toMSecsSinceEpoch());
+        QCOMPARE(queries.last().queryItemValue("end").toLongLong(), day->date().addDays(1).startOfDay().toMSecsSinceEpoch());
+        QVERIFY(!queries.last().hasQueryItem("before"));
+        search->setText("pending");
+        QTRY_COMPARE(more->text(), QString("继续读取"));
+        QVERIFY(more->isEnabled());
+        const auto pendingReads = api.count("/api/records");
+        QTest::qWait(360);
+        QCOMPARE(api.count("/api/records"), pendingReads);
+        QTest::mouseClick(more, Qt::LeftButton);
+        QTRY_COMPARE(api.count("/api/records"), pendingReads + 1);
+        QTRY_VERIFY(more->isEnabled());
+        QVERIFY(!queries.last().hasQueryItem("before"));
+        QVERIFY(api.clientCredentialOnly);
+        for (const auto &method : api.methods)
+            QCOMPARE(method, QString("GET"));
+        QPointer<HistoryBrowser> closed(browser);
+        browser->invalidate();
+        browser = nullptr;
+        QTRY_VERIFY(closed.isNull());
+    }
+    void announcementsRemainLiteralReadOnlyAndSeparateUnavailableFromUnset()
+    {
+        RecordsApiFixture api;
+        QVERIFY(api.server.listen(QHostAddress::LocalHost, 0));
+        int reply = 0;
+        QPointer<QTcpSocket> held;
+        const QString plain = "合成公告\nhttps://example.invalid/reference?a=1&b=2\n"
+                              "<img src=\"https://example.invalid/pixel\">\nfile:///private/not-a-link";
+        api.handler = [&](QTcpSocket *socket, const QUrl &url)
+        {
+            QCOMPARE(url.path(), QString("/api/groups/announcement-group/announcement"));
+            ++reply;
+            if (reply == 4)
+            {
+                held = socket;
+                return;
+            }
+            RecordsApiFixture::respond(socket, QJsonObject{{"group", "announcement-group"},
+                {"available", reply > 1}, {"set", reply > 2}, {"author", "合成发布者"},
+                {"updated_at", 1700000000000LL}, {"text", reply > 2 ? plain : QString()}});
+        };
+        Transport transport;
+        transport.configure(api.url(), "offline-records-client");
+        auto *dialog = new AnnouncementDialog(&transport, "announcement-group", "合成公告群");
+        const auto closeDialog = qScopeGuard([&] { if (dialog) delete dialog; });
+        dialog->show();
+        auto *body = dialog->findChild<QTextBrowser *>("announcementBody");
+        auto *retry = dialog->findChild<QPushButton *>("announcementRetry");
+        auto *state = dialog->findChild<QLabel *>("announcementState");
+        QTRY_COMPARE(dialog->property("announcementState").toString(), "unavailable");
+        QVERIFY(state->text().contains("暂不可读"));
+        QVERIFY(body->toPlainText().isEmpty());
+        QTest::mouseClick(retry, Qt::LeftButton);
+        QTRY_COMPARE(dialog->property("announcementState").toString(), "unset");
+        QVERIFY(state->text().contains("尚未设置"));
+        QTest::mouseClick(retry, Qt::LeftButton);
+        QTRY_COMPARE(dialog->property("announcementState").toString(), "set");
+        QCOMPARE(body->toPlainText(), plain);
+        QVERIFY(body->isReadOnly());
+        QVERIFY(body->textInteractionFlags().testFlag(Qt::TextSelectableByMouse));
+        QCOMPARE(dialog->findChild<QLabel *>("announcementAuthor")->text(), QString("合成发布者"));
+        int images = 0, anchors = 0;
+        for (auto block = body->document()->begin(); block.isValid(); block = block.next())
+            for (auto it = block.begin(); !it.atEnd(); ++it)
+            {
+                const auto format = it.fragment().charFormat();
+                images += format.isImageFormat();
+                if (format.isAnchor())
+                {
+                    ++anchors;
+                    QVERIFY(format.anchorHref().startsWith("https://"));
+                }
+            }
+        QCOMPARE(images, 0);
+        QVERIFY(anchors > 0);
+        FileOpenHandler handler;
+        QDesktopServices::setUrlHandler("https", &handler, "open");
+        QDesktopServices::setUrlHandler("file", &handler, "open");
+        const auto restore = qScopeGuard([]
+        {
+            QDesktopServices::unsetUrlHandler("https");
+            QDesktopServices::unsetUrlHandler("file");
+        });
+        body->anchorClicked(QUrl("file:///private/not-a-link"));
+        QVERIFY(handler.urls.isEmpty());
+        body->anchorClicked(QUrl("https://example.invalid/reference?a=1&b=2"));
+        QCOMPARE(handler.urls.size(), 1);
+        QTest::qWait(60);
+        QCOMPARE(api.requests.size(), 3); // Rendering an announcement does not fetch its URLs/images.
+        const auto capture = qEnvironmentVariable("WECHAT_LITE_CAPTURE_UI");
+        if (!capture.isEmpty() && QGuiApplication::platformName() == "windows")
+            dialog->grab().save(QDir(capture).filePath("announcement.png"));
+        QTest::mouseClick(retry, Qt::LeftButton);
+        QTRY_VERIFY(held);
+        QPointer<AnnouncementDialog> closed(dialog);
+        dialog->invalidate();
+        dialog = nullptr;
+        QTRY_VERIFY(closed.isNull());
+        RecordsApiFixture::respond(held, QJsonObject{{"group", "announcement-group"}, {"available", true},
+            {"set", true}, {"text", "late response must stay closed"}});
+        QTest::qWait(40);
+        QVERIFY(api.clientCredentialOnly);
+    }
+    void headerEntriesLocateOriginalsAndInvalidateScopedWindows()
+    {
+        QSettings settings;
+        const QStringList connectionKeys{"serverUrl", "token", "certificatePin", "p2p", "connectionMode"};
+        QVariantMap previous;
+        for (const auto &key : connectionKeys)
+        {
+            previous[key] = settings.value(key);
+            settings.remove(key);
+        }
+        const auto restoreSettings = qScopeGuard([&]
+        {
+            for (const auto &key : connectionKeys)
+                if (previous[key].isValid()) settings.setValue(key, previous[key]);
+                else settings.remove(key);
+        });
+        RecordsApiFixture api;
+        QVERIFY(api.server.listen(QHostAddress::LocalHost, 0));
+        bool allowed = true;
+        int sourceReads = 0, contextReads = 0;
+        QPointer<QTcpSocket> heldAnnouncement;
+        const QJsonObject original{{"id", "original-record"}, {"group", "A"}, {"seq", 7},
+            {"timestamp", 1000}, {"sender", "合成成员"}, {"text", "source outside initial page"}, {"status", "received"}};
+        api.handler = [&](QTcpSocket *socket, const QUrl &url)
+        {
+            const auto path = url.path();
+            QJsonValue value(QJsonObject{});
+            if (path == "/api/status")
+                value = QJsonObject{{"permissions", QJsonObject{{"can_send", true}, {"can_download", true}}}};
+            else if (path == "/api/groups")
+                value = allowed ? QJsonArray{QJsonObject{{"id", "A"}, {"name", "合成群 A"}, {"timestamp", 2000}},
+                    QJsonObject{{"id", "B"}, {"name", "合成群 B"}, {"timestamp", 1000}}} : QJsonArray{};
+            else if (path.endsWith("/members"))
+                value = QJsonArray{};
+            else if (path == "/api/history")
+            {
+                const auto group = QUrlQuery(url).queryItemValue("group");
+                value = QJsonObject{{"messages", QJsonArray{QJsonObject{{"id", "latest-" + group}, {"group", group},
+                    {"seq", 10}, {"timestamp", 2000}, {"text", "latest fixture"}, {"status", "received"}}}},
+                    {"has_more", false}, {"pending", false}};
+            }
+            else if (path == "/api/records")
+                value = QJsonObject{{"messages", QJsonArray{original}}, {"has_more", false}, {"pending", false}};
+            else if (path == "/api/messages/original-record")
+            {
+                ++sourceReads;
+                QCOMPARE(QUrlQuery(url).queryItemValue("group"), "A");
+                value = original;
+            }
+            else if (path == "/api/messages")
+            {
+                ++contextReads;
+                QCOMPARE(QUrlQuery(url).queryItemValue("before"), "7");
+                value = QJsonArray{};
+            }
+            else if (path == "/api/groups/A/announcement")
+            {
+                heldAnnouncement = socket;
+                return;
+            }
+            else if (path == "/api/groups/B/announcement")
+                value = QJsonObject{{"group", "B"}, {"available", true}, {"set", false}};
+            RecordsApiFixture::respond(socket, value);
+        };
+        Window isolated(false);
+        isolated.show();
+        auto *transport = isolated.findChild<Transport *>();
+        transport->configure(api.url(), "offline-records-client");
+        transport->connectionChanged(true);
+        auto *groups = isolated.findChild<QListWidget *>("groups");
+        auto *view = isolated.findChild<MessageView *>();
+        auto *model = isolated.findChild<MessageModel *>();
+        auto *history = isolated.findChild<QPushButton *>("historyButton");
+        auto *announcement = isolated.findChild<QPushButton *>("announcementButton");
+        QTRY_COMPARE(groups->count(), 2);
+        QTRY_VERIFY(view->property("canDownload").toBool());
+        QTRY_COMPARE(model->rowCount(), 1);
+        QVERIFY(history->isEnabled() && announcement->isEnabled());
+        QTest::mouseClick(history, Qt::LeftButton);
+        auto *browser = isolated.findChild<HistoryBrowser *>();
+        QVERIFY(browser && browser->isVisible());
+        auto *records = browser->findChild<QListView *>("historyRecords");
+        QTRY_COMPARE(records->model()->rowCount(), 1);
+        const auto capture = qEnvironmentVariable("WECHAT_LITE_CAPTURE_UI");
+        if (!capture.isEmpty() && QGuiApplication::platformName() == "windows")
+        {
+            QDir().mkpath(capture);
+            browser->grab().save(QDir(capture).filePath("history-browser.png"));
+        }
+        QTest::mouseClick(records->viewport(), Qt::LeftButton, {},
+            records->visualRect(records->model()->index(0, 0)).center());
+        QTRY_COMPARE(sourceReads, 1);
+        QTRY_COMPARE(contextReads, 1);
+        QTRY_COMPARE(model->rows.last()["id"].toString(), "original-record");
+        QTRY_COMPARE(view->itemDelegate()->property("locatedId").toString(), "original-record");
+        QVERIFY(!browser->isVisible());
+        QTest::mouseClick(history, Qt::LeftButton);
+        QVERIFY(browser->isVisible());
+        QTest::mouseClick(announcement, Qt::LeftButton);
+        QPointer<AnnouncementDialog> oldAnnouncement(isolated.findChild<AnnouncementDialog *>());
+        QPointer<HistoryBrowser> oldHistory(browser);
+        QVERIFY(oldAnnouncement);
+        QTRY_VERIFY(heldAnnouncement);
+        groups->setCurrentRow(1);
+        QTRY_VERIFY(oldAnnouncement.isNull() && oldHistory.isNull());
+        RecordsApiFixture::respond(heldAnnouncement, QJsonObject{{"group", "A"}, {"available", true},
+            {"set", true}, {"text", "late group A announcement"}});
+        QTest::qWait(30);
+        QVERIFY(!isolated.findChild<AnnouncementDialog *>());
+        QTest::mouseClick(announcement, Qt::LeftButton);
+        QPointer<AnnouncementDialog> current(isolated.findChild<AnnouncementDialog *>());
+        QVERIFY(current && current->group() == "B");
+        QTRY_COMPARE(current->property("announcementState").toString(), "unset");
+        allowed = false;
+        transport->event({{"type", "groups"}});
+        QTRY_COMPARE(groups->count(), 0);
+        QTRY_VERIFY(current.isNull());
+        QVERIFY(!history->isEnabled() && !announcement->isEnabled());
+        QCOMPARE(model->rowCount(), 0);
+        QVERIFY(api.clientCredentialOnly);
+        for (const auto &method : api.methods)
+            QCOMPARE(method, QString("GET"));
+        transport->disconnectService();
     }
     void chatPreferencesPersistAndSeparateLogicalServersAndKeys()
     {

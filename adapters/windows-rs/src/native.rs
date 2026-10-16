@@ -18,7 +18,7 @@ use std::{
 pub const VERSION: &str = "4.1.15.13";
 const CLIENT_HASH: &str = "10f8e995453e2da46d4f2b5080cd6da1f13cc5147746adc119ceae38cb039de5";
 const BRIDGE_HASH: &str = "8b6d16d649abe493f1cac557dff2e4ca4e3f16746d132549397bc2cc9e110b6d";
-const BRIDGE: &[u8] = include_bytes!("../../windows/vendor/native/WeChatLocal.dll");
+const BRIDGE: &[u8] = include_bytes!("../vendor/WeChatLocal.dll");
 const MAX_MEDIA: u64 = 512 * 1024 * 1024;
 
 #[derive(Debug)]

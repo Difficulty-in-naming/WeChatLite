@@ -163,6 +163,18 @@ impl Backend for Local {
             Ok(json!({"id":id,"name":if name.is_empty(){"群成员"}else{&name},"remark":text(&member,"remark"),"avatar":self.avatar(id)}))
         }).collect()
     }
+    fn announcement(&mut self, group: &str) -> Result<Value> {
+        let mut announcement = self.db.announcement(group)?;
+        let editor = text(&announcement, "author_id").to_owned();
+        if announcement["available"] == true && !editor.is_empty() {
+            let name = self.db.display_name(group, &editor).unwrap_or_default();
+            if name != editor {
+                announcement["author"] = json!(name);
+            }
+            announcement["avatar"] = json!(self.avatar(&editor));
+        }
+        Ok(announcement)
+    }
     fn recent(&mut self, group: &str, limit: usize) -> Result<Vec<Value>> {
         self.db.recent(group, limit)
     }

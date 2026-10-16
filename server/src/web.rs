@@ -81,8 +81,10 @@ fn build_router(app: Arc<App>, entry: EntryPoint) -> Router {
         .route("/groups", get(groups))
         .route("/groups/{id}/activate", post(activate))
         .route("/groups/{id}/members", get(members))
+        .route("/groups/{id}/announcement", get(announcement))
         .route("/messages", get(history).post(send))
         .route("/history", get(native_history))
+        .route("/records", get(records))
         .route("/messages/{id}", get(locate))
         .route("/messages/{id}/recall", post(recall))
         .route(
@@ -625,6 +627,165 @@ async fn native_history(
     Ok(Json(public(
         json!({"messages":messages,"has_more":pending || !progress.exhausted || cached_count>=60,"pending":pending}),
     )))
+}
+
+async fn announcement(
+    State(app): State<Arc<App>>,
+    Extension(principal): Extension<Principal>,
+    Path(group): Path<String>,
+) -> ApiResult<Json<Value>> {
+    {
+        let selected = app.forwarding.read().await;
+        check_group(&selected, &group)?;
+        let clients = app.clients.read().await;
+        check_access(&clients, &principal, &group, Capability::Read)?;
+    }
+    if app.demo || app.status.read().await["ready"] != true {
+        return Ok(Json(crate::announcement::unavailable(&group, false)));
+    }
+    let (id, mut receiver) = app
+        .announcements
+        .request(&app, &group, principal.client_id())
+        .await
+        .map_err(|e| Error(e, StatusCode::SERVICE_UNAVAILABLE))?;
+    let received = tokio::time::timeout(crate::announcement::TIMEOUT, async {
+        loop {
+            if let Some(value) = receiver.borrow_and_update().clone() {
+                return Some(value);
+            }
+            if receiver.changed().await.is_err() {
+                return None;
+            }
+        }
+    })
+    .await;
+    let response = match received {
+        Ok(Some(value)) => value,
+        _ => {
+            app.announcements.expire(&group, &id).await;
+            crate::announcement::unavailable(&group, true)
+        }
+    };
+    let selected = app.forwarding.read().await;
+    check_group(&selected, &group)?;
+    let clients = app.clients.read().await;
+    check_access(&clients, &principal, &group, Capability::Read)?;
+    Ok(Json(response))
+}
+
+fn record_response(
+    mut scan: crate::records::Scan,
+    cursor: crate::records::Cursor,
+    progress: &crate::history::Progress,
+    demo: bool,
+    waiting: bool,
+) -> Json<Value> {
+    scan.messages
+        .sort_by_key(|message| std::cmp::Reverse((message.timestamp, message.seq)));
+    let pending = waiting || progress.pending;
+    let has_more = scan.cached_more || pending || (!demo && !progress.exhausted);
+    Json(public(
+        json!({"messages":scan.messages,"next_before":if has_more {Some(cursor.encode())} else {None},"has_more":has_more,"pending":pending}),
+    ))
+}
+
+async fn records(
+    State(app): State<Arc<App>>,
+    Extension(principal): Extension<Principal>,
+    Query(query): Query<crate::records::Query>,
+) -> ApiResult<Json<Value>> {
+    query.validate()?;
+    let (mut cursor, scan, progress) = {
+        let selected = app.forwarding.read().await;
+        check_group(&selected, &query.group)?;
+        let clients = app.clients.read().await;
+        check_access(&clients, &principal, &query.group, Capability::Read)?;
+        app.db({
+            let query = query.clone();
+            move |store| {
+                let progress = store.history_progress(&query.group)?;
+                let mut cursor = crate::records::Cursor::load(
+                    &query,
+                    store.record_snapshot(&query.group)?,
+                    &progress,
+                )?;
+                let scan =
+                    crate::records::scan(store, &query, &mut cursor, crate::records::SCAN_LIMIT)?;
+                cursor.set_progress(&progress);
+                Ok((cursor, scan, progress))
+            }
+        })
+        .await?
+    };
+    // A cached scan, including a page with no matches, always advances its keyset.
+    // Pull only after that cache window is consumed; one HTTP request submits at most one native page.
+    if scan.scanned > 0 || scan.cached_more || app.demo || progress.exhausted {
+        let selected = app.forwarding.read().await;
+        check_group(&selected, &query.group)?;
+        let clients = app.clients.read().await;
+        check_access(&clients, &principal, &query.group, Capability::Read)?;
+        return Ok(record_response(scan, cursor, &progress, app.demo, false));
+    }
+    if app.status.read().await["ready"] != true {
+        return Err(Error(
+            anyhow::anyhow!("本机微信未连接，无法读取更早历史，请稍后重试"),
+            StatusCode::SERVICE_UNAVAILABLE,
+        ));
+    }
+    let receiver = app
+        .history
+        .request(
+            &app,
+            &query.group,
+            principal.client_id(),
+            query.before.is_empty(),
+        )
+        .await
+        .map_err(|e| Error(e, StatusCode::SERVICE_UNAVAILABLE))?;
+    let mut waiting = false;
+    let mut history_error = None;
+    if let Some(mut receiver) = receiver {
+        match tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Some(value) = receiver.borrow_and_update().clone() {
+                    return Some(value);
+                }
+                if receiver.changed().await.is_err() {
+                    return None;
+                }
+            }
+        })
+        .await
+        {
+            Ok(Some(value)) => {
+                history_error = value["error"]
+                    .as_str()
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned)
+            }
+            _ => waiting = true,
+        }
+    }
+    let selected = app.forwarding.read().await;
+    check_group(&selected, &query.group)?;
+    let clients = app.clients.read().await;
+    check_access(&clients, &principal, &query.group, Capability::Read)?;
+    if let Some(error) = history_error {
+        return Err(Error(
+            anyhow::anyhow!(error),
+            StatusCode::SERVICE_UNAVAILABLE,
+        ));
+    }
+    let (scan, progress, cursor) = app
+        .db(move |store| {
+            let progress = store.history_progress(&query.group)?;
+            let scan =
+                crate::records::scan(store, &query, &mut cursor, crate::records::SCAN_LIMIT)?;
+            cursor.set_progress(&progress);
+            Ok((scan, progress, cursor))
+        })
+        .await?;
+    Ok(record_response(scan, cursor, &progress, app.demo, waiting))
 }
 
 #[derive(Deserialize)]
@@ -1291,6 +1452,276 @@ mod tests {
             id: "fixture-key".into(),
             revision: 1,
         }
+    }
+
+    #[tokio::test]
+    async fn records_http_empty_filters_advance_and_readonly_keys_cannot_cross_groups_or_change_cursor_filter()
+     {
+        let temp = tempfile::tempdir().unwrap();
+        let (app, _receiver) = crate::test_app(temp.path());
+        grant(&app).await;
+        {
+            let mut clients = app.clients.write().await;
+            let access = &mut clients.get_mut("fixture-key").unwrap().access;
+            access.can_send = false;
+            access.can_download = false;
+        }
+        app.store
+            .set_history_progress(
+                "g",
+                &crate::history::Progress {
+                    exhausted: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        for index in 1..=230 {
+            let mut row:ChatMessage=serde_json::from_value(json!({"id":format!("record-{index}"),"group":"g","sender":"成员","text":if index==1 {"needle"} else {"ordinary"},"timestamp":1000,"status":"received"})).unwrap();
+            app.store.insert_message(&mut row).unwrap();
+        }
+        let router = client_router(app.clone());
+        let response = router
+            .clone()
+            .oneshot(request(
+                "GET",
+                "/api/records?group=g&q=needle",
+                "fixture-independent-secret",
+                "192.0.2.3:2345",
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let first = json_body(response).await;
+        assert_eq!(first["messages"], json!([]));
+        assert_eq!(first["has_more"], true);
+        let cursor = first["next_before"].as_str().unwrap();
+        for path in [
+            format!("/api/records?group=g&q=changed&before={cursor}"),
+            "/api/records?group=g&type=invalid".into(),
+            "/api/records?group=g&start=2&end=1".into(),
+            "/api/records?group=g&before=ff".into(),
+        ] {
+            assert_eq!(
+                router
+                    .clone()
+                    .oneshot(request(
+                        "GET",
+                        &path,
+                        "fixture-independent-secret",
+                        "192.0.2.3:2345",
+                        Body::empty()
+                    ))
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::BAD_REQUEST
+            );
+        }
+        let response = router
+            .clone()
+            .oneshot(request(
+                "GET",
+                &format!("/api/records?group=g&q=needle&before={cursor}"),
+                "fixture-independent-secret",
+                "192.0.2.3:2345",
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        let last = json_body(response).await;
+        assert_eq!(last["messages"][0]["id"], "record-1");
+        assert_eq!(last["next_before"], Value::Null);
+        app.forwarding.write().await.insert("other".into());
+        for path in ["/api/records?group=other", "/api/groups/other/announcement"] {
+            assert_eq!(
+                router
+                    .clone()
+                    .oneshot(request(
+                        "GET",
+                        path,
+                        "fixture-independent-secret",
+                        "192.0.2.3:2345",
+                        Body::empty()
+                    ))
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::FORBIDDEN
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn records_native_pages_keep_the_tail_and_progress_on_empty_native_matches_without_false_eof()
+     {
+        let temp = tempfile::tempdir().unwrap();
+        let (app, mut commands) = crate::test_app(temp.path());
+        grant(&app).await;
+        app.status.write().await["ready"] = json!(true);
+        let router = client_router(app.clone());
+        let first = tokio::spawn({
+            let router = router.clone();
+            async move {
+                router
+                    .oneshot(request(
+                        "GET",
+                        "/api/records?group=g",
+                        "fixture-independent-secret",
+                        "192.0.2.3:2345",
+                        Body::empty(),
+                    ))
+                    .await
+                    .unwrap()
+            }
+        });
+        let job = commands.recv().await.unwrap();
+        assert_eq!(job["op"], "history");
+        let mut sources = Vec::new();
+        for index in 1..=60 {
+            let source = format!("wx:g:message__message_0.db:{index}:{index}");
+            sources.push(source.clone());
+            let mut row:ChatMessage=serde_json::from_value(json!({"id":format!("row-{index}"),"source_id":source,"group":"g","sender":"成员","text":"ordinary","timestamp":1000,"status":"received"})).unwrap();
+            app.store.insert_historical_message(&mut row).unwrap();
+        }
+        app.history.finish(&app,json!({"group":"g","request_id":job["request_id"],"before_source":sources[0],"has_more":true,"sources":sources})).await.unwrap();
+        let first = json_body(first.await.unwrap()).await;
+        assert_eq!(first["messages"].as_array().unwrap().len(), 50);
+        let cursor = first["next_before"].as_str().unwrap();
+        let tail = router
+            .clone()
+            .oneshot(request(
+                "GET",
+                &format!("/api/records?group=g&before={cursor}"),
+                "fixture-independent-secret",
+                "192.0.2.3:2345",
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        let tail = json_body(tail).await;
+        assert_eq!(tail["messages"].as_array().unwrap().len(), 10);
+        assert_eq!(tail["messages"][0]["id"], "row-10");
+        assert!(commands.try_recv().is_err());
+        let mut before = tail["next_before"].as_str().unwrap().to_owned();
+        // Two unsupported/duplicate-only native pages must still move their opaque cursor.
+        for (position, more) in [(0, true), (-1, false)] {
+            let task = tokio::spawn({
+                let router = router.clone();
+                let before = before.clone();
+                async move {
+                    router
+                        .oneshot(request(
+                            "GET",
+                            &format!("/api/records?group=g&before={before}"),
+                            "fixture-independent-secret",
+                            "192.0.2.3:2345",
+                            Body::empty(),
+                        ))
+                        .await
+                        .unwrap()
+                }
+            });
+            let job = commands.recv().await.unwrap();
+            app.history.finish(&app,json!({"group":"g","request_id":job["request_id"],"before_source":format!("wx:g:message__message_0.db:0:{position}"),"has_more":more,"sources":[]})).await.unwrap();
+            let value = json_body(task.await.unwrap()).await;
+            assert_eq!(value["messages"], json!([]));
+            assert_eq!(value["pending"], false);
+            assert_eq!(value["has_more"], more);
+            if more {
+                let next = value["next_before"].as_str().unwrap().to_owned();
+                assert_ne!(before, next);
+                before = next;
+            } else {
+                assert_eq!(value["next_before"], Value::Null);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn announcement_http_distinguishes_unset_and_rechecks_client_permission_after_native_wait()
+     {
+        let temp = tempfile::tempdir().unwrap();
+        let (app, mut commands) = crate::test_app(temp.path());
+        grant(&app).await;
+        app.status.write().await["ready"] = json!(true);
+        let router = client_router(app.clone());
+        for revoke in [false, true] {
+            let task = tokio::spawn({
+                let router = router.clone();
+                async move {
+                    router
+                        .oneshot(request(
+                            "GET",
+                            "/api/groups/g/announcement",
+                            "fixture-independent-secret",
+                            "192.0.2.3:2345",
+                            Body::empty(),
+                        ))
+                        .await
+                        .unwrap()
+                }
+            });
+            let command = commands.recv().await.unwrap();
+            assert_eq!(command["op"], "announcement");
+            assert_eq!(command["group"], "g");
+            if revoke {
+                app.clients
+                    .write()
+                    .await
+                    .get_mut("fixture-key")
+                    .unwrap()
+                    .access
+                    .groups
+                    .clear();
+            }
+            app.announcements.finish(json!({"group":"g","request_id":command["request_id"],"available":true,"set":false,"text":"","author_id":"","author":"","avatar":"","updated_at":null})).await;
+            let response = task.await.unwrap();
+            if revoke {
+                assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            } else {
+                let value = json_body(response).await;
+                assert_eq!(value["available"], true);
+                assert_eq!(value["set"], false);
+                assert_eq!(value["updated_at"], Value::Null);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn announcement_http_timeout_is_bounded_unavailable_and_retries_use_a_new_generation() {
+        let temp = tempfile::tempdir().unwrap();
+        let (app, mut commands) = crate::test_app(temp.path());
+        grant(&app).await;
+        app.status.write().await["ready"] = json!(true);
+        let response = tokio::time::timeout(
+            Duration::from_secs(4),
+            client_router(app.clone()).oneshot(request(
+                "GET",
+                "/api/groups/g/announcement",
+                "fixture-independent-secret",
+                "192.0.2.3:2345",
+                Body::empty(),
+            )),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let first = commands.recv().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let value = json_body(response).await;
+        assert_eq!(value["available"], false);
+        assert_eq!(value["pending"], true);
+        assert_eq!(value["text"], "");
+        let (new_id, new_reply) = app.announcements.request(&app, "g", "").await.unwrap();
+        assert_ne!(first["request_id"], new_id);
+        app.announcements
+            .finish(
+                json!({"group":"g","request_id":first["request_id"],"available":true,"set":false}),
+            )
+            .await;
+        assert!(new_reply.borrow().is_none());
+        app.announcements.fail_all().await;
     }
 
     #[tokio::test]

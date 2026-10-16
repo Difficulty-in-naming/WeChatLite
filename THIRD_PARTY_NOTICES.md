@@ -12,12 +12,12 @@ are included in distributable packages.
 | Qt 6.8.3 dynamic Widgets, Network and WebSockets libraries | Module and bundled-code terms vary; [Qt licensing](https://doc.qt.io/qt-6/licensing.html), [matching source archive](https://download.qt.io/archive/qt/6.8/6.8.3/). The application links Qt dynamically. |
 | Rust relay/adapter dependencies | Exact versions/checksums are in `Cargo.lock`; each crate retains its license. This includes SQLite, image codecs and cryptography/networking dependencies. |
 | iroh / iroh-relay 1.3.0 and noq QUIC transport | MIT OR Apache-2.0, with retained BSD-3-Clause portions; [upstream](https://github.com/n0-computer/iroh/tree/v1.3.0). Matching notices are in `network/licenses` and package `licenses/`. Used by the Rust relay and `wechat-link` client helper; the separately deployed public relay is the pinned official Linux release. Dependencies and source checksums are retained in `Cargo.lock`. |
-| Local database/media algorithms ported from wechatauto-replica 1.2.6 | Apache-2.0, [upstream source](https://github.com/fanyuantaier/wechatauto-replica); original notice in `adapters/windows/vendor/WechatAuto-LICENSE.txt` and package `licenses/WechatAuto-Apache-2.0.txt`. |
-| Original version-verified WeChatLocal sender | User-supplied local native component in `adapters/windows/vendor/native/WeChatLocal.dll`, retained from the supplied WeChatFeishuBridge project. It is embedded by the Rust adapter; the historical Python bridge is not executed. |
+| Local database/media algorithms ported from wechatauto-replica 1.2.6 | Apache-2.0, [upstream source](https://github.com/fanyuantaier/wechatauto-replica); original notice in `adapters/windows-rs/vendor/WechatAuto-LICENSE.txt` and package `licenses/WechatAuto-Apache-2.0.txt`. |
+| Original version-verified WeChatLocal sender | User-supplied local native component in `adapters/windows-rs/vendor/WeChatLocal.dll`, retained from the supplied WeChatFeishuBridge project and embedded by the Rust adapter. |
 | WeChatActions recall / WeChatQuote native text-quote modules | Reviewable project source and standalone build with two offline self-test executables in `adapters/native`; third-party MIT/BSD notices are retained there and copied to package `licenses/`. WeChatQuote is a separate, hook-free module; it does not replace the existing recall DLL. |
 | MinHook | Original license in `adapters/native/third_party/minhook/LICENSE.txt`, copied to package `licenses/MinHook.txt`. |
 | cpp-httplib 0.12.6 / nlohmann JSON 3.11.1 | MIT; unmodified headers and full attribution/license text in `adapters/native/include` and `adapters/native/THIRD_PARTY_NOTICES.md`. |
-| SILK C SDK from pilk 0.2.4 | The SDK retains Skype Limited's 2006–2012 redistribution terms in each C/header file. The enclosing pilk source distribution retains GPL-3.0. Both are preserved in `adapters/windows-rs/vendor/pilk-0.2.4`; the complete original archive is `thirdparty-sources/pilk-0.2.4.tar.gz`. Only SDK C sources are compiled; no Python extension is linked. |
+| SILK C SDK from pilk 0.2.4 | The SDK retains Skype Limited's 2006–2012 redistribution terms in each C/header file. The enclosing pilk source distribution retains GPL-3.0. The C SDK subset and license are preserved in `adapters/windows-rs/vendor/pilk-0.2.4`; the complete original archive is `thirdparty-sources/pilk-0.2.4.tar.gz`. Unused Python wrappers and packaging metadata have been removed from the source tree. Only SDK C sources are compiled. |
 | Standalone FFmpeg 7.1 CLI, default Windows artifact | GPL-3.0-or-later, as reported by its `-L`; see the exact artifact and source details below. It is invoked only when needed for WXGF, independently of Qt's FFmpeg DLLs. |
 
 ## Standalone FFmpeg artifact and source
@@ -66,14 +66,15 @@ replacement supplied with `-FFmpeg` needs its own matching notices and source
 inventory. FFmpeg's [license documentation](https://ffmpeg.org/legal.html)
 describes how enabled components affect its terms.
 
-## Historical source
+## Development tooling
 
-`adapters/windows`, its requirements/spec and Python regression tests remain as
-migration history. Python 3.11 (PSF), PyInstaller (GPL-2.0 with its bootloader
-exception), pilk's Python wrapper and the old OpenCV/UI-automation dependency
-chain are not part of the new runtime package. Previous packaged binaries are
-preserved under `build/legacy-python-adapter/` when the release script migrates
-them; they are not copied into the new adapter directory.
+The legacy Python bridge, its packaging configuration and its obsolete tests
+have been removed. The maintained integration tests use Rust. Qt downloads and
+tool installation in macOS CI use development-only Python tools; no Python
+interpreter, wrapper or package is installed into either application.
+
+Original third-party source archives are retained intact for attribution and
+source provenance. Their contents are not loaded or executed by the product.
 
 The application is independent of Tencent and WeChat. Version checks describe
 the supplied local adapter rather than an official cross-platform WeChat API.
