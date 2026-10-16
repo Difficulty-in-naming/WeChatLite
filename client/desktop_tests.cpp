@@ -2090,6 +2090,17 @@ class DesktopTests : public QObject
         const auto redacted = recalledIndex.data(Qt::UserRole).toJsonObject();
         QVERIFY(redacted["text"].toString().isEmpty() && redacted["media"].toArray().isEmpty());
         QVERIFY(!redacted["_can_reedit"].toBool());
+        view->setProperty("locatedHistory", false);
+        view->locateRequested({{"id", "h110"}, {"group", "A"}});
+        QTRY_COMPARE(view->itemDelegate()->property("locatedId").toString(), "h110");
+        QVERIFY(view->property("locatedHistory").toBool());
+        QCOMPARE(locateRequests, 0); // A source in the current page still gets the locate feedback.
+        QModelIndex loadedSource;
+        for (int row = 0; row < history->rowCount(); ++row)
+            if (history->rows[row]["id"] == "h110")
+                loadedSource = history->index(row);
+        QVERIFY(loadedSource.isValid());
+        QVERIFY(view->viewport()->rect().contains(view->visualRect(loadedSource).center()));
         const QJsonObject locate{{"id", "missing-source"}, {"group", "A"}};
         view->locateRequested(locate);
         view->locateRequested(locate); // Do not queue duplicate searches while a lookup is pending.

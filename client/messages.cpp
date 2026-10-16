@@ -28,6 +28,7 @@
 #include <QTextLayout>
 #include <QTextOption>
 #include <QWheelEvent>
+#include <QXmlStreamReader>
 #include <QtMath>
 #include <algorithm>
 #include <cmath>
@@ -61,11 +62,47 @@ void MessageView::setRecallCapability(const QJsonObject &status)
     if (recallUnavailableReason == "当前微信版本的后台撤回暂不可用；请在原版微信中撤回")
         recallUnavailableReason = "后台撤回暂不可用，请在微信中撤回";
 }
+static bool nativeImageReference(const QString &text)
+{
+    if (text.size() > 24000 || !text.trimmed().startsWith('<'))
+        return false;
+    QXmlStreamReader xml(text);
+    int depth = 0;
+    bool image = false, root = false;
+    while (!xml.atEnd())
+    {
+        const auto token = xml.readNext();
+        if (token == QXmlStreamReader::DTD || token == QXmlStreamReader::EntityReference)
+            return false;
+        if (xml.isStartElement())
+        {
+            ++depth;
+            if (depth == 1)
+                root = xml.name() == QLatin1String("msg");
+            if (!root)
+                return false;
+            if (depth == 2 && xml.name() == QLatin1String("img"))
+            {
+                const auto md5 = xml.attributes().value("md5");
+                image = md5.size() == 32 && std::all_of(md5.begin(), md5.end(), [](QChar c)
+                {
+                    return (c >= '0' && c <= '9') || (c.toLower() >= 'a' && c.toLower() <= 'f');
+                });
+            }
+        }
+        else if (xml.isEndElement())
+            --depth;
+    }
+    return !xml.hasError() && image;
+}
 QString messageQuoteLabel(const QJsonObject &quote)
 {
     if (quote["unavailable"].toBool())
         return "原消息已撤回或不可用";
-    return quote["sender"].toString() + ": " + wechatDisplayText(quote["text"].toString().replace('\n', ' '));
+    const auto text = quote["text"].toString();
+    // Older saved references contain native image XML instead of a display label.
+    return quote["sender"].toString() + ": " +
+           (nativeImageReference(text) ? QString("[图片]") : wechatDisplayText(QString(text).replace('\n', ' ')));
 }
 static QJsonObject redactedMessage(QJsonObject message)
 {
@@ -1033,6 +1070,13 @@ MessageView::MessageView(QWidget *parent) : StableListView(parent)
     gifUpdateTimer.setSingleShot(true);
     gifUpdateTimer.setInterval(0);
     connect(&gifUpdateTimer, &QTimer::timeout, this, &MessageView::updateVisibleGifs);
+    locateHighlightTimer.setSingleShot(true);
+    locateHighlightTimer.setInterval(1000);
+    connect(&locateHighlightTimer, &QTimer::timeout, this, [this]
+    {
+        itemDelegate()->setProperty("locatedId", QString());
+        viewport()->update();
+    });
     connect(verticalScrollBar(), &QScrollBar::valueChanged, this, &MessageView::scheduleGifUpdate);
     connect(verticalScrollBar(), &QScrollBar::sliderReleased, this, &MessageView::requestOlder);
     connect(verticalScrollBar(), &QScrollBar::valueChanged, this, [this](int) { emit viewportChanged(); });
@@ -1067,18 +1111,11 @@ bool MessageView::locateMessage(const QString &id)
         if (index.data(Qt::UserRole).toJsonObject()["id"].toString() != id)
             continue;
         stopScrollAnimation();
+        setProperty("locatedHistory", true);
         scrollTo(index, QAbstractItemView::PositionAtCenter);
         itemDelegate()->setProperty("locatedId", id);
         viewport()->update();
-        QTimer::singleShot(1000, this,
-                           [this, id]
-                           {
-                               if (itemDelegate()->property("locatedId").toString() == id)
-                               {
-                                   itemDelegate()->setProperty("locatedId", QString());
-                                   viewport()->update();
-                               }
-                           });
+        locateHighlightTimer.start();
         return true;
     }
     return false;

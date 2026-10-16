@@ -285,11 +285,34 @@ fn remove_envelope<'a>(content: &'a str, actor: &str) -> &'a str {
 /// `row` and `raw` must be freshly read from the same group's DB table using one exact locator.
 /// Their shard/local_id/sort_seq/time/actor and raw server ID are cross-checked before constructing wire fields.
 pub fn prepare_source(group: &str, row: &Value, raw: &Value, wxid: &str) -> Result<Value> {
-    ensure!(group_id(group) && member_id(wxid), "引用账号或群编号无效");
     ensure!(
         text(row, "type") == "文本" && raw["local_type"].as_i64() == Some(1),
         "原生引用目前仅支持原微信文本消息，不会改发摘要"
     );
+    source_fields(group, row, raw, wxid)
+}
+
+/// Resolve received references without enabling additional native send types.
+pub fn matches_reference(group: &str, row: &Value, raw: &Value, wxid: &str, reference: &Value) -> bool {
+    let label = match reference["type"].as_u64() {
+        Some(1) => "文本",
+        Some(3) => "图片",
+        _ => return false,
+    };
+    if row["type"] != label || raw["local_type"] != reference["type"] {
+        return false;
+    }
+    let Ok(source) = source_fields(group, row, raw, wxid) else {
+        return false;
+    };
+    source["server_id"] == reference["server_id"]
+        && source["fromusr"] == reference["fromusr"]
+        && source["chatusr"] == reference["chatusr"]
+        && xml_newlines(text(&source, "content")) == xml_newlines(text(reference, "text"))
+}
+
+fn source_fields(group: &str, row: &Value, raw: &Value, wxid: &str) -> Result<Value> {
+    ensure!(group_id(group) && member_id(wxid), "引用账号或群编号无效");
     ensure!(
         row["recalled"] != true && raw["recalled"] != true && row["status"] != "recalled",
         "引用原消息已撤回"
@@ -351,7 +374,7 @@ pub fn prepare_source(group: &str, row: &Value, raw: &Value, wxid: &str) -> Resu
         "引用原文与本机数据库显示记录不一致"
     );
     Ok(
-        json!({"group":group,"type":1,"server_id":server,"local_id":local,"create_time":time,
+        json!({"group":group,"type":raw["local_type"],"server_id":server,"local_id":local,"create_time":time,
         "fromusr":if own {wxid} else {group},"tousr":if own {group} else {wxid},"chatusr":actor,"content":body}),
     )
 }
@@ -771,6 +794,28 @@ mod tests {
             .is_none()
         );
         assert!(reference(&value.replace("<refermsg>", "<refermsg><type>1</type>")).is_none());
+    }
+    #[test]
+    fn image_reference_resolution_keeps_source_identity_checks_and_text_send_restriction() {
+        let body = "<msg><img md5='0123456789abcdef0123456789abcdef'/></msg>";
+        let (mut row, mut raw) = rows(false, body);
+        row["type"] = json!("图片");
+        raw["local_type"] = json!(3);
+        let reference = json!({"type":3,"server_id":"42","fromusr":GROUP,"chatusr":"wxid_member","text":body});
+        assert!(matches_reference(GROUP, &row, &raw, SELF, &reference));
+        assert!(prepare_source(GROUP, &row, &raw, SELF).is_err());
+        for (field, value) in [("type", json!(1)), ("server_id", json!("43")),
+            ("fromusr", json!("555555@chatroom")), ("chatusr", json!(SELF)), ("text", json!("other image"))] {
+            let mut changed = reference.clone();
+            changed[field] = value;
+            assert!(!matches_reference(GROUP, &row, &raw, SELF, &changed), "{field}");
+        }
+        for (field, value) in [("status", json!("recalled")), ("sender_id", json!(9)),
+            ("group", json!("555555@chatroom")), ("content", json!("different body"))] {
+            let mut changed = row.clone();
+            changed[field] = value;
+            assert!(!matches_reference(GROUP, &changed, &raw, SELF, &reference), "{field}");
+        }
     }
     #[test]
     fn receipt_and_health_cannot_confuse_actions_a_different_task_or_missing_uuid() {

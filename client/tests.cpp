@@ -987,6 +987,58 @@ class ClientTests : public QObject
         QTest::keyClick(&view, Qt::Key_End);
         QCOMPARE(latest.count(), 1);
     }
+    void imageQuoteLabelsHideLegacyNativeMetadata()
+    {
+        QJsonObject quote{{"sender", "成员"}, {"text", "<?xml version=\"1.0\"?><msg><img md5=\"0123456789abcdef0123456789abcdef\" cdnmidimgurl=\"private-media\"/></msg>"}};
+        QCOMPARE(messageQuoteLabel(quote), "成员: [图片]");
+        quote["text"] = "<msg><img md5=\"0123456789abcdef0123456789abcdef\"></img></msg>";
+        QCOMPARE(messageQuoteLabel(quote), "成员: [图片]");
+        for (const QString text : {QString("[图片]"), QString("正常文本 [微笑]"),
+                                   QString("<config><img/></config>"), QString("<msg><img/></msg>"),
+                                   QString("<msg><img md5=\"x\"/>截断"),
+                                   QString("<!DOCTYPE msg [<!ENTITY image 'x'>]><msg><img md5=\"x\"/></msg>")})
+        {
+            quote["text"] = text;
+            QCOMPARE(messageQuoteLabel(quote), "成员: " + wechatDisplayText(text));
+        }
+        quote["unavailable"] = true;
+        QCOMPARE(messageQuoteLabel(quote), "原消息已撤回或不可用");
+    }
+    void locatingLoadedMessageRestartsItsFullRowHighlight()
+    {
+        MessageModel model;
+        QJsonArray rows;
+        for (int i = 0; i < 70; ++i)
+            rows.append(QJsonObject{{"id", QString::number(i)}, {"group", "A"}, {"seq", i},
+                                    {"text", "原文"}, {"timestamp", 1700000000000LL}});
+        model.replace(rows);
+        MessageView view;
+        view.resize(640, 320);
+        view.setModel(&model);
+        view.show();
+        QTest::qWait(30);
+        view.scrollToBottom();
+        auto changed = rows[69].toObject();
+        changed["text"] = "加载完毕后的消息";
+        model.upsert(changed); // An asynchronous layout must not undo explicit navigation.
+        QVERIFY(view.locateMessage("7"));
+        QVERIFY(view.property("locatedHistory").toBool());
+        QTest::qWait(40);
+        const auto target = model.index(7);
+        QVERIFY(view.viewport()->rect().contains(view.visualRect(target).center()));
+        auto *delegate = view.itemDelegate();
+        QCOMPARE(delegate->property("locatedId").toString(), "7");
+        const auto pixels = view.viewport()->grab().toImage();
+        QCOMPARE(pixels.pixelColor(5, view.visualRect(target).center().y()), QColor("#eaeaea"));
+        QTest::qWait(610);
+        QVERIFY(view.locateMessage("7"));
+        QTest::qWait(480); // The first locate's timeout must not clear the second highlight.
+        QCOMPARE(delegate->property("locatedId").toString(), "7");
+        QTRY_VERIFY_WITH_TIMEOUT(delegate->property("locatedId").toString().isEmpty(), 1000);
+        QVERIFY(view.locateMessage("9"));
+        QCOMPARE(delegate->property("locatedId").toString(), "9");
+        QVERIFY(!view.locateMessage("missing"));
+    }
     void quoteIsIndependentBelowReplyAndItsMenuOnlyLocates()
     {
         MessageModel model;

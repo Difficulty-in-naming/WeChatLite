@@ -234,6 +234,8 @@ const RECALL_GROUP: &str = "123456@chatroom";
 
 fn recall_db_fixture() -> (TempDir, Local, String) {
     let temp = TempDir::new().unwrap();
+    let contacts = Connection::open_in_memory().unwrap();
+    contacts.execute_batch("CREATE TABLE contact(username TEXT,remark TEXT,nick_name TEXT);CREATE TABLE chat_room(username TEXT,ext_buffer BLOB);").unwrap();
     let messages = Connection::open_in_memory().unwrap();
     let table = format!("Msg_{:x}", Md5::digest(RECALL_GROUP.as_bytes()));
     messages.execute_batch(&format!("CREATE TABLE Name2Id(user_name TEXT);CREATE TABLE {table}(local_id INTEGER PRIMARY KEY,local_type INTEGER,real_sender_id INTEGER,create_time INTEGER,message_content TEXT,source BLOB,packed_info_data BLOB,compress_content BLOB,server_id INTEGER,sort_seq INTEGER);INSERT INTO {table} VALUES(3,1,2,1000,'fixture message',NULL,NULL,NULL,-1,30);")).unwrap();
@@ -242,7 +244,7 @@ fn recall_db_fixture() -> (TempDir, Local, String) {
             temp.path().join("fixture-account"),
             "wxid_self",
             None,
-            HashMap::from([("message/message_0.db".into(), messages)]),
+            HashMap::from([("message/message_0.db".into(), messages), ("contact/contact.db".into(), contacts)]),
         ),
         native: NativeClient::new(temp.path().join("native")),
         media: Media::new(temp.path().to_owned()),
@@ -256,6 +258,40 @@ fn recall_db_fixture() -> (TempDir, Local, String) {
         quotes_error: String::new(),
     };
     (temp, access, table)
+}
+
+#[test]
+fn received_image_quote_uses_a_label_and_real_source_even_before_media_is_cached() {
+    let (temp, mut access, table) = recall_db_fixture();
+    let mut png = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::new_rgb8(2, 2).write_to(&mut png, image::ImageFormat::Png).unwrap();
+    let png = png.into_inner();
+    let digest = format!("{:x}", Md5::digest(&png));
+    let image = format!("<?xml version=\"1.0\"?><msg><img md5=\"{digest}\"/></msg>");
+    let card = format!("<msg><appmsg><type>57</type><title>这个</title><refermsg><type>3</type><svrid>18446744073709551615</svrid><fromusr>wxid_self</fromusr><chatusr>wxid_self</chatusr><displayname>成员</displayname><content><![CDATA[{image}]]></content></refermsg></appmsg></msg>");
+    access.db.open("message/message_0.db").unwrap().execute(
+        &format!("UPDATE {table} SET local_type=3,message_content=?1 WHERE local_id=3"), [&image]).unwrap();
+    let reply = json!({"local_id":4,"sort_seq":40,"shard":"message__message_0.db","sender_id":2,"create_time":1001,"type":"引用","content":card});
+    let converted = access.convert(RECALL_GROUP, &reply).unwrap().unwrap();
+    assert_eq!(converted["text"], "这个");
+    assert_eq!(converted["quote"]["text"], "[图片]");
+    let expected_source = format!("wx:{RECALL_GROUP}:message__message_0.db:3:30");
+    assert_eq!(converted["_quote_source"], expected_source);
+    assert_eq!(converted["quote"]["id"], Uuid::new_v5(&Uuid::NAMESPACE_URL, expected_source.as_bytes()).to_string());
+    assert!(converted.get("_quote_original").is_none()); // An uncached image must not hold up its reply.
+    let row = access.db.reload(RECALL_GROUP, &json!({"local_id":3,"sort_seq":30,"shard":"message__message_0.db"})).unwrap();
+    let raw = access.db.raw_message(RECALL_GROUP, 3, "message__message_0.db").unwrap();
+    assert!(crate::quotes::prepare_source(RECALL_GROUP, &row, &raw, "wxid_self").is_err());
+    let folder = temp.path().join("fixture-account/msg/attach")
+        .join(format!("{:x}", Md5::digest(RECALL_GROUP.as_bytes()))).join("2026-10/Img");
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::write(folder.join(format!("{digest}.dat")), png.iter().map(|b| b ^ 0x88).collect::<Vec<_>>()).unwrap();
+    let ready = access.convert(RECALL_GROUP, &reply).unwrap().unwrap();
+    assert_eq!(ready["quote"], converted["quote"]);
+    assert_eq!(ready["_quote_original"]["id"], ready["quote"]["id"]);
+    assert_eq!(ready["_quote_original"]["media"][0]["kind"], "image");
+    assert!(access.native.pid.is_none());
+    assert!(!temp.path().join("native").exists());
 }
 
 #[test]

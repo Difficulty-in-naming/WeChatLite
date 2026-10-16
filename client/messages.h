@@ -153,6 +153,7 @@ class MessageView : public StableListView
     int textAnchor = 0, textCursor = 0;
     bool selectingText = false;
     QTimer gifUpdateTimer;
+    QTimer locateHighlightTimer;
     QHash<QString, GifAnimation> gifs;
     QList<QMetaObject::Connection> modelConnections;
     QPointer<QWidget> observedWindow;

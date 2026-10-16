@@ -87,7 +87,7 @@ impl Local {
     fn referenced_original(&mut self, group: &str, reference: &Value) -> Result<Option<Value>> {
         use md5::{Digest, Md5};
         use rusqlite::OptionalExtension;
-        if reference["type"] != 1 {
+        if reference["type"] != 1 && reference["type"] != 3 {
             return Ok(None);
         }
         let server = text(reference, "server_id")
@@ -119,24 +119,10 @@ impl Local {
                     json!({"local_id":id,"sort_seq":sequence,"shard":rel.replace('/',"__")});
                 let row = self.db.reload(group, &locator)?;
                 let raw = self.db.raw_message(group, id, text(&locator, "shard"))?;
-                let Ok(source) = crate::quotes::prepare_source(group, &row, &raw, &self.db.wxid)
-                else {
-                    return Ok(None);
-                };
-                if source["server_id"] != reference["server_id"]
-                    || source["fromusr"] != reference["fromusr"]
-                    || source["chatusr"] != reference["chatusr"]
-                    || text(&source, "content")
-                        .replace("\r\n", "\n")
-                        .replace('\r', "\n")
-                        != text(reference, "text")
-                            .replace("\r\n", "\n")
-                            .replace('\r', "\n")
-                {
+                if !crate::quotes::matches_reference(group, &row, &raw, &self.db.wxid, reference) {
                     return Ok(None);
                 }
-                // Only validated type-1 source rows reach this recursion; no nested quote expansion.
-                return self.convert(group, &row);
+                return Ok(Some(row));
             }
         }
         Ok(None)
@@ -320,7 +306,17 @@ impl Backend for Local {
         let mut message = json!({"id":Uuid::new_v5(&Uuid::NAMESPACE_URL,source_id.as_bytes()).to_string(),"group":group,"sender":name,"sender_id":actor,"avatar":self.avatar(&actor),"text":body,"media":media,"mentions":mentions,"timestamp":timestamp,"status":"received","source_id":source_id,"outgoing":if actor.is_empty(){row["sender_id"]==2}else{actor==self.db.wxid}});
         if let Some(reference) = crate::quotes::reference(&content) {
             message["text"] = json!(xml_text(&content, "title"));
-            let original = self.referenced_original(group, &reference)?;
+            let source_row = self.referenced_original(group, &reference)?;
+            let source_id = source_row.as_ref().map(|row| source(group, row)).transpose()?;
+            // A referenced image can still be downloading; its reply and stable source ID are ready.
+            let original = if let Some(row) = &source_row {
+                match self.convert(group, row) {
+                    Err(error) if error.is::<crate::media::MediaPending>() => None,
+                    result => result?,
+                }
+            } else {
+                None
+            };
             let caption = if !text(&reference, "sender").is_empty() {
                 text(&reference, "sender").to_owned()
             } else if let Some(original) = &original {
@@ -328,13 +324,16 @@ impl Backend for Local {
             } else {
                 self.db.display_name(group, text(&reference, "chatusr"))?
             };
-            let id = original
+            let id = source_id
                 .as_ref()
-                .map(|value| text(value, "id").to_owned())
+                .map(|source| Uuid::new_v5(&Uuid::NAMESPACE_URL, source.as_bytes()).to_string())
                 .unwrap_or_else(|| format!("unavailable-{}", text(&reference, "server_id")));
-            message["quote"] = json!({"id":id,"sender":if caption.is_empty(){"群成员"}else{&caption},"text":reference["text"],"unavailable":false});
+            let preview = if reference["type"] == 3 { "[图片]" } else { text(&reference, "text") };
+            message["quote"] = json!({"id":id,"sender":if caption.is_empty(){"群成员"}else{&caption},"text":preview,"unavailable":false});
+            if let Some(source_id) = source_id {
+                message["_quote_source"] = json!(source_id);
+            }
             if let Some(original) = original {
-                message["_quote_source"] = original["source_id"].clone();
                 message["_quote_original"] = original;
             }
         }
