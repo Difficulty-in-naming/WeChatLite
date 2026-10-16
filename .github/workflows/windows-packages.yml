@@ -1,0 +1,126 @@
+name: Windows x64 packages
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-packages-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: windows-2025-vs2026
+    timeout-minutes: 90
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_BUILD_JOBS: '3'
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - name: Restore Qt SDK
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: .qt
+          key: qt-6.8.3-windows-x64-msvc2022-minimal-v1
+      - name: Restore Rust build cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            packaging/windows-portable/target
+          key: rust-1.95.0-windows-x64-msvc2026-cmake4.4.4-${{ hashFiles('Cargo.lock', 'packaging/windows-portable/Cargo.lock') }}
+          restore-keys: rust-1.95.0-windows-x64-msvc2026-cmake4.4.4-
+      - name: Prepare native tools and Qt
+        run: |
+          $ErrorActionPreference = 'Stop'
+          rustup toolchain install 1.95.0 --profile minimal
+          if ($LASTEXITCODE) { throw 'Rust installation failed' }
+          rustup override set 1.95.0
+          if ($LASTEXITCODE) { throw 'Rust toolchain selection failed' }
+          python -m pip install --disable-pip-version-check aqtinstall==3.3.0 cmake==4.4.4
+          if ($LASTEXITCODE) { throw 'Build tool installation failed' }
+          if (-not (Test-Path -LiteralPath '.qt/6.8.3/msvc2022_64/lib/cmake/Qt6Svg/Qt6SvgConfig.cmake')) {
+            python -m aqt install-qt windows desktop 6.8.3 win64_msvc2022_64 `
+              --archives qtbase qtsvg qttools --modules qtwebsockets --outputdir "$PWD/.qt"
+            if ($LASTEXITCODE) { throw 'Qt installation failed' }
+          }
+          cargo --version
+          cmake --version
+      - name: Prepare verified standalone FFmpeg
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Use the same binary/source inventory as the local package. Extract only
+          # the EXE from the pinned wheel; no Python wrapper enters the runtime.
+          python -m pip download --disable-pip-version-check --only-binary=:all: --no-deps `
+            --dest .tools/downloads imageio-ffmpeg==0.6.0
+          if ($LASTEXITCODE) { throw 'FFmpeg download failed' }
+          $wheels = @(Get-ChildItem -LiteralPath .tools/downloads -Filter 'imageio_ffmpeg-0.6.0-*-win_amd64.whl' -File)
+          if ($wheels.Count -ne 1) { throw 'Expected the pinned Windows x64 FFmpeg wheel' }
+          $destination = Join-Path $PWD '.tools/Lib/site-packages/imageio_ffmpeg/binaries/ffmpeg-win-x86_64-v7.1.exe'
+          New-Item -ItemType Directory -Force -Path (Split-Path -Parent $destination) | Out-Null
+          $archive = [IO.Compression.ZipFile]::OpenRead($wheels[0].FullName)
+          try {
+            $entry = $archive.GetEntry('imageio_ffmpeg/binaries/ffmpeg-win-x86_64-v7.1.exe')
+            if ($null -eq $entry) { throw 'The pinned FFmpeg wheel has unexpected contents' }
+            [IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $destination, $true)
+          } finally {
+            $archive.Dispose()
+          }
+          $expected = '2ce797a0f88d7f067180338fb227f7b1928ea727bd9a4d7a1d022f7c52af71a3'
+          if ((Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expected) {
+            throw 'FFmpeg SHA256 does not match the retained source/build inventory'
+          }
+      - name: Build, test and package
+        run: |
+          ./scripts/build-windows.ps1 -Generator 'Visual Studio 18 2026'
+          if ($LASTEXITCODE) { throw 'Windows build/test/package failed' }
+      - name: Verify portable launcher and write package checksums
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cargo test --manifest-path packaging/windows-portable/Cargo.toml --locked
+          if ($LASTEXITCODE) { throw 'Portable package security tests failed' }
+          ./packaging/windows-portable/test-launcher.ps1
+          if ($LASTEXITCODE) { throw 'Portable launcher integration failed' }
+          $checksums = foreach ($role in @('Client', 'Server')) {
+            $name = "WeChatLite-$role-Windows-x64.exe"
+            $digest = (Get-FileHash -LiteralPath (Join-Path dist $name) -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$digest  $name"
+          }
+          [IO.File]::WriteAllLines((Join-Path $PWD 'dist/WINDOWS_SHA256SUMS.txt'), [string[]]$checksums, [Text.UTF8Encoding]::new($false))
+      - name: Save distributable packages
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: Windows-x64-packages
+          path: |
+            dist/WeChatLite-Client-Windows-x64.exe
+            dist/WeChatLite-Server-Windows-x64.exe
+            dist/WINDOWS_SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 7
+      - name: Save test diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: Windows-test-diagnostics
+          path: |
+            build/Testing/Temporary/LastTest.log
+            build/native/Testing/Temporary/LastTest.log
+            build/client/*-tests.txt
+            build/server_gui/*-tests.txt
+          if-no-files-found: ignore
+          retention-days: 7

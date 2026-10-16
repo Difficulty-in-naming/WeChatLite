@@ -10,6 +10,8 @@
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
 #include <QNetworkRequest>
+#include <QTcpServer>
+#include <QTcpSocket>
 #include <QQueue>
 #include <QTemporaryDir>
 #include <QtTest>
@@ -158,6 +160,116 @@ class UpdateTests : public QObject
     FakeNetwork *network(const std::unique_ptr<ReleaseUpdate> &updater)
         { return static_cast<FakeNetwork *>(updater->network); }
   private slots:
+    void updateProxyUsesEachUrlPreservesCredentialsAndBypassesLoopback()
+    {
+        const QNetworkProxy http(QNetworkProxy::HttpProxy, "system-http.invalid", 8123,
+            "system-http-user", "synthetic-http-password");
+        const QNetworkProxy socks(QNetworkProxy::Socks5Proxy, "system-socks.invalid", 9123,
+            "system-socks-user", "synthetic-socks-password");
+        QList<QNetworkProxy> policy{http, QNetworkProxy::NoProxy, socks};
+        QList<QUrl> queries;
+        std::unique_ptr<QNetworkProxyFactory> factory(ReleaseUpdate::updateProxyFactory(
+            [&](const QNetworkProxyQuery &query)
+            {
+                queries.append(query.url());
+                return policy;
+            }));
+        const QList<QUrl> urls{QUrl(api + "/releases/latest"),
+            QUrl(web + "/releases/download/v0.3.2/" + clientName),
+            QUrl("https://release-assets.githubusercontent.com/file?signature=fixture")};
+        for (const auto &url : urls)
+            QCOMPARE(factory->queryProxy(QNetworkProxyQuery(url)), policy);
+        QCOMPARE(queries, urls);
+        for (const auto &url : {"https://localhost/fixture", "https://LOCALHOST./fixture",
+                 "https://127.0.0.2/fixture", "https://[::1]/fixture"})
+            QCOMPARE(factory->queryProxy(QNetworkProxyQuery(QUrl(url))),
+                QList<QNetworkProxy>{QNetworkProxy::NoProxy});
+        QCOMPARE(queries, urls); // Bypassing a fixture must not invoke system PAC discovery.
+        QCOMPARE(factory->queryProxy(QNetworkProxyQuery(QUrl("https://localhost.example/fixture"))), policy);
+        QCOMPARE(queries.size(), urls.size() + 1);
+        policy = {QNetworkProxy::DefaultProxy, http, QNetworkProxy::NoProxy};
+        QCOMPARE(factory->queryProxy(QNetworkProxyQuery(urls.first())),
+            (QList<QNetworkProxy>{QNetworkProxy::NoProxy, http, QNetworkProxy::NoProxy}));
+        policy.clear();
+        QCOMPARE(factory->queryProxy(QNetworkProxyQuery(urls.last())),
+            QList<QNetworkProxy>{QNetworkProxy::NoProxy});
+        ReleaseUpdate updater(ReleaseUpdate::Role::Client, "0.3.1");
+        QVERIFY(updater.network->proxyFactory());
+        QCOMPARE(updater.network->proxyFactory()->queryProxy(QNetworkProxyQuery(QUrl("https://127.0.0.1/fixture"))),
+            QList<QNetworkProxy>{QNetworkProxy::NoProxy});
+    }
+    void proxyAuthenticationNeverUsesOriginOrChatCredentials_data()
+    {
+        QTest::addColumn<bool>("credentials");
+        QTest::newRow("system-proxy-credentials") << true;
+        QTest::newRow("no-proxy-credentials") << false;
+    }
+    void proxyAuthenticationNeverUsesOriginOrChatCredentials()
+    {
+        QFETCH(bool, credentials);
+        QTemporaryDir directory;
+        QTcpServer proxy;
+        QVERIFY(proxy.listen(QHostAddress::LocalHost, 0));
+        QList<QByteArray> exchanges;
+        const QByteArray expected = "Basic " + QByteArray("system-proxy-user:synthetic-proxy-password").toBase64();
+        bool authenticated = false;
+        connect(&proxy, &QTcpServer::newConnection, this, [&]
+        {
+            while (auto *socket = proxy.nextPendingConnection())
+            {
+                auto buffer = std::make_shared<QByteArray>();
+                connect(socket, &QTcpSocket::disconnected, socket, &QObject::deleteLater);
+                connect(socket, &QTcpSocket::readyRead, socket, [&, socket, buffer]
+                {
+                    buffer->append(socket->readAll());
+                    if (!buffer->contains("\r\n\r\n") || socket->property("handled").toBool()) return;
+                    socket->setProperty("handled", true);
+                    exchanges.append(*buffer);
+                    QByteArray authorization;
+                    for (const auto &line : buffer->split('\n'))
+                        if (line.toLower().startsWith("proxy-authorization:"))
+                            authorization = line.mid(line.indexOf(':') + 1).trimmed();
+                    authenticated |= authorization == expected;
+                    const auto response = authenticated
+                        ? QByteArray("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                        : QByteArray("HTTP/1.1 407 Proxy Authentication Required\r\n"
+                            "Proxy-Authenticate: Basic realm=\"offline updater proxy\"\r\n"
+                            "Content-Length: 0\r\nConnection: close\r\n\r\n");
+                    socket->write(response);
+                    socket->disconnectFromHost(); // No origin connection or external traffic is made.
+                });
+            }
+        });
+        QNetworkAccessManager unrelated;
+        const QNetworkProxy chatProxy(QNetworkProxy::HttpProxy, "chat-proxy.invalid", 9321,
+            "chat-only-user", "chat-token-never-for-updates");
+        unrelated.setProxy(chatProxy);
+        ReleaseUpdate updater(ReleaseUpdate::Role::Client, "0.3.1");
+        updater.system = "Windows";
+        updater.architecture = "x86_64";
+        updater.cacheRoot = directory.filePath("updates");
+        updater.checkTimeoutMs = 2500;
+        QNetworkProxy selected(QNetworkProxy::HttpProxy, "127.0.0.1", proxy.serverPort(),
+            credentials ? "system-proxy-user" : QString(), credentials ? "synthetic-proxy-password" : QString());
+        updater.network->setProxyFactory(ReleaseUpdate::updateProxyFactory(
+            [selected](const QNetworkProxyQuery &) { return QList<QNetworkProxy>{selected}; }));
+        updater.check();
+        QTRY_COMPARE_WITH_TIMEOUT(updater.state(), ReleaseUpdate::State::Failed, 4000);
+        QCOMPARE(authenticated, credentials);
+        QVERIFY(!exchanges.isEmpty());
+        for (const auto &headers : exchanges)
+        {
+            QVERIFY(headers.startsWith("CONNECT api.github.com:443 "));
+            QVERIFY(!headers.toLower().contains("\r\nauthorization:"));
+            QVERIFY(!headers.toLower().contains("\r\ncookie:"));
+            QVERIFY(!headers.contains("chat-token-never-for-updates"));
+            QVERIFY(!headers.contains("chat-only-user"));
+        }
+        QCOMPARE(unrelated.proxy(), chatProxy);
+        QVERIFY(!unrelated.proxyFactory());
+        QVERIFY(updater.filePath().isEmpty());
+        QVERIFY(partials(directory.path()).isEmpty());
+    }
     void strictVersionComparison_data()
     {
         QTest::addColumn<QString>("current");
@@ -276,8 +388,12 @@ class UpdateTests : public QObject
         for (const auto &request : fake->requests)
         {
             QVERIFY(!request.hasRawHeader("Authorization"));
+            QVERIFY(!request.hasRawHeader("Proxy-Authorization"));
+            QVERIFY(!request.hasRawHeader("Cookie"));
             QCOMPARE(request.attribute(QNetworkRequest::RedirectPolicyAttribute).toInt(), int(QNetworkRequest::ManualRedirectPolicy));
             QCOMPARE(request.attribute(QNetworkRequest::AuthenticationReuseAttribute).toInt(), int(QNetworkRequest::Manual));
+            QCOMPARE(request.attribute(QNetworkRequest::CookieLoadControlAttribute).toInt(), int(QNetworkRequest::Manual));
+            QCOMPARE(request.attribute(QNetworkRequest::CookieSaveControlAttribute).toInt(), int(QNetworkRequest::Manual));
             QVERIFY(request.sslConfiguration().localCertificateChain().isEmpty());
             QCOMPARE(request.transferTimeout(), 30000);
         }

@@ -1,10 +1,12 @@
 #pragma once
 #include <QObject>
+#include <QNetworkProxy>
 #include <QPointer>
 #include <QString>
 #include <QTimer>
 #include <QUrl>
 #include <atomic>
+#include <functional>
 #include <memory>
 
 class QFile;
@@ -39,6 +41,8 @@ class ReleaseUpdate final : public QObject
     void upToDate();
   private:
     friend class UpdateTests;
+    static QNetworkProxyFactory *updateProxyFactory(
+        std::function<QList<QNetworkProxy>(const QNetworkProxyQuery &)> resolver = {});
     static constexpr qint64 maximumAssetSize = 1024LL * 1024 * 1024;
     struct Asset { QString name; QUrl url; QByteArray digest; qint64 size = 0; };
     void setState(State state);

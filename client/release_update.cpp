@@ -7,6 +7,7 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QHostAddress>
 #include <QNetworkAccessManager>
 #include <QNetworkProxy>
 #include <QNetworkReply>
@@ -28,6 +29,27 @@ constexpr qint64 metadataLimit = 1024 * 1024;
 constexpr qint64 chunkSize = 64 * 1024;
 const QString apiRepository = QStringLiteral("https://api.github.com/repos/Difficulty-in-naming/WeChatLite");
 const QString browserRepository = QStringLiteral("https://github.com/Difficulty-in-naming/WeChatLite");
+
+class UpdateProxyFactory final : public QNetworkProxyFactory
+{
+  public:
+    explicit UpdateProxyFactory(std::function<QList<QNetworkProxy>(const QNetworkProxyQuery &)> resolver)
+        : resolver(std::move(resolver)) {}
+    QList<QNetworkProxy> queryProxy(const QNetworkProxyQuery &query) override
+    {
+        const auto host = query.peerHostName();
+        if (host.compare("localhost", Qt::CaseInsensitive) == 0 ||
+            host.compare("localhost.", Qt::CaseInsensitive) == 0 || QHostAddress(host).isLoopback())
+            return {QNetworkProxy::NoProxy};
+        auto proxies = resolver(query);
+        for (auto &proxy : proxies)
+            if (proxy.type() == QNetworkProxy::DefaultProxy) proxy = QNetworkProxy::NoProxy;
+        if (proxies.isEmpty()) proxies.append(QNetworkProxy::NoProxy);
+        return proxies;
+    }
+  private:
+    std::function<QList<QNetworkProxy>(const QNetworkProxyQuery &)> resolver;
+};
 
 QVersionNumber stableVersion(const QString &text)
 {
@@ -84,6 +106,13 @@ bool safeDirectory(const QString &path)
 }
 }
 
+QNetworkProxyFactory *ReleaseUpdate::updateProxyFactory(
+    std::function<QList<QNetworkProxy>(const QNetworkProxyQuery &)> resolver)
+{
+    if (!resolver) resolver = QNetworkProxyFactory::systemProxyForQuery;
+    return new UpdateProxyFactory(std::move(resolver));
+}
+
 ReleaseUpdate::ReleaseUpdate(Role selectedRole, const QString &currentVersion, QObject *parent)
     : QObject(parent), role(selectedRole), installedVersion(currentVersion),
       architecture(QSysInfo::buildCpuArchitecture()), network(new QNetworkAccessManager(this))
@@ -94,7 +123,7 @@ ReleaseUpdate::ReleaseUpdate(Role selectedRole, const QString &currentVersion, Q
     system = "macOS";
 #endif
     // The update connection has no relationship to the chat connection or its credentials.
-    network->setProxy(QNetworkProxy::NoProxy);
+    network->setProxyFactory(updateProxyFactory());
     cacheRoot = QDir(QStandardPaths::writableLocation(QStandardPaths::CacheLocation)).filePath("updates");
     deadline.setSingleShot(true);
     connect(&deadline, &QTimer::timeout, this, [this]

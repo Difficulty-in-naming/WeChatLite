@@ -75,7 +75,9 @@ Apple Silicon Mac：Xcode Command Line Tools、Qt 6.8.3+、CMake、Rust。当前
 QT_PREFIX=/path/to/Qt/6.8.3/macos bash scripts/build-macos.sh
 ```
 
-GitHub Actions 的 `macOS arm64 packages` 工作流可以手动运行，在原生 arm64 Mac 上构建、测试、部署依赖、检查签名并生成两份 DMG。只上传程序与校验值，测试诊断单独保存为短期 Actions artifact。
+每次向 GitHub 推送提交，Actions 都会自动运行 `Windows x64 packages` 和 `macOS arm64 packages`，也可分别手动运行。Windows 使用显式的 `windows-2025-vs2026` runner、VS 2026 和 CMake 4.4.4，Mac 使用原生 arm64 runner；两端固定 Qt 6.8.3 和 Rust 1.95.0，先通过离线测试、依赖部署和包内容校验，再生成客户端与服务端。
+
+在仓库 **Actions → 对应工作流 → 对应提交的成功运行 → Artifacts** 下载 `Windows-x64-packages` 或 `macOS-arm64-packages`。前者只含两个便携 EXE 和校验值，后者只含两个 DMG 和校验值；默认保留七天。测试诊断另存，不进入程序包。提交构建不会自动创建或覆盖正式 Release，正式版本仍在 Releases 下载。
 
 ```text
 cargo test --locked -p wechat-relay -p wechat-adapter -p wechat-p2p
@@ -85,4 +87,4 @@ ctest --test-dir build/native -C Release --output-on-failure
 
 默认自动化使用演示服务、离线样本或合成 fixture，不发送真实微信群消息。真实 WeChat 适配器、系统通知视觉效果、不同外网的直连成功率和签名公证须分别验证，不能以单元测试替代。
 
-第三方组件与对应源码材料见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。业务代码与集成测试使用 Rust/C++，部署和测量使用系统脚本；旧 Python 桥接及包装代码已移除。Mac CI 仅在安装构建工具和下载 Qt 时使用 Python 版官方构建辅助工具，不进入产品或运行包。
+第三方组件与对应源码材料见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。业务代码与集成测试使用 Rust/C++，部署和测量使用系统脚本；旧 Python 桥接及包装代码已移除。CI 仅在安装构建工具和下载依赖时使用 Python 辅助工具，不进入产品或运行包。

@@ -2,7 +2,8 @@ param(
     [string]$QtRoot = "$PSScriptRoot\..\.qt\6.8.3\msvc2022_64",
     [string]$FFmpeg = "$PSScriptRoot\..\.tools\Lib\site-packages\imageio_ffmpeg\binaries\ffmpeg-win-x86_64-v7.1.exe",
     [string]$CMake = "$PSScriptRoot\..\.tools\Scripts\cmake.exe",
-    [string]$CTest = "$PSScriptRoot\..\.tools\Scripts\ctest.exe"
+    [string]$CTest = "$PSScriptRoot\..\.tools\Scripts\ctest.exe",
+    [string]$Generator = 'Visual Studio 18 2026'
 )
 $ErrorActionPreference = 'Stop'
 $workspace = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
@@ -20,7 +21,7 @@ if (-not (Test-Path -LiteralPath (Join-Path $QtRoot 'bin\windeployqt.exe') -Path
 $env:PATH = "$QtRoot\bin;$workspace\.tools\Scripts;$env:PATH"
 
 # Build the independent C++ action module and pin the exact binary before Rust embeds its hash.
-& (Join-Path $workspace 'adapters\native\build.ps1') -CMake $CMake -CTest $CTest
+& (Join-Path $workspace 'adapters\native\build.ps1') -CMake $CMake -CTest $CTest -Generator $Generator
 if ($LASTEXITCODE) { throw 'Native actions build failed' }
 $actionsBinary = Join-Path $workspace 'build\native\Release\WeChatActions.dll'
 $actionsHash = (Get-FileHash -LiteralPath $actionsBinary -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -56,11 +57,11 @@ Copy-Item -LiteralPath $FFmpeg -Destination (Join-Path $releaseRuntime 'ffmpeg.e
 Copy-Item -LiteralPath $actionsBinary -Destination (Join-Path $releaseRuntime 'WeChatActions.dll') -Force
 Copy-Item -LiteralPath $quoteBinary -Destination (Join-Path $releaseRuntime 'WeChatQuote.dll') -Force
 
-& $CMake -S . -B build -G 'Visual Studio 18 2026' -A x64 "-DCMAKE_PREFIX_PATH=$QtRoot"
+& $CMake -S . -B build -G $Generator -A x64 "-DCMAKE_PREFIX_PATH=$QtRoot"
 if ($LASTEXITCODE) { throw 'Client configure failed' }
 & $CMake --build build --config Release --parallel 4
 if ($LASTEXITCODE) { throw 'Client build failed' }
-& $CTest --test-dir build -C Release --output-on-failure
+& $CTest --test-dir build -C Release --output-on-failure --timeout 180
 if ($LASTEXITCODE) { throw 'Client tests failed' }
 
 & (Join-Path $PSScriptRoot 'package-windows.ps1') -QtRoot $QtRoot -FFmpeg $FFmpeg

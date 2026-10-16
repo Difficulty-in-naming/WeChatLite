@@ -4,7 +4,13 @@ use crate::{
 };
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::{collections::BTreeSet, path::PathBuf};
+
+// This exact Actions DLL has the same 4.1.15.13 recall ABI/hooks as native/src/actions.cpp.
+// Remove this compatibility pin when that recall implementation or its ABI changes.
+const COMPATIBLE_ACTIONS_HASH: &str =
+    "8be08c6e44f9af86d6fde188a255060bbe53411c5b3c1ab9fab8c8ce0d21a974";
 
 pub struct Actions {
     client: NativeClient,
@@ -28,6 +34,21 @@ impl Actions {
             .context("程序目录缺失")?
             .join("WeChatActions.dll");
         let binary = std::fs::read(path).context("缺少独立撤回组件 WeChatActions.dll")?;
+        ensure!(
+            hex::encode(Sha256::digest(&binary)) == hash,
+            "独立撤回组件指纹不匹配"
+        );
+        let (binary, hash) = if hash != COMPATIBLE_ACTIONS_HASH {
+            match NativeClient::compatible_loaded_binary(
+                &directory.join("native-actions"),
+                COMPATIBLE_ACTIONS_HASH,
+            )? {
+                Some(binary) => (binary, COMPATIBLE_ACTIONS_HASH),
+                None => (binary, hash),
+            }
+        } else {
+            (binary, hash)
+        };
         let mut client = NativeClient::with_binary(
             directory.join("native-actions"),
             binary,
