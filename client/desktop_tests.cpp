@@ -1517,6 +1517,84 @@ class DesktopTests : public QObject
         transport->event({{"type", "synced"}, {"seq", 0}});
         window->showNormal();
     }
+    void dockBadgeCountsOnlyMessagesTheGroupLevelWouldAlert()
+    {
+        auto *transport = window->findChild<Transport *>();
+        auto *list = window->findChild<QListWidget *>("groups");
+        QTRY_VERIFY(list->count() >= 2 && list->currentItem());
+        const auto current = list->currentItem()->data(Qt::UserRole).toJsonObject().value("id").toString();
+        QString other;
+        for (int row = 0; row < list->count(); ++row)
+            if (list->item(row)->data(Qt::UserRole).toJsonObject().value("id").toString() != current)
+                other = list->item(row)->data(Qt::UserRole).toJsonObject().value("id").toString();
+        QVERIFY(!other.isEmpty());
+        const auto choose = [this](const QString &group, const QString &action)
+        {
+            auto *menu = window->groupContextMenuFor(group);
+            menu->findChild<QAction *>(action)->trigger();
+            delete menu;
+        };
+        choose(current, "groupNotificationsMentions");
+        choose(other, "groupNotificationsAll");
+        // Earlier tests queued unread messages in these same demo conversations. Read both so the
+        // aggregate starts from a known zero before counting the messages below.
+        window->showNormal();
+        QApplication::setActiveWindow(window);
+        QTRY_VERIFY(window->isActiveWindow());
+        window->activateConversation(current);
+        QTRY_COMPARE(list->currentItem()->data(Qt::UserRole).toJsonObject().value("id").toString(), current);
+        window->activateConversation(other);
+        QTRY_COMPARE(list->currentItem()->data(Qt::UserRole).toJsonObject().value("id").toString(), other);
+        window->hide();
+        transport->event({{"type", "status"}, {"ready", true}, {"self_id", "wxid_badge_self"}});
+        qint64 seq = 4000000;
+        transport->event({{"type", "synced"}, {"seq", seq}});
+        const auto mention = QJsonArray{QJsonObject{{"id", "wxid_badge_self"}, {"name", "徽标测试"}}};
+        const auto event = [&seq](const QString &id, const QString &group, const QJsonArray &mentions)
+        {
+            return QJsonObject{{"type", "message"}, {"seq", ++seq}, {"created", true},
+                {"message", QJsonObject{{"id", "badge-" + id}, {"group", group},
+                    {"sender_id", "wxid_other"}, {"sender", "离线成员"}, {"text", "徽标测试消息"},
+                    {"mentions", mentions}, {"status", "received"}, {"timestamp", 1}}}};
+        };
+        int total = -1;
+        QObject::connect(window, &Window::unreadTotalChanged, window, [&total](int count) { total = count; });
+        // A plain message in a mentions-only conversation keeps the list marker but stays off the
+        // Dock badge.
+        transport->event(event("mentions-plain", current, {}));
+        QCOMPARE(total, 0);
+        bool markedUnread = false;
+        for (int row = 0; row < list->count(); ++row)
+        {
+            const auto group = list->item(row)->data(Qt::UserRole).toJsonObject();
+            markedUnread |= group.value("id").toString() == current && group.value("unread").toInt() == 1;
+        }
+        QVERIFY(markedUnread);
+        // A structured mention in the same conversation does count.
+        transport->event(event("mentions-hit", current, mention));
+        QCOMPARE(total, 1);
+        // The plain conversation keeps counting every message.
+        transport->event(event("all-plain", other, {}));
+        QCOMPARE(total, 2);
+        // Switching the level re-derives the aggregate from messages already received.
+        choose(current, "groupNotificationsAll");
+        QCOMPARE(total, 3);
+        choose(current, "groupNotificationsIgnore");
+        QCOMPARE(total, 1); // Only the ignored conversation drops out; the other still counts.
+        choose(other, "groupNotificationsIgnore");
+        QCOMPARE(total, 0);
+        choose(current, "groupNotificationsAll");
+        choose(other, "groupNotificationsAll");
+        QCOMPARE(total, 3);
+        // Opening a conversation clears its contribution, including the mentions-only subset.
+        window->activateConversation(current);
+        QTRY_COMPARE(list->currentItem()->data(Qt::UserRole).toJsonObject().value("id").toString(), current);
+        QCOMPARE(total, 1);
+        window->activateConversation(other);
+        QTRY_COMPARE(list->currentItem()->data(Qt::UserRole).toJsonObject().value("id").toString(), other);
+        QCOMPARE(total, 0);
+        window->showNormal();
+    }
     void automaticClientStoresStableIdentityAndStartsOnlyOnSave()
     {
         QSettings settings;
