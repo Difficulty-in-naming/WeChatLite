@@ -11,6 +11,14 @@ set_target_properties(wechat-lite PROPERTIES WIN32_EXECUTABLE TRUE MACOSX_BUNDLE
     MACOSX_BUNDLE_BUNDLE_NAME "微信轻聊" MACOSX_BUNDLE_GUI_IDENTIFIER "local.wechatlite.client"
     MACOSX_BUNDLE_BUNDLE_VERSION ${PROJECT_VERSION}
     MACOSX_BUNDLE_SHORT_VERSION_STRING ${PROJECT_VERSION})
+if(APPLE)
+    # Without an icon the Dock shows a blank tile, which also hides the unread badge.
+    # The .icns mirrors Window::appIcon() so the in-app and Dock icons stay identical.
+    set(APP_ICON "${CMAKE_CURRENT_SOURCE_DIR}/icons/app.icns")
+    set_source_files_properties(${APP_ICON} PROPERTIES MACOSX_PACKAGE_LOCATION "Resources")
+    target_sources(wechat-lite PRIVATE ${APP_ICON})
+    set_target_properties(wechat-lite PROPERTIES MACOSX_BUNDLE_ICON_FILE "app.icns")
+endif()
 if(WIN32)
     target_sources(wechat-lite PRIVATE system_notifier.win.cpp)
     target_link_libraries(wechat-lite PRIVATE windowsapp runtimeobject ole32 shell32 propsys advapi32 uuid)

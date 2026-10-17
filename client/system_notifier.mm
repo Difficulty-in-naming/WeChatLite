@@ -134,6 +134,9 @@ class MacNotificationBackend final : public SystemNotifier::Native
         NSDockTile *tile = NSApp.dockTile;
         if (!tile)
             return;
+        // Qt leaves showsApplicationBadge off for windows-style apps, which makes badgeLabel
+        // inert: the value is stored and reported by lsappinfo, but the Dock never draws it.
+        tile.showsApplicationBadge = YES;
         tile.badgeLabel = count > 0 ? text(QString::number(count)) : nil;
         [tile display];
     }

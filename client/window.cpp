@@ -836,6 +836,28 @@ void Window::changeEvent(QEvent *event)
         QTimer::singleShot(0, this, [this] { fitToScreen(); });
     if (event->type() == QEvent::ActivationChange || event->type() == QEvent::WindowStateChange)
         updateNativeFrame();
+    // Messages that arrived while the window sat in the background were counted as unread even
+    // for the open conversation, so clear that conversation now that the user is looking at it.
+    if (event->type() == QEvent::ActivationChange && isActiveWindow())
+        markConversationRead();
+}
+
+void Window::markConversationRead()
+{
+    if (groupId.isEmpty() || !unread.contains(groupId))
+        return;
+    unread.remove(groupId);
+    updateUnreadTotal();
+    for (int row = 0; row < groups->count(); ++row)
+    {
+        auto *item = groups->item(row);
+        auto group = item->data(Qt::UserRole).toJsonObject();
+        if (group.value("id").toString() != groupId || group.value("unread").toInt() == 0)
+            continue;
+        group["unread"] = 0;
+        item->setData(Qt::UserRole, group);
+        break;
+    }
 }
 void Window::refreshThemeIcons()
 {
@@ -2181,8 +2203,12 @@ void Window::handleEvent(const QJsonObject &event)
                                                                         : message["text"].toString());
                     obj["timestamp"] = message["timestamp"];
                 }
-                if (firstSeen && message["group"] != groupId && !message["outgoing"].toBool() &&
-                    message["status"] == "received")
+                // A message counts as unread unless the user is actually looking at it: the
+                // conversation has to be open *and* the window has to be active. Otherwise a
+                // message that lands in the open conversation while the app sits in the
+                // background would never reach the Dock badge.
+                if (firstSeen && message["status"] == "received" && !message["outgoing"].toBool() &&
+                    (message["group"] != groupId || !isActiveWindow()))
                 {
                     obj["unread"] = ++unread[message["group"].toString()];
                     updateUnreadTotal();

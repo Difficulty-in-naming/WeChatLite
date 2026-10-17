@@ -77,6 +77,7 @@ class Window : public QMainWindow
     bool rememberMessage(const QJsonObject &message);
     void maybeNotifyMessage(const QJsonObject &event, bool firstSeen);
     void updateUnreadTotal();
+    void markConversationRead();
     void selectGroup(const QString &id, const QString &name);
     void loadHistory(bool older = false, int pendingAttempt = 0);
     void loadMembers();
