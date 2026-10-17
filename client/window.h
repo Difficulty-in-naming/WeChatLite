@@ -49,6 +49,8 @@ class Window : public QMainWindow
   signals:
     void systemNotificationRequested(const QString &groupId, const QString &title, const QString &body);
     void notificationSoundPreviewRequested();
+    // Aggregate unread across conversations, mirrored to the Dock tile by the native notifier.
+    void unreadTotalChanged(int count);
 
   protected:
     void closeEvent(QCloseEvent *event) override;
@@ -74,6 +76,8 @@ class Window : public QMainWindow
     void sortGroups();
     bool rememberMessage(const QJsonObject &message);
     void maybeNotifyMessage(const QJsonObject &event, bool firstSeen);
+    void updateUnreadTotal();
+    void markConversationRead();
     void selectGroup(const QString &id, const QString &name);
     void loadHistory(bool older = false, int pendingAttempt = 0);
     void loadMembers();
@@ -168,6 +172,11 @@ class Window : public QMainWindow
     std::shared_ptr<MediaStorage::LocalFiles> localFiles;
     std::shared_ptr<std::atomic<quint64>> cacheRecoveryGeneration = std::make_shared<std::atomic<quint64>>(0);
     QHash<QString, int> unread;
+    // Of those unread messages, the ones that mentioned this account (or everyone). The Dock badge
+    // derives its total from both counters plus the current notification level, so a conversation
+    // switched back to "all messages" regains the messages the quieter levels had dropped, while
+    // unread above keeps drawing the plain new-message marker in the conversation list.
+    QHash<QString, int> unreadMentions;
     QHash<QString, QJsonObject> historyUpdates;
     QSet<QString> downloading, openRequests, saveRequests;
     QSet<QString> queuedMediaIds;
