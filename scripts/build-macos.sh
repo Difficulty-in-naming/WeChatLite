@@ -9,6 +9,27 @@ fi
 QT_PREFIX="${QT_PREFIX:-$(brew --prefix qt)}"
 jobs="${BUILD_JOBS:-3}"
 export CARGO_BUILD_JOBS="$jobs"
+
+# Signing identity. Ad-hoc keeps the build working on any checkout and in CI, but a stable
+# "Apple Development" identity is preferable locally: macOS keys each app's notification
+# permission to its signing identity, so ad-hoc signing makes every rebuild look like a brand
+# new app and the permission has to be granted again. Override with CODESIGN_IDENTITY, or set
+# it to an empty string to force ad-hoc.
+if [[ -z "${CODESIGN_IDENTITY+set}" ]]; then
+  CODESIGN_IDENTITY='-'
+  if command -v security >/dev/null 2>&1; then
+    if detected="$(security find-identity -v -p codesigning 2>/dev/null |
+      sed -n 's/.*"\(Apple Development: .*\)"/\1/p' | head -1)" && [[ -n "$detected" ]]; then
+      CODESIGN_IDENTITY="$detected"
+    fi
+  fi
+fi
+: "${CODESIGN_IDENTITY:=-}"
+if [[ "$CODESIGN_IDENTITY" == '-' ]]; then
+  echo 'Signing ad-hoc. Set CODESIGN_IDENTITY to a Developer ID to keep macOS permissions stable.'
+else
+  echo "Signing with: $CODESIGN_IDENTITY"
+fi
 cargo test --locked -p wechat-relay -p wechat-p2p
 cargo build --release --locked -p wechat-relay -p wechat-p2p
 WECHAT_RELAY_BINARY="$PWD/target/release/wechat-relay" \
@@ -46,11 +67,15 @@ for role in client server; do
   cp "docs/$guide.md" "$resources/使用说明.md"
   cp THIRD_PARTY_NOTICES.md "$resources/THIRD_PARTY_NOTICES.md"
   cp network/licenses/*.txt "$resources/licenses/"
+  # macdeployqt must sign with the same identity: it is the step that signs the Qt frameworks
+  # nested in Contents/Frameworks, and codesign does not re-sign nested code when signing a bundle
+  # without the deprecated --deep. Everything is then re-signed below in its final location.
   "$QT_PREFIX/bin/macdeployqt" "$app" \
-    -executable="$app/Contents/MacOS/$helper" -always-overwrite -codesign=-
-  # Sign after resources and both executables are in their final locations.
-  codesign --force --sign - "$app/Contents/MacOS/$helper"
-  codesign --force --sign - "$app"
+    -executable="$app/Contents/MacOS/$helper" -always-overwrite -codesign="$CODESIGN_IDENTITY"
+  # Sign after resources and both executables are in their final locations. The helper is signed
+  # first because signing the bundle does not re-sign nested executables.
+  codesign --force --sign "$CODESIGN_IDENTITY" "$app/Contents/MacOS/$helper"
+  codesign --force --sign "$CODESIGN_IDENTITY" "$app"
   codesign --verify --deep --strict --verbose=2 "$app"
   cmake "-DAPP=$app" "-DAPP_BINARY=$binary" "-DHELPER_BINARY=$helper" \
     -P scripts/verify-macos-bundle.cmake
@@ -81,4 +106,4 @@ done
 shasum -a 256 dist/WeChatLite-*-macOS-arm64.dmg > dist/MACOS_SHA256SUMS.txt
 echo 'Output: two DMGs, each containing one self-contained .app.'
 echo 'The Mac server has no native Mac WeChat adapter. It cannot forward local Mac WeChat yet.'
-echo 'Ad-hoc signed for local testing. Developer ID signing/notarization require the owner certificate.'
+echo "Signed with: $CODESIGN_IDENTITY. Developer ID signing/notarization require the owner certificate."

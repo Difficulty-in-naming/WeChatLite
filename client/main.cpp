@@ -48,6 +48,7 @@ int main(int argc, char **argv)
     QObject::connect(&window, &Window::systemNotificationRequested, &notifier, &SystemNotifier::showMessage);
     QObject::connect(&window, &Window::notificationSoundPreviewRequested, &notifier, &SystemNotifier::previewSound);
     QObject::connect(&notifier, &SystemNotifier::activated, &window, &Window::activateConversation);
+    QObject::connect(&window, &Window::unreadTotalChanged, &notifier, &SystemNotifier::setUnreadTotal);
     window.show();
     if (!parser.isSet("demo") && (QSettings().value("serverUrl").toString().trimmed().isEmpty() ||
                                   QSettings().value("token").toString().trimmed().size() < 24))

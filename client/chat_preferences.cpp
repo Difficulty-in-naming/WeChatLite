@@ -75,6 +75,11 @@ bool ChatPreferences::allowsNotification(const QString &group, const QJsonArray 
     const auto mode = notificationMode(group);
     if (mode != NotificationMode::MentionsOnly)
         return mode == NotificationMode::AllMessages;
+    return mentionsSelf(mentions, selfId);
+}
+
+bool ChatPreferences::mentionsSelf(const QJsonArray &mentions, const QString &selfId)
+{
     for (const auto &mention : mentions)
     {
         const auto id = mention.toObject().value("id").toString();

@@ -836,6 +836,29 @@ void Window::changeEvent(QEvent *event)
         QTimer::singleShot(0, this, [this] { fitToScreen(); });
     if (event->type() == QEvent::ActivationChange || event->type() == QEvent::WindowStateChange)
         updateNativeFrame();
+    // Messages that arrived while the window sat in the background were counted as unread even
+    // for the open conversation, so clear that conversation now that the user is looking at it.
+    if (event->type() == QEvent::ActivationChange && isActiveWindow())
+        markConversationRead();
+}
+
+void Window::markConversationRead()
+{
+    if (groupId.isEmpty() || !unread.contains(groupId))
+        return;
+    unread.remove(groupId);
+    unreadMentions.remove(groupId);
+    updateUnreadTotal();
+    for (int row = 0; row < groups->count(); ++row)
+    {
+        auto *item = groups->item(row);
+        auto group = item->data(Qt::UserRole).toJsonObject();
+        if (group.value("id").toString() != groupId || group.value("unread").toInt() == 0)
+            continue;
+        group["unread"] = 0;
+        item->setData(Qt::UserRole, group);
+        break;
+    }
 }
 void Window::refreshThemeIcons()
 {
@@ -1444,6 +1467,8 @@ void Window::connectService()
     ++groupsGeneration;
     clearConversation();
     unread.clear();
+    unreadMentions.clear();
+    updateUnreadTotal();
     groups->clear();
     ready = false;
     tunnel.stop();
@@ -1535,10 +1560,12 @@ void Window::loadGroups()
                       groups->clear();
                       QListWidgetItem *selected = nullptr;
                       QListWidgetItem *activated = nullptr;
+                      QSet<QString> accessibleGroups;
                       int normalOrder = 0;
                       for (const auto &entry : value.toArray())
                       {
                           auto obj = entry.toObject();
+                          accessibleGroups.insert(obj["id"].toString());
                           obj["_normalOrder"] = normalOrder++;
                           obj["unread"] = unread.value(obj["id"].toString());
                           auto *item = new QListWidgetItem(groups);
@@ -1551,6 +1578,15 @@ void Window::loadGroups()
                           if (obj["id"] == pendingActivatedGroup)
                               activated = item;
                       }
+                      for (auto it = unread.begin(); it != unread.end();)
+                          if (!accessibleGroups.contains(it.key()))
+                          {
+                              unreadMentions.remove(it.key());
+                              it = unread.erase(it);
+                          }
+                          else
+                              ++it;
+                      updateUnreadTotal();
                       sortGroups();
                       if (!previous.isEmpty() && !selected)
                           clearConversation();
@@ -1696,6 +1732,31 @@ void Window::activateConversation(const QString &id)
         loadGroups();
 }
 
+void Window::updateUnreadTotal()
+{
+    // The Dock badge mirrors what the group's notification level actually alerts on: an ignored
+    // conversation contributes nothing and a mentions-only conversation only contributes the
+    // unread messages that mentioned this account. unread itself keeps the plain new-message
+    // marker drawn in the conversation list, whatever the level.
+    int total = 0;
+    for (auto it = unread.cbegin(); it != unread.cend(); ++it)
+    {
+        const auto mentions = unreadMentions.value(it.key());
+        switch (chatPreferences.notificationMode(it.key()))
+        {
+        case ChatPreferences::NotificationMode::Ignore:
+            break;
+        case ChatPreferences::NotificationMode::MentionsOnly:
+            total += mentions;
+            break;
+        case ChatPreferences::NotificationMode::AllMessages:
+            total += it.value();
+            break;
+        }
+    }
+    emit unreadTotalChanged(total);
+}
+
 void Window::sortGroups()
 {
     QList<QListWidgetItem *> ordered;
@@ -1776,6 +1837,9 @@ QMenu *Window::groupContextMenuFor(const QString &id)
             if (scope != chatPreferences.scope())
                 return;
             chatPreferences.setNotificationMode(id, mode);
+            // The level also decides what the Dock badge counts, so the aggregate follows a change
+            // made after the messages arrived instead of staying stuck on the old level.
+            updateUnreadTotal();
             sortGroups();
         });
     };
@@ -1883,6 +1947,8 @@ void Window::selectGroup(const QString &id, const QString &name)
     findChild<QWidget *>("composeArea")->setEnabled(true);
     composer->setReadOnly(false);
     unread.remove(id);
+    unreadMentions.remove(id);
+    updateUnreadTotal();
     if (auto *item = groups->currentItem())
     {
         auto group = item->data(Qt::UserRole).toJsonObject();
@@ -2171,9 +2237,22 @@ void Window::handleEvent(const QJsonObject &event)
                                                                         : message["text"].toString());
                     obj["timestamp"] = message["timestamp"];
                 }
-                if (firstSeen && message["group"] != groupId && !message["outgoing"].toBool() &&
-                    message["status"] == "received")
-                    obj["unread"] = ++unread[message["group"].toString()];
+                // A message counts as unread unless the user is actually looking at it: the
+                // conversation has to be open *and* the window has to be active. Otherwise a
+                // message that lands in the open conversation while the app sits in the
+                // background would never reach the Dock badge.
+                if (firstSeen && message["status"] == "received" && !message["outgoing"].toBool() &&
+                    (message["group"] != groupId || !isActiveWindow()))
+                {
+                    const auto group = message["group"].toString();
+                    obj["unread"] = ++unread[group];
+                    // The Dock badge derives its total from this subset and the current level, so
+                    // the quieter levels can drop these messages and a later switch back to "all
+                    // messages" still restores them. The list marker above stays level-independent.
+                    if (ChatPreferences::mentionsSelf(message["mentions"].toArray(), selfMemberId))
+                        ++unreadMentions[group];
+                    updateUnreadTotal();
+                }
                 item->setData(Qt::UserRole, obj);
                 break;
             }

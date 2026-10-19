@@ -5,6 +5,7 @@
 #include <QList>
 #include <QMutex>
 #include <QMutexLocker>
+#include <QRandomGenerator>
 #import <UserNotifications/UserNotifications.h>
 #include <algorithm>
 #include <functional>
@@ -116,33 +117,58 @@ class MacNotificationBackend final : public SystemNotifier::Native
         const auto state = dispatch;
         [center getNotificationSettingsWithCompletionHandler:^(UNNotificationSettings *settings) {
           const auto status = settings.authorizationStatus;
+          const auto badge = settings.badgeSetting;
           state->invoke(
-              [status](SystemNotifier *owner)
+              [status, badge](SystemNotifier *owner)
               {
                   if (auto *backend = static_cast<MacNotificationBackend *>(owner->native.get()))
-                      backend->authorization(status);
+                      backend->authorization(status, badge);
               });
         }];
     }
 
-  private:
-    void authorization(UNAuthorizationStatus status)
+    void setBadge(int count) override
     {
-        if (status == UNAuthorizationStatusNotDetermined)
+        // Keep the unread label independent of banner delivery. The Dock also consults the
+        // registered application's notification settings when deciding whether to render it.
+        NSDockTile *tile = NSApp.dockTile;
+        if (!tile)
+            return;
+        tile.badgeLabel = count > 0 ? text(QString::number(count)) : nil;
+        [tile display];
+    }
+
+  private:
+    void authorization(UNAuthorizationStatus status, UNNotificationSetting badge)
+    {
+        const bool authorized = status == UNAuthorizationStatusAuthorized ||
+                                status == UNAuthorizationStatusProvisional;
+        // Older versions requested only alert/sound. An authorized application can therefore
+        // still have no Badge option in its notification settings. Request the missing
+        // option once per run, without overriding a badge the user explicitly disabled.
+        const bool missingBadge = authorized && badge == UNNotificationSettingNotSupported &&
+                                  !requestedBadgeAuthorization;
+        if (status == UNAuthorizationStatusNotDetermined || missingBadge)
         {
+            requestedBadgeAuthorization = true;
             const auto state = dispatch;
             // This is reached only by the first actual showMessage, never by construction/tests.
-            [center requestAuthorizationWithOptions:(UNAuthorizationOptionAlert | UNAuthorizationOptionSound)
+            [center requestAuthorizationWithOptions:(UNAuthorizationOptionAlert | UNAuthorizationOptionSound |
+                                                    UNAuthorizationOptionBadge)
                                   completionHandler:^(BOOL granted, NSError *error) {
                                     Q_UNUSED(error);
                                     state->invoke(
-                                        [granted](SystemNotifier *owner)
+                                        [granted, authorized](SystemNotifier *owner)
                                         {
                                             if (auto *backend = static_cast<MacNotificationBackend *>(
                                                     owner->native.get()))
                                             {
                                                 backend->checking = false;
+                                                // The unread count may have changed while the
+                                                // permission request was pending.
                                                 if (granted)
+                                                    backend->setBadge(owner->unreadTotal);
+                                                if (granted || authorized)
                                                     backend->deliverPending();
                                                 else
                                                     backend->pending.clear();
@@ -169,9 +195,15 @@ class MacNotificationBackend final : public SystemNotifier::Native
             content.sound = entry.sound ? UNNotificationSound.defaultSound : nil;
             content.threadIdentifier = text(entry.group);
             content.userInfo = @{@"group" : text(entry.group)};
+            // The identifier must be unique per message. Reusing one identifier per group makes
+            // macOS treat each new message as an update to an already-delivered notification, so it
+            // reorders the existing entry instead of alerting: no banner, no sound, one visible row.
+            // threadIdentifier keeps the per-group stack that identifier uniqueness would otherwise
+            // cost us, because macOS groups by thread rather than by identifier.
             const auto identifier =
                 "wechat-lite." +
-                QCryptographicHash::hash(entry.group.toUtf8(), QCryptographicHash::Sha256).toHex();
+                QCryptographicHash::hash(entry.group.toUtf8(), QCryptographicHash::Sha256).toHex() +
+                "." + QByteArray::number(sequence++);
             UNNotificationRequest *request =
                 [UNNotificationRequest requestWithIdentifier:text(QString::fromLatin1(identifier))
                                                      content:content
@@ -191,6 +223,12 @@ class MacNotificationBackend final : public SystemNotifier::Native
     __weak id<UNUserNotificationCenterDelegate> previous = nil;
     QList<Pending> pending;
     bool checking = false;
+    bool requestedBadgeAuthorization = false;
+    // Makes every delivered request identifier unique. Uniqueness is what forces a fresh alert,
+    // because macOS treats a repeat identifier as an update to an already-delivered notification
+    // and updates do not re-alert. Seeded randomly so a relaunch cannot collide with entries that
+    // an earlier run left visible in Notification Center.
+    quint64 sequence = QRandomGenerator::global()->generate64();
 };
 
 std::unique_ptr<SystemNotifier::Native> SystemNotifier::createNative(SystemNotifier *owner)
@@ -211,5 +249,29 @@ std::unique_ptr<SystemNotifier::Native> SystemNotifier::createNative(SystemNotif
 
 void SystemNotifier::previewSound()
 {
-    if (!disabled()) NSBeep();
+    // 试听 should sound like a real message. A real message uses UNNotificationSound.defaultSound,
+    // which resolves to the ToneLibrary "Note" tone rather than to anything under /System/Library/
+    // Sounds, so resolve that tone first and keep the generic alert and NSBeep only as fallbacks.
+    if (disabled())
+        return;
+    static NSSound *alert = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSBundle *tones = [NSBundle bundleWithIdentifier:@"com.apple.ToneLibrary"];
+        NSString *path = [tones pathForResource:@"Note" ofType:@"m4r"
+                                   inDirectory:@"AlertTones/Modern"];
+        if (!path)
+            path = @"/System/Library/PrivateFrameworks/ToneLibrary.framework/Versions/A/"
+                   @"Resources/AlertTones/Modern/Note.m4r";
+        alert = [[NSSound alloc] initWithContentsOfFile:path byReference:YES];
+        if (!alert)
+            alert = [NSSound soundNamed:@"Ping"];
+    });
+    if (alert)
+    {
+        [alert stop];
+        [alert play];
+    }
+    else
+        NSBeep();
 }
