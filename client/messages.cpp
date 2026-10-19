@@ -46,7 +46,7 @@ bool canRecallMessage(const QJsonObject &message, qint64 now)
     const bool retry = recall == "failed" && message["recall_retryable"].toBool();
     return message["outgoing"].toBool() && (status == "sent" || status == "received") &&
            !message["text"].toString().isEmpty() && message["media"].toArray().isEmpty() &&
-           message["quote"].toObject().isEmpty() &&
+           message["quote"].toObject().isEmpty() && !message["record"].isObject() &&
            !message["source_id"].toString().isEmpty() && !message["id"].toString().isEmpty() &&
            (recall.isEmpty() || retry) && age >= 0 && age < 180000;
 }
@@ -127,6 +127,7 @@ static QJsonObject redactedMessage(QJsonObject message)
         message["text"] = "";
         message["media"] = QJsonArray{};
         message.remove("quote");
+        message.remove("record");
         message.remove("mentions");
     }
     return message;
@@ -222,7 +223,8 @@ void MessageModel::replace(const QJsonArray &messages)
         row = preserveLocalMediaState(row, previous.value(row["group"].toString() + '\n' + row["id"].toString()));
         rows.append(normalize(row));
     }
-    std::stable_sort(rows.begin(), rows.end(), messageBefore);
+    if (!property("preserveOrder").toBool())
+        std::stable_sort(rows.begin(), rows.end(), messageBefore);
     while (rows.size() > 300)
         rows.removeFirst();
     endResetModel();
@@ -417,6 +419,7 @@ static QList<int> displaySourceOffsets(const QString &source)
 }
 int MessageDelegate::textHeight(const QJsonObject &message, int width, const QFont &font)
 {
+    if (message["record"].isObject()) return 0;
     if (message["text"].toString().isEmpty())
         return 0;
     QTextLayout layout(layoutString(message), wechatDisplayFont(font));
@@ -460,6 +463,7 @@ static QSize previewSize(const QJsonObject &media)
 static int bubbleWidth(const QJsonObject &message, int viewWidth, const QFont &font)
 {
     const int maximum = qMax(100, qMin(540, viewWidth - 150));
+    if (message["record"].isObject()) return qMin(286,maximum);
     int desired = 36;
     const QFontMetrics metrics(wechatDisplayFont(font));
     for (const auto &line : wechatDisplayText(message["text"].toString()).split('\n'))
@@ -470,6 +474,7 @@ static int bubbleWidth(const QJsonObject &message, int viewWidth, const QFont &f
 }
 static bool showTime(const QModelIndex &index)
 {
+    if (index.model()->property("readOnlyRecord").toBool()) return false;
     if (index.row() == 0)
         return true;
     auto message = index.data(Qt::UserRole).toJsonObject();
@@ -502,6 +507,7 @@ static QString statusLabel(const QJsonObject &message)
 struct MessageGeometry
 {
     QRect bubble, quote;
+    bool recordDetail = false;
     int timeHeight = 0, textHeight = 0, rowHeight = 0;
     QList<QRect> media;
 };
@@ -509,8 +515,9 @@ static MessageGeometry geometryFor(const QJsonObject &message, const QModelIndex
                                    const QFont &font)
 {
     MessageGeometry geometry;
+    geometry.recordDetail = index.model()->property("readOnlyRecord").toBool();
     const bool mine = message["outgoing"].toBool();
-    const int width = bubbleWidth(message, row.width(), font);
+    const int width = geometry.recordDetail ? qMax(100,row.width()-94) : bubbleWidth(message, row.width(), font);
     geometry.timeHeight = showTime(index) ? 30 : 0;
     if (message["status"] == "recalled")
     {
@@ -518,8 +525,8 @@ static MessageGeometry geometryFor(const QJsonObject &message, const QModelIndex
         return geometry;
     }
     geometry.textHeight = MessageDelegate::textHeight(message, width, font);
-    int height = geometry.textHeight;
-    const auto media = message["media"].toArray();
+    int height = message["record"].isObject() ? 132 : geometry.textHeight;
+    const auto media = message["record"].isObject() ? QJsonArray{} : message["media"].toArray();
     for (int i = 0; i < media.size(); ++i)
     {
         if (height)
@@ -786,11 +793,16 @@ void MessageDelegate::paint(QPainter *p, const QStyleOptionViewItem &option, con
     const bool mine = message["outgoing"].toBool();
     const auto geometry = geometryFor(message, index, option.rect, option.font);
     const auto bubble = geometry.bubble;
-    const auto media = message["media"].toArray();
+    const auto media = message["record"].isObject() ? QJsonArray{} : message["media"].toArray();
     p->save();
     p->setClipRect(option.rect);
     p->setRenderHint(QPainter::Antialiasing);
     p->setFont(option.font);
+    if (geometry.recordDetail)
+    {
+        p->setPen(themeColor("#e9e9eb", "#3a3c3e"));
+        p->drawLine(option.rect.left()+70,option.rect.bottom()-1,option.rect.right()-24,option.rect.bottom()-1);
+    }
     if (!property("locatedId").toString().isEmpty() &&
         property("locatedId").toString() == message["id"].toString())
         p->fillRect(option.rect, themeColor("#eaeaea", "#353a3e"));
@@ -821,28 +833,39 @@ void MessageDelegate::paint(QPainter *p, const QStyleOptionViewItem &option, con
         p->restore();
         return;
     }
-    QRect avatar(mine ? option.rect.right() - 59 : option.rect.left() + 20, bubble.top(), 36, 36);
+    QRect avatar(mine ? option.rect.right() - 59 : option.rect.left() + 20,
+                 geometry.recordDetail ? option.rect.top()+3 : bubble.top(),36,36);
     p->drawPixmap(avatar, chatAvatar(message, avatar.width()));
     if (!mine)
     {
         p->setFont(smallFont(option.font));
         p->setPen(themeColor("#9f9fa6", "#999ca3"));
-        p->drawText(QRect(bubble.left(), bubble.top() - 20, qMax(200, bubble.width()), 17),
-                    Qt::AlignLeft | Qt::AlignVCenter, message["sender"].toString());
+        auto header=QRect(bubble.left(),bubble.top()-20,qMax(200,bubble.width()),17);
+        if (geometry.recordDetail)
+        {
+            const auto time=QDateTime::fromMSecsSinceEpoch(message["timestamp"].toInteger()).toString("yyyy年M月d日 HH:mm");
+            p->drawText(header,Qt::AlignRight|Qt::AlignVCenter,time);
+            header.setWidth(qMax(0,header.width()-QFontMetrics(p->font()).horizontalAdvance(time)-12));
+        }
+        p->drawText(header,Qt::AlignLeft|Qt::AlignVCenter,
+                    QFontMetrics(p->font()).elidedText(message["sender"].toString(),Qt::ElideRight,header.width()));
     }
     const bool textOnly = media.isEmpty();
     if (geometry.textHeight)
     {
-        const auto background = mine ? themeColor("#9df29f", "#3c633c") : themeColor("#eeeef0", "#303234");
-        p->setPen(Qt::NoPen);
-        p->setBrush(background);
-        p->drawRoundedRect(QRect(bubble.left(), bubble.top(), bubble.width(), geometry.textHeight), 5, 5);
-        p->drawPolygon(mine ? QPolygon{{bubble.right() - 1, bubble.top() + 10},
+        if (!geometry.recordDetail)
+        {
+            const auto background = mine ? themeColor("#9df29f", "#3c633c") : themeColor("#eeeef0", "#303234");
+            p->setPen(Qt::NoPen);
+            p->setBrush(background);
+            p->drawRoundedRect(QRect(bubble.left(), bubble.top(), bubble.width(), geometry.textHeight), 5, 5);
+            p->drawPolygon(mine ? QPolygon{{bubble.right() - 1, bubble.top() + 10},
                                        {bubble.right() + 5, bubble.top() + 15},
                                        {bubble.right() - 1, bubble.top() + 20}}
                             : QPolygon{{bubble.left() + 1, bubble.top() + 10},
                                        {bubble.left() - 5, bubble.top() + 15},
                                        {bubble.left() + 1, bubble.top() + 20}});
+        }
         p->setFont(wechatDisplayFont(option.font));
         p->setPen(themeColor("#19191a", "#ededed"));
         QTextLayout text(layoutString(message), wechatDisplayFont(option.font));
@@ -859,11 +882,40 @@ void MessageDelegate::paint(QPainter *p, const QStyleOptionViewItem &option, con
         }
         text.draw(p, {qreal(bubble.left() + 10), qreal(bubble.top() + 10)}, selections);
     }
-    else if (textOnly)
+    else if (textOnly && !geometry.recordDetail)
     {
         p->setPen(Qt::NoPen);
         p->setBrush(mine ? themeColor("#9df29f", "#3c633c") : themeColor("#eeeef0", "#303234"));
         p->drawRoundedRect(bubble, 5, 5);
+    }
+    if (message["record"].isObject())
+    {
+        const auto record = message["record"].toObject();
+        p->setPen(themeColor("#19191a", "#ededed"));
+        p->setFont(option.font);
+        p->drawText(bubble.adjusted(12, 9, -12, -98), Qt::AlignVCenter,
+                    QFontMetrics(p->font()).elidedText(record["title"].toString("聊天记录"),Qt::ElideRight,bubble.width()-24));
+        p->setFont(smallFont(option.font));
+        p->setPen(themeColor("#9f9fa6", "#999ca3"));
+        const auto items = record["items"].toArray();
+        for (int i = 0; i < qMin(3,items.size()); ++i)
+        {
+            const auto item = items[i].toObject();
+            auto preview = item["text"].toString();
+            if (preview.isEmpty())
+            {
+                const auto indices=item["media"].toArray();
+                const auto attachments=message["media"].toArray();
+                const int position=indices.isEmpty() ? -1 : indices.first().toInt(-1);
+                const auto kind=position>=0 && position<attachments.size() ? attachments[position].toObject()["kind"].toString() : QString();
+                preview=kind=="image" || kind=="gif" ? "[图片]" : kind=="video" ? "[视频]" : kind=="voice" ? "[语音]" : "[文件]";
+            }
+            p->drawText(QRect(bubble.left()+12,bubble.top()+38+i*18,bubble.width()-24,18),Qt::AlignVCenter,
+                        QFontMetrics(p->font()).elidedText(item["sender"].toString()+"："+preview.simplified(),Qt::ElideRight,bubble.width()-24));
+        }
+        p->drawLine(bubble.left()+12,bubble.bottom()-29,bubble.right()-12,bubble.bottom()-29);
+        p->drawText(bubble.adjusted(12,104,-12,-5),Qt::AlignVCenter,
+                    record["pending"].toBool() ? "聊天记录 · 附件下载中" : "聊天记录 · 点击查看");
     }
     for (int i = 0; i < media.size(); ++i)
     {
@@ -1220,6 +1272,16 @@ void MessageView::wheelEvent(QWheelEvent *event)
 void MessageView::keyPressEvent(QKeyEvent *event)
 {
     stopScrollAnimation();
+    if (event->key() == Qt::Key_Return || event->key() == Qt::Key_Enter)
+    {
+        const auto message = currentIndex().data(Qt::UserRole).toJsonObject();
+        if (message["record"].isObject() && message["status"] != "recalled")
+        {
+            emit recordClicked(message);
+            event->accept();
+            return;
+        }
+    }
     if (event->matches(QKeySequence::Copy))
     {
         const auto text = selectedText();
@@ -1339,7 +1401,7 @@ void MessageView::updateVisibleGifs()
         if (!rect.intersects(bounds))
             continue;
         const auto message = index.data(Qt::UserRole).toJsonObject();
-        if (message["status"] == "recalled")
+        if (message["status"] == "recalled" || message["record"].isObject())
             continue;
         const auto media = message["media"].toArray();
         const auto geometry = geometryFor(message, index, rect, font());
@@ -1493,6 +1555,11 @@ void MessageView::mouseReleaseEvent(QMouseEvent *event)
             return;
         }
         const auto geometry = geometryFor(message, index, visualRect(index), font());
+        if (message["status"] != "recalled" && message["record"].isObject() && geometry.bubble.contains(event->pos()))
+        {
+            emit recordClicked(message);
+            return;
+        }
         auto media = message["media"].toArray();
         for (int i = 0; i < geometry.media.size(); ++i)
             if (geometry.media[i].translated(geometry.bubble.topLeft()).contains(event->pos()))
@@ -1739,6 +1806,8 @@ QMenu *MessageView::contextMenuFor(const QModelIndex &index, bool avatar, int me
     if (message["status"] == "recalled")
         return nullptr;
     auto *menu = new ChatContextMenu(this);
+    if (message["record"].isObject() && !avatar)
+        menu->addAction("打开聊天记录",this,[this,message]{emit recordClicked(message);});
     if (avatar)
     {
         if (!message["sender_id"].toString().isEmpty())
@@ -1775,9 +1844,12 @@ QMenu *MessageView::contextMenuFor(const QModelIndex &index, bool avatar, int me
         copy->setProperty("chatIcon", "copy");
         const auto allowed = property("canDownload");
         copy->setEnabled(!resource || !allowed.isValid() || allowed.toBool());
-        auto *quote = menu->addAction("引用", this, [this, message] { emit quoteRequested(message); });
-        quote->setObjectName("quoteMessage");
-        quote->setProperty("chatIcon", "quote");
+        if (!property("readOnlyRecord").toBool() && !message["record"].isObject())
+        {
+            auto *quote = menu->addAction("引用", this, [this, message] { emit quoteRequested(message); });
+            quote->setObjectName("quoteMessage");
+            quote->setProperty("chatIcon", "quote");
+        }
     }
     if (resource)
         return menu;

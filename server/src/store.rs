@@ -603,6 +603,52 @@ impl Store {
         Ok(Some(event))
     }
 
+    pub fn enrich_native_record(
+        &self,
+        incoming: &ChatMessage,
+        historical: bool,
+    ) -> Result<Option<Value>> {
+        let mut conn = self.db.lock().unwrap();
+        let tx = conn.transaction()?;
+        let body: String = tx.query_row(
+            "SELECT body FROM messages WHERE id=?1",
+            [&incoming.id],
+            |r| r.get(0),
+        )?;
+        let mut message: ChatMessage = serde_json::from_str(&body)?;
+        if message.status == "recalled"
+            || !message.client_id.is_empty()
+            || !message.recall_status.is_empty()
+            || message.group != incoming.group
+            || message.source_id != incoming.source_id
+            || incoming.record.is_none()
+        {
+            return Ok(None);
+        }
+        if message.record == incoming.record
+            && serde_json::to_value(&message.media)? == serde_json::to_value(&incoming.media)?
+        {
+            return Ok(None);
+        }
+        message.record = incoming.record.clone();
+        message.media = incoming.media.clone();
+        message.text = incoming.text.clone();
+        tx.execute(
+            "UPDATE messages SET body=?1 WHERE id=?2",
+            params![serde_json::to_string(&message)?, message.id],
+        )?;
+        let mut event = Self::append_event(&tx, &message, false)?;
+        if historical {
+            event["historical"] = json!(true);
+            tx.execute(
+                "UPDATE events SET body=?1 WHERE seq=?2",
+                params![event.to_string(), event["seq"].as_i64().unwrap()],
+            )?;
+        }
+        tx.commit()?;
+        Ok(Some(event))
+    }
+
     pub fn update_message(&self, message: &ChatMessage) -> Result<Value> {
         let mut conn = self.db.lock().unwrap();
         let tx = conn.transaction()?;
@@ -737,6 +783,22 @@ impl Store {
         Ok((message, Some(event)))
     }
 
+    pub fn legacy_record_sources(&self) -> Result<Vec<(String, String)>> {
+        let conn = self.db.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT group_id,source_id FROM messages WHERE source_id LIKE 'wx:%'
+             AND status='received' AND coalesce(json_extract(body,'$.client_id'),'')=''
+             AND coalesce(json_extract(body,'$.recall_status'),'')=''
+             AND ((coalesce(json_type(body,'$.record'),'null')='null'
+             AND instr(json_extract(body,'$.text'),'favorite_record__w_unsupport')>0)
+             OR EXISTS(SELECT 1 FROM json_each(body,'$.record.items') AS item
+             WHERE json_extract(item.value,'$.text') LIKE '% · 暂时无法读取'
+             AND coalesce(json_array_length(item.value,'$.media'),0)=0)) ORDER BY seq",
+        )?;
+        Ok(stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     pub fn pending_recalls(&self) -> Result<Vec<ChatMessage>> {
         let conn = self.db.lock().unwrap();
         let mut stmt=conn.prepare("SELECT body FROM messages WHERE json_extract(body,'$.recall_status')='pending' ORDER BY seq LIMIT 100")?;
@@ -776,6 +838,7 @@ impl Store {
             message.status = "recalled".into();
             message.text.clear();
             message.media.clear();
+            message.record = None;
             message.mentions.clear();
             message.quote = None;
             message.recall_status.clear();
@@ -1218,6 +1281,24 @@ mod tests {
     fn message(id: &str) -> ChatMessage {
         serde_json::from_value(json!({"id":id,"group":"g","sender":"小林","text":"你好","timestamp":0,"status":"queued"})).unwrap()
     }
+    #[test]
+    fn record_upgrade_candidates_include_failed_attachments_and_exclude_protected_messages() {
+        let temp=tempfile::tempdir().unwrap();
+        let store=Store::open(&temp.path().join("records.sqlite")).unwrap();
+        for (index,id) in ["legacy","failed-media","complete","withdrawn","client-owned","recalling"].iter().enumerate() {
+            let mut row=message(id);row.status="received".into();row.source_id=format!("wx:g:fixture:{index}:{index}");
+            row.text="title\nhttps://support.weixin.qq.com/favorite_record__w_unsupport".into();
+            if *id=="failed-media" || *id=="complete" {
+                row.record=Some(serde_json::from_value(json!({"title":"record","pending":false,"items":[{"id":"one","sender":"A","text":if *id=="failed-media" {"[图片] 图片 · 暂时无法读取"} else {"hello"},"timestamp":1,"media":[]}]})).unwrap());
+            }
+            if *id=="withdrawn" {row.status="recalled".into();}
+            if *id=="client-owned" {row.client_id="client".into();}
+            if *id=="recalling" {row.recall_status="pending".into();}
+            store.insert_message(&mut row).unwrap();
+        }
+        assert_eq!(store.legacy_record_sources().unwrap(),vec![("g".into(),"wx:g:fixture:0:0".into()),("g".into(),"wx:g:fixture:1:1".into())]);
+    }
+
     #[test]
     fn native_quote_placeholder_repair_requires_exact_proof_and_preserves_existing_and_redacted_links()
      {

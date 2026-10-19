@@ -112,6 +112,7 @@ class MessageView : public StableListView
     bool recallSupported() const { return recallAvailable; }
   signals:
     void mediaClicked(const QJsonObject &media, bool saveOnly);
+    void recordClicked(const QJsonObject &message);
     void mediaCopyRequested(const QJsonObject &media);
     void mentionRequested(const QJsonObject &member);
     void quoteRequested(const QJsonObject &message);

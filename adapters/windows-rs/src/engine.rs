@@ -129,9 +129,13 @@ pub trait Backend {
     fn reload(&mut self, group: &str, locator: &Value) -> Result<Value>;
     fn signatures(&mut self) -> Result<Value>;
     fn authorize(&mut self, groups: &BTreeSet<String>) -> Result<()>;
+    fn select_downloads(&mut self, groups: &BTreeSet<String>) -> Result<()>;
     fn convert(&mut self, group: &str, row: &Value) -> Result<Option<Value>>;
     fn is_quote(&mut self, _group: &str, row: &Value) -> bool {
         crate::quotes::reference(text(row, "content")).is_some()
+    }
+    fn is_record(&mut self, _group: &str, row: &Value) -> bool {
+        crate::records::is_record(text(row, "content"))
     }
     fn prepare_media(&mut self, data: &Path, id: &str, index: usize, media: &Value)
     -> Result<Step>;
@@ -325,14 +329,24 @@ fn initialize<A: Backend>(
 }
 
 fn backfill<A: Backend>(access: &mut A, store: &Receipts, group: &str) -> Result<()> {
-    let key = format!("history_loaded:{group}");
+    let key = format!("history_loaded_records_v1:{group}");
     if store.state(&key)? == Some(json!(true)) {
         return Ok(());
     }
     let rows = access.recent(group, 40)?;
     let tx = store.db.unchecked_transaction()?;
     for row in rows.iter().rev() {
-        if journal(store, group, row)? {
+        let mut added = journal(store, group, row)?;
+        if !added
+            && access.is_record(group, row)
+            && !store.contains("echoes", "key", &source(group, row)?)?
+        {
+            added = store.db.execute(
+                "INSERT OR IGNORE INTO pending(source,group_id,locator) VALUES(?,?,?)",
+                params![source(group, row)?, group, position(row)?.to_string()],
+            )? > 0;
+        }
+        if added {
             // A warm history read is not a live arrival, even if media becomes ready later.
             // An existing pending row may already belong to the live watcher; preserve its origin.
             let mut locator = position(row)?;
@@ -423,6 +437,14 @@ fn history_page<A: Backend>(
         }
         sources.push(key.clone());
         journal(store, group, row)?;
+        let record = access.is_record(group, row);
+        if record {
+            // Legacy delivered cards also need a durable retry when this page exceeds the media budget.
+            store.db.execute(
+                "INSERT OR IGNORE INTO pending(source,group_id,locator) VALUES(?,?,?)",
+                params![key, group, position(row)?.to_string()],
+            )?;
+        }
         use rusqlite::OptionalExtension;
         let previous: Option<String> = store
             .db
@@ -449,15 +471,18 @@ fn history_page<A: Backend>(
         // Received quote metadata can be repaired after an adapter upgrade even when its reply was delivered.
         let plain = text(row, "type") == "文本" || access.is_quote(group, row);
         if !plain {
-            if media_budget == 0 || store.contains("delivered", "source", &key)? {
+            if media_budget == 0 || (!record && store.contains("delivered", "source", &key)?) {
                 continue;
             }
             media_budget -= 1;
         }
         let delay = match access.convert(group, row) {
             Ok(Some(message)) => {
+                let waiting = (message["record"]["pending"] == true).then(|| {
+                    anyhow::Error::new(crate::media::MediaPending("聊天记录附件下载中".into()))
+                });
                 events.push(json!({"type":"message","historical":true,"message":message}));
-                media_retry_delay(&mut locator, now, None)
+                media_retry_delay(&mut locator, now, waiting.as_ref())
             }
             Ok(None) => {
                 sources.pop();
@@ -923,6 +948,7 @@ impl<A: Backend> Engine<A> {
         let store = Receipts::open(&directory.join("receipts.sqlite"))?;
         let catalog = access.catalog()?;
         let selected = selection(policy, &catalog)?;
+        access.select_downloads(&selected)?;
         let result = initialize(&mut access, &store, &selected);
         access.release();
         result?;
@@ -971,6 +997,7 @@ impl<A: Backend> Engine<A> {
         let changed = selected != self.watched;
         self.watched.retain(|g| selected.contains(g));
         self.active.retain(|g| selected.contains(g));
+        self.access.select_downloads(&selected)?;
         self.access.authorize(&self.active)?;
         let mut index = 0;
         while index < self.jobs.len() {
@@ -1039,6 +1066,20 @@ impl<A: Backend> Engine<A> {
                         events,
                         self.jobs.first(),
                     )
+                })(),
+                "record_refresh" => (|| {
+                    let group = text(command, "group");
+                    let key = text(command, "source_id");
+                    ensure!(self.watched.contains(group), "该群未获准读取聊天记录");
+                    ensure!(key.len() <= 1024, "聊天记录来源无效");
+                    let mut locator = history_position(group, key)?.context("聊天记录缺少来源")?;
+                    locator["historical"] = json!(true);
+                    locator["_record_refresh"] = json!(true);
+                    self.store.db.execute(
+                        "INSERT OR IGNORE INTO pending(source,group_id,locator) VALUES(?,?,?)",
+                        params![key, group, locator.to_string()],
+                    )?;
+                    Ok(())
                 })(),
                 "quote_refresh" => (|| {
                     ensure!(
@@ -1252,16 +1293,26 @@ impl<A: Backend> Engine<A> {
                     continue;
                 }
                 let mut retry_locator = None;
+                let mut waiting = None;
                 let result: Result<bool> = (|| {
                     retry_locator = Some(serde_json::from_str::<Value>(&raw_locator)?);
                     let locator = retry_locator.as_ref().context("消息定位缺失")?;
                     let row = self.access.reload(&group, &locator)?;
+                    if locator["_record_refresh"] == true && !self.access.is_record(&group, &row) {
+                        self.store.db.execute("DELETE FROM pending WHERE source=?", [&key])?;
+                        return Ok(true);
+                    }
                     if let Some(job) = self.jobs.first() {
                         if job.defers(&mut self.access, &self.store, &group, &row)? {
                             return Ok(false);
                         }
                     }
                     if let Some(message) = self.access.convert(&group, &row)? {
+                        waiting = (message["record"]["pending"] == true).then(|| {
+                            anyhow::Error::new(crate::media::MediaPending(
+                                "聊天记录附件下载中".into(),
+                            ))
+                        });
                         events.push(json!({"type":"message","historical":locator["historical"]==true,"message":message}));
                     } else {
                         self.store
@@ -1272,9 +1323,9 @@ impl<A: Backend> Engine<A> {
                 })();
                 let delay = match result {
                     Ok(false) => 2.0,
-                    Ok(true) => retry_locator
-                        .as_mut()
-                        .map_or(30.0, |locator| media_retry_delay(locator, now, None)),
+                    Ok(true) => retry_locator.as_mut().map_or(30.0, |locator| {
+                        media_retry_delay(locator, now, waiting.as_ref())
+                    }),
                     Err(error) => {
                         if self.warned.insert(key.clone()) {
                             events.push(json!({"type":"warning","group":group,"text":format!("微信附件暂未就绪，将保留并重试：{error}")}));
@@ -1300,6 +1351,7 @@ impl<A: Backend> Engine<A> {
         Ok(())
     }
     pub fn shutdown(&mut self) -> Result<()> {
+        self.access.select_downloads(&BTreeSet::new())?;
         self.access.authorize(&BTreeSet::new())?;
         self.access.release();
         Ok(())

@@ -135,6 +135,7 @@ impl Local {
 impl Drop for Local {
     fn drop(&mut self) {
         let _ = self.native.restrict(&[]);
+        let _ = self.media.select(&BTreeSet::new());
         self.db.release();
     }
 }
@@ -198,7 +199,7 @@ impl Backend for Local {
                 .as_array()
                 .context("微信原生组件未提供功能列表")?;
             ensure!(
-                ["text", "mentions", "image", "gif", "file", "video_download"]
+                ["text", "mentions", "image", "gif", "file"]
                     .iter()
                     .all(|cap| capabilities.iter().any(|value| value == cap)),
                 "本机微信组件功能不完整"
@@ -217,9 +218,16 @@ impl Backend for Local {
         self.allowed = groups.clone();
         Ok(())
     }
+    fn select_downloads(&mut self, groups: &BTreeSet<String>) -> Result<()> {
+        self.media.select(groups)
+    }
     fn is_quote(&mut self, group: &str, row: &Value) -> bool {
         self.identity(group, row)
             .is_ok_and(|(content, _)| crate::quotes::reference(&content).is_some())
+    }
+    fn is_record(&mut self, group: &str, row: &Value) -> bool {
+        self.identity(group, row)
+            .is_ok_and(|(content, _)| crate::records::is_record(&content))
     }
     fn convert(&mut self, group: &str, row: &Value) -> Result<Option<Value>> {
         if system_message(row) {
@@ -256,23 +264,17 @@ impl Backend for Local {
             _ => None,
         };
         if let Some(kind) = media_kind {
-            media.push(self.media.inbound(
-                &mut self.db,
-                Some(&mut self.native),
-                group,
-                &message_row,
-                kind,
-            )?);
+            media.push(
+                self.media
+                    .inbound(&mut self.db, group, &message_row, kind)?,
+            );
         } else if kind != "文本" {
             let app_type = xml_text(&content, "type");
             if app_type == "6" || app_type == "74" {
-                media.push(self.media.inbound(
-                    &mut self.db,
-                    Some(&mut self.native),
-                    group,
-                    &message_row,
-                    "file",
-                )?);
+                media.push(
+                    self.media
+                        .inbound(&mut self.db, group, &message_row, "file")?,
+                );
             } else {
                 let mut pieces = vec![];
                 for tag in ["title", "des", "url"] {
@@ -312,6 +314,19 @@ impl Backend for Local {
         let timestamp = timestamp(&row["create_time"])?;
         let source_id = source(group, row)?;
         let mut message = json!({"id":Uuid::new_v5(&Uuid::NAMESPACE_URL,source_id.as_bytes()).to_string(),"group":group,"sender":name,"sender_id":actor,"avatar":self.avatar(&actor),"text":body,"media":media,"mentions":mentions,"timestamp":timestamp,"status":"received","source_id":source_id,"outgoing":if actor.is_empty(){row["sender_id"]==2}else{actor==self.db.wxid}});
+        if crate::records::is_record(&content) {
+            match crate::records::parse(&content, &source_id, timestamp, |key, resource| {
+                self.media.record_attachment(group, key, resource)
+            }) {
+                Ok((record, attachments)) => {
+                    message["record"] = record;
+                    message["media"] = json!(attachments);
+                }
+                Err(_) => {
+                    message["record"] = json!({"title":xml_text(&content,"title"),"items":[{"id":"unavailable","sender":"","timestamp":timestamp,"text":"这条聊天记录暂时无法解析，请在原版微信查看","media":[]}],"pending":false});
+                }
+            }
+        }
         if let Some(reference) = crate::quotes::reference(&content) {
             message["text"] = json!(xml_text(&content, "title"));
             let source_row = self.referenced_original(group, &reference)?;

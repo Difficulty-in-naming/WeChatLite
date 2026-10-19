@@ -33,6 +33,10 @@ Copy-Item -LiteralPath $actionsBinary -Destination (Join-Path $adapterVendor 'We
 [IO.File]::WriteAllText((Join-Path $adapterVendor 'WeChatActions.sha256'), "$actionsHash`n", [Text.UTF8Encoding]::new($false))
 Copy-Item -LiteralPath $quoteBinary -Destination (Join-Path $adapterVendor 'WeChatQuote.dll') -Force
 [IO.File]::WriteAllText((Join-Path $adapterVendor 'WeChatQuote.sha256'), "$quoteHash`n", [Text.UTF8Encoding]::new($false))
+$mediaBinary = Join-Path $workspace 'build\native\Release\WeChatMedia.dll'
+$mediaHash = (Get-FileHash -LiteralPath $mediaBinary -Algorithm SHA256).Hash.ToLowerInvariant()
+Copy-Item -LiteralPath $mediaBinary -Destination (Join-Path $adapterVendor 'WeChatMedia.dll') -Force
+[IO.File]::WriteAllText((Join-Path $adapterVendor 'WeChatMedia.sha256'), "$mediaHash`n", [Text.UTF8Encoding]::new($false))
 
 # Cargo media fixtures locate these standalone runtime files next to the test executable.
 $testRuntime = Join-Path $workspace 'target\debug\deps'

@@ -140,7 +140,10 @@ impl NativeClient {
             ensure!(
                 key == "self_wxid"
                     || (key == "capability"
-                        && matches!(value.as_str(), Some("recall" | "quote_text"))),
+                        && matches!(
+                            value.as_str(),
+                            Some("recall" | "quote_text" | "media_download")
+                        )),
                 "本机组件额外配置字段无效"
             );
             config[key] = value.clone();
@@ -379,30 +382,6 @@ impl NativeClient {
             "/SendMediaMsg",
             Some(&json!({"wxidorgid":group,"path":native_path(&path)?,
             "kind":kind,"request_id":request_id(key)})),
-        )
-    }
-
-    pub fn download_video(
-        &self,
-        group: &str,
-        file_id: &str,
-        aes_key: &str,
-        length: u64,
-        key: &str,
-    ) -> Result<Value> {
-        self.check_send(group, key)?;
-        ensure!(
-            !file_id.is_empty()
-                && file_id.len() <= 16384
-                && !aes_key.is_empty()
-                && aes_key.len() <= 256
-                && (1..=MAX_MEDIA).contains(&length),
-            "微信视频下载参数无效"
-        );
-        self.request(
-            "/DownloadVideo",
-            Some(&json!({"group":group,"file_id":file_id,"aes_key":aes_key,
-            "length":length,"request_id":request_id(key)})),
         )
     }
 

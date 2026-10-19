@@ -1,11 +1,17 @@
-This directory builds two independent modules for the version-verified Windows
+This directory builds three independent modules for the version-verified Windows
 bridge: `WeChatActions.dll` retains legacy observation/status diagnostics but
 unconditionally disables its undocumented recall queue; `WeChatQuote.dll` creates a native type-57 text reference using verified
-same-group database fields. Quote installs no observation hooks. Neither module
+same-group database fields. `WeChatMedia.dll` submits CDN downloads and observes only its own download completion receipts. Quote installs no observation hooks. None of these modules
 loads itself into any process; the Rust adapter performs WeChat version/hash
 checks and explicit loading. The external `nen/work/WeChat-Hook` checkout is
 unchanged. Each Actions and Quote build has its own pinned binary fingerprint;
-packages and the Rust loader must use the matching fingerprint files.
+packages and the Rust loader must use the matching fingerprint files. Media is embedded in the adapter with its own SHA-256 pin.
+
+Media downloads use `POST /DownloadMedia` on a private bearer-authenticated loopback listener. Each request supplies an allowlisted `group`, stable 64-hex `request_id`, `kind`, opaque hexadecimal `file_id`, 32-hex `aes_key` and `length` (1 byte to 512 MiB). Requests are bound to a fingerprint of all inputs, write only a hash-named private `.part` file and return `downloading`, `complete` or `failed`. Completed receipts also bind the request ID to the actual CDN `size` and `md5`. No message is sent by this module. Group grants are reread for every request.
+
+The request mappings are original image=1, mid image=2, standard video=4, attachment=5 and a legacy original-video attempt=6; opaque `7f0c` resources override these with BigFile type 7. Successful real transfers exercised image type 1, standard-video type 4 and BigFile type 7. No successful legacy type-6 original-video transfer is claimed. The native completion interface at `Weixin.dll+0x3790AC0` is observed without changing its inputs, result or original handler. Only already-registered request IDs are retained. Completion state/error are at `+0/+4`, actual size at `+0x88` and server MD5 at `+0xF0`. These offsets were verified against real successful and failed downloads and the exact 4.1.15.13 binary. Unknown hook chains are rejected; restart WeChat normally when upgrading this native module. An already-loaded identical build can reconnect without a restart.
+
+The adapter checks image/file checksums against their original metadata. A transcoded standard video may use the actual successful CDN receipt instead of stale XML metadata, with its bytes checked against that receipt and a private resource-bound receipt retained for cache reuse. Original-video failures never turn an incomplete file into a success. See `docs/BACKGROUND_MEDIA.md` for evidence and limitations.
 
 Build and offline verification, from the workspace root:
 
@@ -21,9 +27,9 @@ Equivalent commands:
 .tools/Scripts/ctest.exe --test-dir build/native -C Release --output-on-failure
 ```
 
-Outputs are `build/native/Release/WeChatActions.dll`, `WeChatQuote.dll`,
-`ActionsSelftest.exe` and `QuoteSelftest.exe`. CTest runs `actions-offline` and
-`quote-offline` as two executables; their internal assertions are not counted as
+Outputs are `build/native/Release/WeChatActions.dll`, `WeChatQuote.dll`, `WeChatMedia.dll`,
+`ActionsSelftest.exe`, `QuoteSelftest.exe` and `MediaSelftest.exe`. CTest runs `actions-offline`,
+`quote-offline` and `media-download-offline` as three executables; their internal assertions are not counted as
 extra functional cases. Both self-tests have assertions explicitly enabled even in Release, and a
 preprocessor error prevents accidentally compiling it with `NDEBUG`. The test
 uses synthetic in-memory records, a temporary config and stub record copies.

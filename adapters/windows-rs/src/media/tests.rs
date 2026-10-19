@@ -10,6 +10,158 @@ fn sample_png() -> Vec<u8> {
         .unwrap();
     out.into_inner()
 }
+
+#[test]
+fn reencoded_record_images_require_the_complete_same_request_cdn_receipt() {
+    let temp=tempfile::tempdir().unwrap();
+    let bytes=sample_png();let path=temp.path().join("download.part");fs::write(&path,&bytes).unwrap();
+    let mut resource=DownloadResource {kind:"image",file_id:"a".repeat(194),aes:"b".repeat(32),length:99,md5:"c".repeat(32)};
+    let id=download_id("g","record-image",&resource);
+    let receipt=json!({"ret":0,"status":"complete","request_id":id,"path":path,"size":bytes.len(),"md5":picture::md5(&bytes)});
+    assert!(completed_download(&receipt,temp.path(),&path,&id,&resource,false).is_err());
+    assert_eq!(fs::read(completed_download(&receipt,temp.path(),&path,&id,&resource,true).unwrap().unwrap()).unwrap(),bytes);
+    for (field,value) in [("ret",json!(-1)),("request_id",json!("unrelated")),("md5",json!("d".repeat(32))),("size",json!(bytes.len()+1)),("path",json!(temp.path().join("other.part")))] {
+        let mut bad=receipt.clone();bad[field]=value;
+        assert!(completed_download(&bad,temp.path(),&path,&id,&resource,true).is_err());
+    }
+    let mut unfinished=receipt.clone();unfinished["status"]=json!("downloading");
+    assert!(completed_download(&unfinished,temp.path(),&path,&id,&resource,true).unwrap().is_none());
+    resource.kind="file";
+    assert!(completed_download(&receipt,temp.path(),&path,&id,&resource,true).is_err());
+    resource.kind="image";fs::write(&path,b"tampered").unwrap();
+    assert!(completed_download(&receipt,temp.path(),&path,&id,&resource,true).is_err());
+}
+
+#[test]
+fn record_attachment_cache_is_bound_to_resource_and_detects_modified_bytes() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut media = Media::new(temp.path().join("adapter"));
+    let bytes = sample_png();
+    let mut item = crate::records::Attachment {
+        kind: "image",
+        file_id: "a".repeat(194),
+        aes: "b".repeat(32),
+        length: bytes.len() as u64,
+        md5: picture::md5(&bytes),
+        name: "photo.png".into(),
+    };
+    let resource = DownloadResource {
+        kind: "image",
+        file_id: item.file_id.clone(),
+        aes: item.aes.clone(),
+        length: item.length,
+        md5: item.md5.clone(),
+    };
+    let folder = media.directory.join("feishu/media/wechat-download");
+    fs::create_dir_all(&folder).unwrap();
+    let partial = folder.join(format!("{}.part", download_id("g", "record-1", &resource)));
+    fs::write(&partial, &bytes).unwrap();
+    let first = media.record_attachment("g", "record-1", &item).unwrap();
+    fs::remove_file(&partial).unwrap();
+    assert_eq!(
+        media.record_attachment("g", "record-1", &item).unwrap(),
+        first
+    );
+    item.file_id = "c".repeat(194);
+    assert!(media.record_attachment("g", "record-1", &item).is_err());
+    item.file_id = resource.file_id;
+    fs::write(first["path"].as_str().unwrap(), b"modified").unwrap();
+    assert!(media.record_attachment("g", "record-1", &item).is_err());
+}
+
+#[test]
+fn inbound_downloaded_originals_do_not_require_a_wechat_cache_or_image_key() {
+    let root = tempfile::tempdir().unwrap();
+    let mut db = Db::media_fixture(
+        root.path().join("account"),
+        "wxid_offline",
+        None,
+        Default::default(),
+    );
+    let group = "123456@chatroom";
+    let mut media = Media::new(root.path().join("adapter"));
+    for (kind, bytes) in [
+        ("image", sample_png()),
+        ("file", b"complete software attachment fixture".to_vec()),
+    ] {
+        let digest = picture::md5(&bytes);
+        let resource = DownloadResource {
+            kind,
+            file_id: "a".repeat(194),
+            aes: "b".repeat(32),
+            length: bytes.len() as u64,
+            md5: digest.clone(),
+        };
+        let xml = if kind == "image" {
+            format!(
+                "<msg><img cdnbigimgurl='{}' aeskey='{}' hdlength='{}' md5='{digest}'/></msg>",
+                resource.file_id,
+                resource.aes,
+                bytes.len()
+            )
+        } else {
+            format!(
+                "<msg><appmsg><type>6</type><title>software.exe</title><md5>{digest}</md5><appattach><totallen>{}</totallen><cdnattachurl>{}</cdnattachurl><aeskey>{}</aeskey></appattach></appmsg></msg>",
+                bytes.len(),
+                resource.file_id,
+                resource.aes
+            )
+        };
+        let row =
+            json!({"local_id":1,"sort_seq":1,"shard":"offline","packed_info":[],"content":xml});
+        let key = message_key(group, &row);
+        let folder = media.directory.join("feishu/media/wechat-download");
+        fs::create_dir_all(&folder).unwrap();
+        fs::write(
+            folder.join(format!("{}.part", download_id(group, &key, &resource))),
+            &bytes,
+        )
+        .unwrap();
+        let actual = media.inbound(&mut db, group, &row, kind).unwrap();
+        assert_eq!(fs::read(actual["path"].as_str().unwrap()).unwrap(), bytes);
+        assert!(media.image_key.is_none() && !media.downloads.is_alive());
+    }
+}
+
+#[test]
+fn transcoded_video_cache_requires_the_same_download_and_a_matching_cdn_checksum() {
+    let root = tempfile::tempdir().unwrap();
+    let group = "123456@chatroom";
+    let bytes = b"verified CDN transcoded video bytes";
+    let resource = DownloadResource {
+        kind: "video",
+        file_id: "a".repeat(194),
+        aes: "b".repeat(32),
+        length: 520420,
+        md5: "c".repeat(32),
+    };
+    let path = root.path().join("video.mp4");
+    let receipt = root.path().join("video-receipt.json");
+    fs::write(&path, bytes).unwrap();
+    atomic_write(&receipt,&serde_json::to_vec(&json!({"request_id":download_id(group,"video-key",&resource),"size":bytes.len(),"md5":picture::md5(bytes)})).unwrap()).unwrap();
+    assert!(cached_video_receipt(
+        &path,
+        &receipt,
+        group,
+        "video-key",
+        std::slice::from_ref(&resource)
+    ));
+    assert!(!cached_video_receipt(
+        &path,
+        &receipt,
+        group,
+        "different-message",
+        std::slice::from_ref(&resource)
+    ));
+    fs::write(&path, b"corrupt").unwrap();
+    assert!(!cached_video_receipt(
+        &path,
+        &receipt,
+        group,
+        "video-key",
+        &[resource]
+    ));
+}
 fn store(root: &Path, name: &str, kind: &str, data: &[u8]) -> Value {
     fs::create_dir_all(root.join("media")).unwrap();
     let path = root.join("media").join(name);
@@ -221,7 +373,7 @@ fn inbound_local_picture_file_video_and_emoji_keep_verified_originals() {
     let encrypted: Vec<_> = original.iter().map(|byte| byte ^ 0x88).collect();
     fs::write(folder.join(format!("{digest}.dat")), encrypted).unwrap();
     let row = json!({"local_id":1,"sort_seq":1,"shard":"offline","packed_info":digest.as_bytes(),"content":""});
-    let result = media.inbound(&mut db, None, group, &row, "image").unwrap();
+    let result = media.inbound(&mut db, group, &row, "image").unwrap();
     assert_eq!(result["kind"], "image");
     assert_eq!(
         fs::read(result["path"].as_str().unwrap()).unwrap(),
@@ -232,7 +384,7 @@ fn inbound_local_picture_file_video_and_emoji_keep_verified_originals() {
     let file = b"verified original attachment";
     fs::write(file_root.join("renamed.bin"), file).unwrap();
     let row = json!({"local_id":2,"sort_seq":2,"shard":"offline","content":format!("<msg><appmsg><type>74</type><title>original.bin</title><appattach><totallen>{}</totallen><md5>{}</md5></appattach></appmsg></msg>",file.len(),picture::md5(file))});
-    let result = media.inbound(&mut db, None, group, &row, "file").unwrap();
+    let result = media.inbound(&mut db, group, &row, "file").unwrap();
     assert_eq!(result["name"], "original.bin");
     assert_eq!(fs::read(result["path"].as_str().unwrap()).unwrap(), file);
     let video = b"\0\0\0\x20ftypisomoffline_video_fixture";
@@ -240,7 +392,7 @@ fn inbound_local_picture_file_video_and_emoji_keep_verified_originals() {
     fs::create_dir_all(&video_root).unwrap();
     fs::write(video_root.join("cached.mp4"), video).unwrap();
     let row = json!({"local_id":3,"sort_seq":3,"shard":"offline","content":format!("<msg><videomsg length='{}' md5='{}'/></msg>",video.len(),picture::md5(video))});
-    let result = media.inbound(&mut db, None, group, &row, "video").unwrap();
+    let result = media.inbound(&mut db, group, &row, "video").unwrap();
     assert_eq!(result["kind"], "video");
     assert_eq!(fs::read(result["path"].as_str().unwrap()).unwrap(), video);
     let gif = gif(16);
@@ -249,7 +401,7 @@ fn inbound_local_picture_file_video_and_emoji_keep_verified_originals() {
     fs::create_dir_all(&emoji_root).unwrap();
     fs::write(emoji_root.join(format!("{digest}.gif")), &gif).unwrap();
     let row = json!({"local_id":4,"sort_seq":4,"shard":"offline","content":format!("<msg><emoji md5='{digest}' len='{}'/></msg>",gif.len())});
-    let result = media.inbound(&mut db, None, group, &row, "gif").unwrap();
+    let result = media.inbound(&mut db, group, &row, "gif").unwrap();
     assert_eq!(result["kind"], "gif");
     assert_eq!(fs::read(result["path"].as_str().unwrap()).unwrap(), gif);
 }
@@ -268,7 +420,7 @@ fn completed_video_partial_and_destination_skip_archive_but_still_verify_content
     }
     fs::write(video_root.join("cached.mp4"), video).unwrap();
     let db = Db::media_fixture(account, "wxid_offline", None, Default::default());
-    let media = Media::new(root.path().join("adapter"));
+    let mut media = Media::new(root.path().join("adapter"));
     let group = "123456@chatroom";
     let row = json!({"local_id":3,"sort_seq":3,"shard":"offline","content":format!("<msg><videomsg length='{}' md5='{}'/></msg>",video.len(),picture::md5(video))});
     let key = message_key(group, &row);
@@ -281,23 +433,17 @@ fn completed_video_partial_and_destination_skip_archive_but_still_verify_content
     fs::create_dir_all(partial.parent().unwrap()).unwrap();
     fs::write(&partial, video).unwrap();
     fs::write(&destination, &corrupt).unwrap();
-    let restored = media.video(&db, None, group, &row, &key).unwrap();
+    let restored = media.video(&db, group, &row, &key).unwrap();
     assert_eq!(restored, destination);
     assert_eq!(fs::read(&restored).unwrap(), video);
     assert_eq!(media.video_scan_entries.get(), 0);
 
     fs::remove_file(&partial).unwrap();
-    assert_eq!(
-        media.video(&db, None, group, &row, &key).unwrap(),
-        destination
-    );
+    assert_eq!(media.video(&db, group, &row, &key).unwrap(), destination);
     assert_eq!(media.video_scan_entries.get(), 0);
     // A same-size corrupted private file must not become a successful fast-path hit.
     fs::write(&destination, &corrupt).unwrap();
-    assert_eq!(
-        media.video(&db, None, group, &row, &key).unwrap(),
-        destination
-    );
+    assert_eq!(media.video(&db, group, &row, &key).unwrap(), destination);
     assert!(media.video_scan_entries.get() > 0);
     assert_eq!(fs::read(destination).unwrap(), video);
 }
@@ -337,7 +483,7 @@ fn missing_and_partial_inbound_media_remain_retryable() {
             json!({"local_id":3,"sort_seq":3,"shard":"offline","content":"<msg><appmsg><type>6</type><title>missing.txt</title><appattach><totallen>10</totallen><md5>0123456789abcdef0123456789abcdef</md5></appattach></appmsg></msg>"}),
         ),
     ] {
-        let error = media.inbound(&mut db, None, group, &row, kind).unwrap_err();
+        let error = media.inbound(&mut db, group, &row, kind).unwrap_err();
         assert!(
             error.downcast_ref::<MediaPending>().is_some(),
             "{kind}: {error}"

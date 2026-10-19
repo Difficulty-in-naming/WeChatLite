@@ -1,6 +1,9 @@
 //! On-demand local media retrieval, verified staging and native codec boundaries.
+#[path = "media/picture.rs"]
 mod picture;
+#[path = "media/silk.rs"]
 mod silk;
+#[path = "media/wxgf.rs"]
 mod wxgf;
 
 use crate::{db::Db, native::NativeClient};
@@ -10,6 +13,7 @@ pub use picture::avatar_data;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::BTreeSet,
     fmt,
     fs::{self, File},
     io::{Read, Seek, SeekFrom, Write},
@@ -49,6 +53,9 @@ pub struct Media {
     image_key: Option<[u8; 16]>,
     xor_key: Option<u8>,
     last_key_scan: Option<Instant>,
+    downloads: NativeClient,
+    download_groups: BTreeSet<String>,
+    download_connected: bool,
     #[cfg(test)]
     video_scan_entries: std::cell::Cell<usize>,
 }
@@ -58,26 +65,34 @@ impl Media {
         let directory = std::path::absolute(&directory).unwrap_or(directory);
         let cache = directory.join("wechat/media");
         Self {
-            directory,
+            directory: directory.clone(),
             cache,
             image_key: None,
             xor_key: None,
             last_key_scan: None,
+            downloads: NativeClient::with_binary(
+                directory.join("native-downloads"),
+                &include_bytes!("../vendor/WeChatMedia.dll")[..],
+                include_str!("../vendor/WeChatMedia.sha256").trim(),
+                json!({"capability":"media_download"}),
+            ),
+            download_groups: BTreeSet::new(),
+            download_connected: false,
             #[cfg(test)]
             video_scan_entries: std::cell::Cell::new(0),
         }
     }
+    pub fn select(&mut self, groups: &BTreeSet<String>) -> Result<()> {
+        self.downloads
+            .restrict(&groups.iter().cloned().collect::<Vec<_>>())?;
+        self.download_groups = groups.clone();
+        self.download_connected = false;
+        Ok(())
+    }
     fn cache_dir(&self, key: &str) -> Result<PathBuf> {
         owned_dir(&self.cache, &self.cache.join(sha256(key.as_bytes())))
     }
-    pub fn inbound(
-        &mut self,
-        db: &mut Db,
-        mut native: Option<&mut NativeClient>,
-        group: &str,
-        row: &Value,
-        kind: &str,
-    ) -> Result<Value> {
+    pub fn inbound(&mut self, db: &mut Db, group: &str, row: &Value, kind: &str) -> Result<Value> {
         let local_id = number(&row["local_id"]);
         let shard = row["shard"].as_str().unwrap_or("");
         let mut raw = row.clone();
@@ -96,9 +111,9 @@ impl Media {
         let source = match kind {
             "image" => self.image(db, group, &raw, &key)?,
             "voice" => self.voice(db, group, &raw, &key)?,
-            "video" => self.video(db, native.as_deref_mut(), group, &raw, &key)?,
+            "video" => self.video(db, group, &raw, &key)?,
             "gif" => self.emoji(db, &content(&raw))?,
-            "file" => self.file(db, &content(&raw), &key)?,
+            "file" => self.file(db, group, &content(&raw), &key)?,
             _ => bail!("媒体类型暂不支持，原消息已保留"),
         };
         let size = fs::metadata(&source)?.len();
@@ -114,6 +129,99 @@ impl Media {
         Ok(
             json!({"id":"","kind":actual,"name":source.file_name().unwrap_or_default().to_string_lossy(),
             "size":size,"sha256":hash_file::<Sha256>(&source)?,"path":source.canonicalize()?.to_string_lossy()}),
+        )
+    }
+    pub fn record_attachment(
+        &mut self,
+        group: &str,
+        key: &str,
+        item: &crate::records::Attachment,
+    ) -> Result<Value> {
+        let resource = DownloadResource {
+            kind: if item.kind == "voice" {
+                "file"
+            } else {
+                item.kind
+            },
+            file_id: item.file_id.clone(),
+            aes: item.aes.clone(),
+            length: item.length,
+            md5: item.md5.clone(),
+        };
+        resource.validate()?;
+        let folder = self.cache_dir(key)?;
+        let name: String = item
+            .name
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or("附件")
+            .chars()
+            .filter(|c| !c.is_control())
+            .map(|c| if "<>:\"/\\|?*".contains(c) { '_' } else { c })
+            .take(150)
+            .collect();
+        validate_name(&name)?;
+        let receipt = folder.join("record-receipt.json");
+        if let Ok(bytes) = read_limited(&receipt, 4096) {
+            if let Ok(saved) = serde_json::from_slice::<Value>(&bytes) {
+                if let Some(name) = saved["name"]
+                    .as_str()
+                    .filter(|name| validate_name(name).is_ok())
+                {
+                    let path = folder.join(name);
+                    if cached_video_receipt(
+                        &path,
+                        &receipt,
+                        group,
+                        key,
+                        std::slice::from_ref(&resource),
+                    ) {
+                        return Ok(
+                            json!({"id":"","name":name,"kind":saved["kind"],"size":path.metadata()?.len(),"sha256":hash_file::<Sha256>(&path)?,"path":path.canonicalize()?.to_string_lossy()}),
+                        );
+                    }
+                }
+            }
+        }
+        let source = self.download(group, key, &resource, item.kind == "image")?;
+        let size = source.metadata()?.len();
+        let digest = hash_file::<Md5>(&source)?;
+        let mut destination = folder.join(&name);
+        let actual;
+        if item.kind == "image" {
+            let data = read_limited(&source, MAX_FILE)?;
+            let data = if data.starts_with(b"wxgf") {
+                wxgf::decode(&data, &folder)?
+            } else {
+                data
+            };
+            let (format, _, _) = picture::validate(&data, 12000)?;
+            destination = folder.join(format!("image.{}", picture::extension(format)));
+            atomic_write(&destination, &data)?;
+            actual = if destination
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("gif"))
+            {
+                "gif"
+            } else {
+                "image"
+            };
+        } else {
+            copy_verified(&source, &destination, Some(size), &[digest.clone()])?;
+            if item.kind == "voice" {
+                destination = silk::decode(&destination)?;
+            }
+            actual = item.kind;
+        }
+        atomic_write(
+            &receipt,
+            &serde_json::to_vec(
+                &json!({"request_id":download_id(group,key,&resource),"size":destination.metadata()?.len(),"md5":hash_file::<Md5>(&destination)?,"name":destination.file_name().unwrap_or_default().to_string_lossy(),"kind":actual}),
+            )?,
+        )?;
+        Ok(
+            json!({"id":"","name":destination.file_name().unwrap_or_default().to_string_lossy(),"kind":actual,
+            "size":destination.metadata()?.len(),"sha256":hash_file::<Sha256>(&destination)?,"path":destination.canonicalize()?.to_string_lossy()}),
         )
     }
     pub fn outgoing(
@@ -204,6 +312,30 @@ impl Media {
         })
     }
     fn image(&mut self, db: &mut Db, group: &str, row: &Value, key: &str) -> Result<PathBuf> {
+        match self.local_image(db, group, row, key) {
+            Ok(path) => Ok(path),
+            Err(local_error) => {
+                let xml = content(row);
+                let Some(resource) = image_resource(&xml) else {
+                    return Err(local_error);
+                };
+                let source = self.download(group, key, &resource, false)?;
+                let folder = self.cache_dir(key)?;
+                // The CDN API writes decrypted original bytes; no foreground image-key scan is needed.
+                let data = read_limited(&source, MAX_FILE)?;
+                let plain = if data.starts_with(b"wxgf") {
+                    wxgf::decode(&data, &folder)?
+                } else {
+                    data
+                };
+                let (format, _, _) = picture::validate(&plain, 12000)?;
+                let destination = folder.join(format!("image.{}", picture::extension(format)));
+                atomic_write(&destination, &plain)?;
+                Ok(destination)
+            }
+        }
+    }
+    fn local_image(&mut self, db: &mut Db, group: &str, row: &Value, key: &str) -> Result<PathBuf> {
         let folder = self.cache_dir(key)?;
         if let Some(path) = cached_picture(&folder) {
             return Ok(path);
@@ -419,39 +551,46 @@ impl Media {
         }
         silk::decode(&silk).map_err(|_| pending("微信语音缓存尚未完整解码，原件已保留，会自动重试"))
     }
-    fn video(
-        &self,
-        db: &Db,
-        native: Option<&mut NativeClient>,
-        group: &str,
-        row: &Value,
-        key: &str,
-    ) -> Result<PathBuf> {
+    fn video(&mut self, db: &Db, group: &str, row: &Value, key: &str) -> Result<PathBuf> {
         let xml = content(row);
         let doc = xml_document(&xml)?;
         let video = doc
             .descendants()
             .find(|node| node.has_tag_name("videomsg"))
             .ok_or_else(|| pending("微信视频元数据尚未就绪"))?;
-        let length = video
+        let standard_length = video
             .attribute("length")
             .and_then(|v| v.parse::<u64>().ok())
             .filter(|v| *v > 0)
             .ok_or_else(|| pending("微信视频大小尚未就绪"))?;
-        ensure!(length <= MAX_FILE, "视频超过 512 MiB，源消息已保留");
-        let hashes: Vec<String> = ["md5", "newmd5"]
+        let standard_hashes: Vec<String> = ["md5", "newmd5"]
             .iter()
             .filter_map(|key| video.attribute(*key))
             .filter(|value| is_hex(value, 32))
             .map(str::to_lowercase)
             .collect();
-        if hashes.is_empty() {
-            return Err(pending("微信视频 MD5 尚未就绪，会自动重试"));
+        let resource = video_resource(video)?;
+        let length = resource.length;
+        let hashes = vec![resource.md5.clone()];
+        let mut resources = vec![resource];
+        if resources[0].kind == "video_original" {
+            if let Ok(standard) = standard_video_resource(video) {
+                resources.push(standard);
+            }
         }
+        let matches_video = |path: &Path| {
+            verified(path, length, &hashes)
+                || (standard_length <= MAX_FILE
+                    && verified(path, standard_length, &standard_hashes))
+        };
         let request_key = format!("video:{key}");
         let ident = sha256(request_key.as_bytes());
         let directory = self.cache_dir(&request_key)?;
         let destination = directory.join("video.mp4");
+        let receipt = directory.join("video-receipt.json");
+        if cached_video_receipt(&destination, &receipt, group, key, &resources) {
+            return Ok(destination);
+        }
         let native_root = self.directory.join("feishu/media");
         owned_dir(&self.directory, &native_root)?;
         let partial = native_root
@@ -463,9 +602,15 @@ impl Media {
             let Ok(source) = within(root, path) else {
                 continue;
             };
-            if verified(&source, length, &hashes) {
+            if matches_video(&source) {
                 if source != destination {
-                    copy_verified(&source, &destination, Some(length), &hashes)?;
+                    let size = source.metadata()?.len();
+                    let allowed = if size == length {
+                        hashes.clone()
+                    } else {
+                        standard_hashes.clone()
+                    };
+                    copy_verified(&source, &destination, Some(size), &allowed)?;
                 }
                 return Ok(destination.clone());
             }
@@ -481,7 +626,9 @@ impl Media {
             self.video_scan_entries
                 .set(self.video_scan_entries.get() + 1);
             if entry.file_type().is_file()
-                && entry.metadata().is_ok_and(|m| m.len() == length)
+                && entry
+                    .metadata()
+                    .is_ok_and(|m| m.len() == length || m.len() == standard_length)
                 && (id
                     .as_ref()
                     .is_some_and(|id| entry.file_name() == format!("{id}.mp4").as_str())
@@ -491,39 +638,40 @@ impl Media {
                         .is_some_and(|ext| ext.eq_ignore_ascii_case("mp4")))
             {
                 if let Ok(source) = within(&root, entry.path())
-                    && verified(&source, length, &hashes)
+                    && matches_video(&source)
                 {
-                    copy_verified(&source, &destination, Some(length), &hashes)?;
+                    let size = source.metadata()?.len();
+                    let allowed = if size == length {
+                        hashes.clone()
+                    } else {
+                        standard_hashes.clone()
+                    };
+                    copy_verified(&source, &destination, Some(size), &allowed)?;
                     return Ok(destination);
                 }
             }
         }
-        let file_id = video.attribute("cdnvideourl").unwrap_or("");
-        let aes = video.attribute("aeskey").unwrap_or("");
-        ensure!(
-            (32..=4096).contains(&file_id.len())
-                && file_id.len() % 2 == 0
-                && is_hex(file_id, file_id.len())
-                && is_hex(aes, 32),
-            "微信视频缺少有效的后台下载参数，原消息已保留"
-        );
-        let native = native.ok_or_else(|| pending("微信视频后台下载组件未连接，会自动重试"))?;
-        let response = native
-            .download_video(group, file_id, aes, length, &request_key)
-            .map_err(|_| pending("微信视频后台下载暂未就绪，会自动重试"))?;
-        if response["ret"] != 0 || response["status"] != "downloading" {
-            return Err(pending("微信视频后台下载未确认，会自动重试"));
+        let mut last_error = pending("微信视频等待后台下载");
+        for resource in &resources {
+            match self.download(group, key, resource, false) {
+                Ok(source) => {
+                    let size = source.metadata()?.len();
+                    let digest = hash_file::<Md5>(&source)?;
+                    copy_verified(&source, &destination, Some(size), &[digest.clone()])?;
+                    atomic_write(
+                        &receipt,
+                        &serde_json::to_vec(&json!({
+                            "request_id":download_id(group,key,resource),"size":size,"md5":digest,
+                        }))?,
+                    )?;
+                    return Ok(destination);
+                }
+                Err(error) => last_error = error,
+            }
         }
-        let returned = PathBuf::from(response["path"].as_str().unwrap_or(""));
-        ensure!(
-            absolute_comparable(&returned) == absolute_comparable(&partial),
-            "微信视频后台下载返回的缓存路径不匹配，未读取"
-        );
-        Err(pending(
-            "微信视频正在后台下载，大小和 MD5 完整校验后会自动转发",
-        ))
+        Err(last_error)
     }
-    fn file(&self, db: &Db, xml: &str, key: &str) -> Result<PathBuf> {
+    fn file(&mut self, db: &Db, group: &str, xml: &str, key: &str) -> Result<PathBuf> {
         let document = xml_document(xml)?;
         let app = document
             .descendants()
@@ -602,7 +750,72 @@ impl Media {
             copy_verified(&source, &destination, expected, &[digest.clone()])?;
             return Ok(destination);
         }
-        Err(pending("微信文件尚未完整下载；在微信下载后会自动补发"))
+        let resource = DownloadResource {
+            kind: "file",
+            file_id: text_at(app, "cdnattachurl").to_owned(),
+            aes: text_at(app, "aeskey").to_owned(),
+            length: expected.unwrap_or(0),
+            md5: digest.clone(),
+        };
+        let source = self.download(group, key, &resource, false)?;
+        copy_verified(&source, &destination, expected, &[digest])?;
+        Ok(destination)
+    }
+    fn download(&mut self, group: &str, key: &str, resource: &DownloadResource, allow_transcoded_image: bool) -> Result<PathBuf> {
+        resource
+            .validate()
+            .map_err(|error| pending(&error.to_string()))?;
+        let native_root = self.directory.join("feishu/media");
+        let folder = owned_dir(&self.directory, &native_root.join("wechat-download"))?;
+        let id = download_id(group, key, resource);
+        let partial = folder.join(format!("{id}.part"));
+        ensure!(!partial.is_symlink(), "微信下载缓存不能是链接");
+        if let Ok(source) = within(&folder, &partial) {
+            if verified(&source, resource.length, &[resource.md5.clone()]) {
+                return Ok(source);
+            }
+        }
+        ensure!(
+            self.download_groups.contains(group),
+            "该群未授权后台媒体下载"
+        );
+        if !self.download_connected || !self.downloads.is_alive() {
+            let health = self
+                .downloads
+                .connect(
+                    &self.download_groups.iter().cloned().collect::<Vec<_>>(),
+                    &native_root,
+                )
+                .map_err(|error| pending(&format!("微信后台下载组件未就绪：{error}")))?;
+            ensure!(
+                health["capabilities"]
+                    .as_array()
+                    .is_some_and(|caps| caps.iter().any(|cap| cap == "media_download"))
+                    && health["capabilities"]
+                        .as_array()
+                        .is_some_and(|caps| caps.iter().any(|cap| cap == "download_receipts"))
+                    && health["max_size"].as_u64() == Some(MAX_FILE)
+                    && health["hooks_installed"] == true,
+                "微信后台下载组件能力不匹配"
+            );
+            self.downloads.request("/start", Some(&json!({})))?;
+            self.download_connected = true;
+        }
+        let response = self.downloads.request("/DownloadMedia", Some(&json!({
+            "group":group,"kind":resource.kind,"file_id":resource.file_id,"aes_key":resource.aes,
+            "length":resource.length,"request_id":id,
+        }))).map_err(|error| pending(&format!("微信后台媒体下载等待重试：{error}")))?;
+        if let Some(source) = completed_download(&response, &folder, &partial, &id, resource, allow_transcoded_image)? {
+            return Ok(source);
+        }
+        if response["status"] == "failed" {
+            return Err(pending(&format!(
+                "微信 CDN 暂未提供此资源（{}），会自动重试",
+                response["code"]
+            )));
+        }
+        ensure!(response["status"] == "downloading", "微信后台下载状态无效");
+        Err(pending("微信媒体正在后台下载，大小和 MD5 校验后自动转发"))
     }
     fn emoji(&self, db: &Db, xml: &str) -> Result<PathBuf> {
         let document = xml_document(xml)?;
@@ -745,6 +958,145 @@ impl Media {
             "微信表情原资源尚未下载或未通过完整校验，会自动重试",
         ))
     }
+}
+
+struct DownloadResource {
+    kind: &'static str,
+    file_id: String,
+    aes: String,
+    length: u64,
+    md5: String,
+}
+impl DownloadResource {
+    fn validate(&self) -> Result<()> {
+        ensure!(
+            (1..=MAX_FILE).contains(&self.length),
+            "媒体大小缺失或超过 512 MiB"
+        );
+        ensure!(is_hex(&self.md5, 32), "媒体缺少有效的 MD5 校验信息");
+        ensure!(
+            (32..=4096).contains(&self.file_id.len())
+                && self.file_id.len() % 2 == 0
+                && is_hex(&self.file_id, self.file_id.len())
+                && is_hex(&self.aes, 32),
+            "微信媒体缺少有效的后台下载参数，原消息已保留"
+        );
+        Ok(())
+    }
+}
+fn completed_download(response: &Value, folder: &Path, partial: &Path, id: &str, resource: &DownloadResource, allow_transcoded_image: bool) -> Result<Option<PathBuf>> {
+    ensure!(response["ret"] == 0 && response["request_id"] == id, "微信后台下载回执不匹配");
+    let returned = PathBuf::from(response["path"].as_str().unwrap_or(""));
+    ensure!(absolute_comparable(&returned) == absolute_comparable(partial), "微信后台下载路径不匹配");
+    if response["status"] != "complete" { return Ok(None); }
+    let source = within(folder, partial)?;
+    let size = response["size"].as_u64().unwrap_or(0);
+    let digest = response["md5"].as_str().unwrap_or("").to_ascii_lowercase();
+    ensure!((1..=MAX_FILE).contains(&size) && is_hex(&digest, 32) && verified(&source,size,&[digest.clone()]), "微信 CDN 下载完成回执的文件校验失败");
+    // Full record images can be reencoded by the CDN; only their same-request native receipt can attest replacement bytes.
+    ensure!(resource.kind == "video" || (allow_transcoded_image && resource.kind == "image") || (size == resource.length && digest == resource.md5), "微信 CDN 下载内容与原消息不一致");
+    Ok(Some(source))
+}
+
+fn download_id(group: &str, key: &str, resource: &DownloadResource) -> String {
+    sha256(
+        json!([
+            group,
+            key,
+            resource.kind,
+            resource.file_id,
+            resource.aes,
+            resource.length,
+            resource.md5
+        ])
+        .to_string()
+        .as_bytes(),
+    )
+}
+fn image_resource(xml: &str) -> Option<DownloadResource> {
+    let document = xml_document(xml).ok()?;
+    let image = document
+        .descendants()
+        .find(|node| node.has_tag_name("img"))?;
+    let resource = DownloadResource {
+        kind: "image",
+        file_id: image.attribute("cdnbigimgurl").unwrap_or("").to_owned(),
+        aes: image.attribute("aeskey").unwrap_or("").to_owned(),
+        length: image
+            .attribute("hdlength")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
+        md5: image.attribute("md5").unwrap_or("").to_ascii_lowercase(),
+    };
+    resource.validate().ok()?;
+    Some(resource)
+}
+fn video_resource(video: roxmltree::Node<'_, '_>) -> Result<DownloadResource> {
+    let original = DownloadResource {
+        kind: "video_original",
+        file_id: video.attribute("cdnrawvideourl").unwrap_or("").to_owned(),
+        aes: video
+            .attribute("cdnrawvideoaeskey")
+            .unwrap_or("")
+            .to_owned(),
+        length: video
+            .attribute("rawlength")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
+        md5: video.attribute("rawmd5").unwrap_or("").to_ascii_lowercase(),
+    };
+    if original.validate().is_ok() {
+        return Ok(original);
+    }
+    standard_video_resource(video)
+}
+fn standard_video_resource(video: roxmltree::Node<'_, '_>) -> Result<DownloadResource> {
+    let resource = DownloadResource {
+        kind: "video",
+        file_id: video.attribute("cdnvideourl").unwrap_or("").to_owned(),
+        aes: video.attribute("aeskey").unwrap_or("").to_owned(),
+        length: video
+            .attribute("length")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
+        md5: ["md5", "newmd5"]
+            .iter()
+            .filter_map(|key| video.attribute(*key))
+            .find(|v| is_hex(v, 32))
+            .unwrap_or("")
+            .to_ascii_lowercase(),
+    };
+    // Cached local videos may have no CDN locator. Validate it only if a download is necessary.
+    ensure!(
+        (1..=MAX_FILE).contains(&resource.length) && is_hex(&resource.md5, 32),
+        "微信视频大小或 MD5 无效"
+    );
+    Ok(resource)
+}
+fn cached_video_receipt(
+    path: &Path,
+    receipt: &Path,
+    group: &str,
+    key: &str,
+    resources: &[DownloadResource],
+) -> bool {
+    if path.is_symlink() || receipt.is_symlink() {
+        return false;
+    }
+    let Ok(bytes) = read_limited(receipt, 4096) else {
+        return false;
+    };
+    let Ok(record) = serde_json::from_slice::<Value>(&bytes) else {
+        return false;
+    };
+    let size = record["size"].as_u64().unwrap_or(0);
+    let digest = record["md5"].as_str().unwrap_or("");
+    (1..=MAX_FILE).contains(&size)
+        && is_hex(digest, 32)
+        && resources
+            .iter()
+            .any(|resource| record["request_id"] == download_id(group, key, resource))
+        && verified(path, size, &[digest.to_owned()])
 }
 
 fn content(row: &Value) -> String {

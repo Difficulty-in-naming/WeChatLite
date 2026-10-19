@@ -1108,6 +1108,7 @@ async fn send(
         media,
         mentions: request.mentions,
         quote,
+        record: None,
         timestamp: chrono::Utc::now().timestamp_millis(),
         status: "queued".into(),
         error: String::new(),

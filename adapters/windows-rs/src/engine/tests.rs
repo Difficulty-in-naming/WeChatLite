@@ -108,6 +108,7 @@ struct Fake {
     rows: HashMap<String, Vec<Value>>,
     calls: Vec<String>,
     allowed: BTreeSet<String>,
+    download_groups: BTreeSet<String>,
     reads: usize,
     signature: u64,
     mode: &'static str,
@@ -124,6 +125,7 @@ impl Default for Fake {
             rows: HashMap::from([("g".to_owned(), vec![row(10, 1)])]),
             calls: vec![],
             allowed: BTreeSet::new(),
+            download_groups: BTreeSet::new(),
             reads: 0,
             signature: 1,
             mode: "confirm",
@@ -216,6 +218,10 @@ impl Backend for Fake {
         self.allowed = g.clone();
         Ok(())
     }
+    fn select_downloads(&mut self, g: &BTreeSet<String>) -> Result<()> {
+        self.download_groups = g.clone();
+        Ok(())
+    }
     fn convert(&mut self, g: &str, r: &Value) -> Result<Option<Value>> {
         self.conversions += 1;
         if text(r, "type") != "文本" {
@@ -231,6 +237,7 @@ impl Backend for Fake {
             json!({"id":source(g,r)?,"source_id":source(g,r)?,"group":g,"text":r["content"]});
         for field in [
             "quote",
+            "record",
             "_quote_source",
             "_quote_server_id",
             "_quote_original",
@@ -936,6 +943,119 @@ fn short_media_retries_preserve_live_and_history_conversion_budgets() {
         .unwrap();
     assert_eq!(done["sources"].as_array().unwrap().len(), 20);
     assert!(engine.access.calls.is_empty());
+}
+
+#[test]
+fn legacy_record_history_queues_cards_beyond_the_page_media_budget() {
+    let (_temp, mut engine) = setup(json!(["g"]));
+    engine.last_poll = 1000.0;
+    let mut rows = vec![];
+    for index in 1..=10 {
+        let mut item = row(index, index);
+        item["type"] = json!("文件/链接/卡片");
+        item["content"] = json!("<msg><appmsg><type>19</type></appmsg></msg>");
+        item["record"] = json!({"pending":true});
+        journal(&engine.store, "g", &item).unwrap();
+        engine
+            .store
+            .acknowledge("g", &source("g", &item).unwrap())
+            .unwrap();
+        rows.push(item);
+    }
+    engine.access.rows.insert("g".into(), rows);
+    let mut events = vec![];
+    history_page(&mut engine.access,&engine.store,&json!({"group":"g","request_id":uuid::Uuid::new_v4().to_string(),"before_source":"","limit":60}),1000.1,&mut events,None).unwrap();
+    assert_eq!(events.iter().filter(|e| e["type"] == "message").count(), 8);
+    let pending: i64 = engine
+        .store
+        .db
+        .query_row("SELECT count(*) FROM pending", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(pending, 10);
+    let events = engine.cycle(&[], 1000.2);
+    assert_eq!(events.iter().filter(|e| e["type"] == "message").count(), 2);
+    assert!(engine.access.allowed.is_empty());
+}
+
+#[test]
+fn selected_groups_can_download_without_opening_a_chat_or_enabling_native_sending() {
+    let (_temp, mut engine) = setup(json!(["g"]));
+    assert_eq!(engine.access.download_groups, BTreeSet::from(["g".into()]));
+    assert!(engine.access.allowed.is_empty());
+    engine.cycle(&[json!({"op":"configure","groups":["h"]})], 1000.1);
+    assert_eq!(engine.access.download_groups, BTreeSet::from(["h".into()]));
+    assert!(engine.access.allowed.is_empty());
+    engine.cycle(&[json!({"op":"activate","group":"h"})], 1000.2);
+    assert_eq!(engine.access.allowed, BTreeSet::from(["h".into()]));
+    engine.cycle(&[json!({"op":"configure","groups":["g"]})], 1000.3);
+    assert!(engine.access.allowed.is_empty());
+    assert_eq!(engine.access.download_groups, BTreeSet::from(["g".into()]));
+    engine.shutdown().unwrap();
+    assert!(engine.access.download_groups.is_empty());
+}
+
+#[test]
+fn targeted_record_refresh_repairs_delivered_cards_outside_warm_history_without_sending() {
+    let (_temp, mut engine) = setup(json!(["g"]));
+    engine.last_poll = 1000.0;
+    let mut old = row(2, 2);
+    old["type"] = json!("文件/链接/卡片");
+    old["content"] = json!("<msg><appmsg><type>19</type></appmsg></msg>");
+    old["record"] = json!({"pending":true,"items":[]});
+    let key = source("g", &old).unwrap();
+    journal(&engine.store,"g",&old).unwrap();
+    engine.store.acknowledge("g",&key).unwrap();
+    let mut rows=vec![old];rows.extend((11..90).map(|id|row(id,id)));
+    engine.access.rows.insert("g".into(),rows);
+    let cursor=engine.store.state("cursor:g").unwrap();
+    let command=json!({"op":"record_refresh","group":"g","source_id":key});
+    let events=engine.cycle(&[command.clone()],1000.1);
+    assert!(events.iter().any(|e|e["type"]=="message" && e["message"]["source_id"]==key && e["historical"]==true));
+    assert!(engine.store.contains("pending","source",&key).unwrap());
+    let retry=retry_state(&engine,&key);
+    engine.cycle(&[command],1000.2);
+    assert_eq!(retry_state(&engine,&key),retry);
+    assert_eq!(engine.store.state("cursor:g").unwrap(),cursor);
+    assert!(engine.active.is_empty());assert!(engine.access.allowed.is_empty());assert!(engine.access.calls.is_empty());
+    for command in [json!({"op":"record_refresh","group":"h","source_id":key}),json!({"op":"record_refresh","group":"g","source_id":"wx:h:bad:1:1"})] {
+        assert!(engine.cycle(&[command],1000.3).iter().any(|e|e["type"]=="warning"));
+    }
+}
+
+#[test]
+fn warm_history_repairs_delivered_merged_records_and_retries_their_pending_children() {
+    let (_temp, mut engine) = setup(json!(["g"]));
+    engine.last_poll = 1000.0;
+    let mut forwarded = row(9, 9);
+    forwarded["type"] = json!("文件/链接/卡片");
+    forwarded["content"] = json!("<msg><appmsg><type>19</type></appmsg></msg>");
+    forwarded["record"] = json!({"pending":true,"items":[]});
+    let key = source("g", &forwarded).unwrap();
+    journal(&engine.store, "g", &forwarded).unwrap();
+    engine.store.acknowledge("g", &key).unwrap();
+    engine.store.set("history_loaded:g", &json!(true)).unwrap();
+    engine.access.rows.insert("g".into(), vec![forwarded]);
+    let cursor = engine.store.state("cursor:g").unwrap();
+    let events = engine.cycle(&[json!({"op":"activate","group":"g"})], 1000.1);
+    assert!(events.iter().any(|e| e["type"] == "message"
+        && e["message"]["record"]["pending"] == true
+        && e["historical"] == true));
+    assert!(engine.store.contains("pending", "source", &key).unwrap());
+    let count = engine.access.conversions;
+    engine.access.rows.get_mut("g").unwrap()[0]["record"]["pending"] = json!(false);
+    let events = engine.cycle(&[], 1002.2);
+    assert!(engine.access.conversions > count);
+    assert!(
+        events
+            .iter()
+            .any(|e| e["type"] == "message" && e["message"]["record"]["pending"] == false)
+    );
+    engine.cycle(
+        &[json!({"op":"receipt","group":"g","source_id":key})],
+        1002.3,
+    );
+    assert!(!engine.store.contains("pending", "source", &key).unwrap());
+    assert_eq!(engine.store.state("cursor:g").unwrap(), cursor);
 }
 
 #[test]

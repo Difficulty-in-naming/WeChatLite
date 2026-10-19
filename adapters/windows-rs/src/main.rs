@@ -6,6 +6,7 @@ mod media;
 mod native;
 mod quotes;
 mod recall;
+mod records;
 
 use anyhow::{Context, Result, ensure};
 use engine::Engine;

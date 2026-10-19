@@ -13,3 +13,4 @@ if ($LASTEXITCODE) { throw 'Actions build failed' }
 if ($LASTEXITCODE) { throw 'Actions offline self-test failed' }
 Get-FileHash -LiteralPath (Join-Path $BuildDirectory 'Release\WeChatActions.dll') -Algorithm SHA256
 Get-FileHash -LiteralPath (Join-Path $BuildDirectory 'Release\WeChatQuote.dll') -Algorithm SHA256
+Get-FileHash -LiteralPath (Join-Path $BuildDirectory 'Release\WeChatMedia.dll') -Algorithm SHA256

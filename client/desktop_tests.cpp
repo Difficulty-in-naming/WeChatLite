@@ -260,6 +260,56 @@ class DesktopTests : public QObject
         QVERIFY2(failure.isEmpty(), qPrintable(failure));
         QTRY_VERIFY_WITH_TIMEOUT(model->rowCount() >= 4, 8000);
     }
+    void mergedRecordOpensOrderedDetailsUpdatesAttachmentsAndClosesOnRecall()
+    {
+        auto *model=window->findChild<MessageModel *>();
+        auto *view=window->findChild<MessageView *>();
+        auto *transport=window->findChild<Transport *>();
+        QVERIFY(!model->rows.isEmpty());
+        const auto group=model->rows.first()["group"];
+        const QJsonObject first{{"id","record-file-a"},{"kind","file"},{"name","a.bin"},{"size",3},{"sha256",QString(64,'a')}};
+        const QJsonObject second{{"id","record-file-b"},{"kind","file"},{"name","b.bin"},{"size",4},{"sha256",QString(64,'b')}};
+        QJsonObject record{{"title","合并聊天记录"},{"pending",true},{"items",QJsonArray{
+            QJsonObject{{"id","item-a"},{"sender","A"},{"timestamp",3000},{"text",""},{"media",QJsonArray{0}}},
+            QJsonObject{{"id","item-b"},{"sender","B"},{"timestamp",1000},{"text","中间的文字"},{"media",QJsonArray{}}},
+            QJsonObject{{"id","item-c"},{"sender","C"},{"timestamp",2000},{"text","附件下载中"},{"media",QJsonArray{}}}}}};
+        QJsonObject root{{"id","merged-record-fixture"},{"group",group},{"sender","转发者"},
+            {"timestamp",QDateTime::currentMSecsSinceEpoch()},{"status","received"},{"text","聊天记录"},
+            {"media",QJsonArray{first}},{"record",record}};
+        transport->event({{"type","message"},{"message",root}});
+        QModelIndex card;
+        for (int i=0;i<model->rowCount();++i)
+            if (model->rows[i]["id"]==root["id"]) card=model->index(i);
+        QVERIFY(card.isValid());
+        view->scrollTo(card,QAbstractItemView::PositionAtCenter);
+        QStyleOptionViewItem option;option.rect=view->visualRect(card);option.font=view->font();
+        const auto bubble=MessageDelegate::bubbleRect(option,card);
+        QCOMPARE(bubble.height(),132);
+        QTRY_VERIFY(view->viewport()->rect().contains(bubble.center()));
+        QTest::mouseClick(view->viewport(),Qt::LeftButton,{},bubble.center());
+        QPointer<QDialog> dialog=window->findChild<QDialog *>("forwardRecordDialog");
+        QVERIFY(dialog);QVERIFY(dialog->isVisible());
+        auto *details=dialog->findChild<MessageModel *>();
+        auto *detailView=dialog->findChild<MessageView *>();
+        QVERIFY(dialog->isWindow());
+        QVERIFY(details->property("readOnlyRecord").toBool());
+        QCOMPARE(details->rows.size(),3);QCOMPARE(details->rows[0]["sender"].toString(),"A");
+        QCOMPARE(details->rows[1]["text"].toString(),"中间的文字");
+        QCOMPARE(details->rows[0]["media"].toArray()[0].toObject()["id"].toString(),"record-file-a");
+        QScopedPointer<QMenu> menu(detailView->contextMenuFor(details->index(1),false));
+        QVERIFY(menu);QVERIFY(!menu->findChild<QAction *>("quoteMessage"));
+        menu.reset();
+        auto items=record["items"].toArray();auto last=items[2].toObject();last["text"]="";last["media"]=QJsonArray{1};items[2]=last;
+        record["items"]=items;record["pending"]=false;root["record"]=record;root["media"]=QJsonArray{first,second};
+        transport->event({{"type","message"},{"historical",true},{"message",root}});
+        QTRY_COMPARE(details->rows[2]["media"].toArray().size(),1);
+        QCOMPARE(details->rows[2]["media"].toArray()[0].toObject()["id"].toString(),"record-file-b");
+        QVERIFY(!dialog->findChild<QLabel *>("forwardRecordState")->text().contains("下载中"));
+        const auto capture=qEnvironmentVariable("WECHAT_RECORD_CAPTURE");
+        if (!capture.isEmpty()) QVERIFY(dialog->grab().save(capture));
+        root["status"]="recalled";transport->event({{"type","message"},{"message",root}});
+        QTRY_VERIFY(dialog.isNull());
+    }
     void windowBoundsFitLogicalScreensAndRecoverAnOffscreenSavedWindow_data()
     {
         QTest::addColumn<QRect>("available");

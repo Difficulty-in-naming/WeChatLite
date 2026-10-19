@@ -231,7 +231,18 @@ async fn import_message_with_quote_source(
     if source.is_empty() {
         anyhow::bail!("微信消息缺少稳定来源编号");
     }
-    if let Some(existing) = app.db(move |s| s.source(&group, &source)).await? {
+    if let Some(record) = &message.record {
+        anyhow::ensure!(
+            record.items.len() <= 200
+                && record
+                    .items
+                    .iter()
+                    .all(|item| item.media.iter().all(|i| *i < message.media.len())),
+            "聊天记录附件索引无效"
+        );
+    }
+    let existing = app.db(move |s| s.source(&group, &source)).await?;
+    if let Some(existing) = &existing {
         // Refresh native quote metadata retained by older adapter versions, keeping client IDs and recall redaction.
         if existing.status != "recalled"
             && existing.recall_status.is_empty()
@@ -244,6 +255,7 @@ async fn import_message_with_quote_source(
             }
             let text = message.text.clone();
             let quote = message.quote.clone().unwrap();
+            let existing = existing.clone();
             if let Some(event) = app
                 .db(move |s| {
                     s.enrich_native_quote(
@@ -259,39 +271,68 @@ async fn import_message_with_quote_source(
                 app.publish(event);
             }
         }
-        return Ok(app.allows(&message.group).await);
+        if message.record.is_none()
+            || existing.status == "recalled"
+            || !existing.client_id.is_empty()
+            || !existing.recall_status.is_empty()
+            || existing.record.as_ref().is_some_and(|r| !r.pending)
+                && message.media.len() <= existing.media.len()
+        {
+            return Ok(app.allows(&message.group).await);
+        }
     }
     let mut media = Vec::new();
     let imported: Result<()> = async {
+        let mut attachments = Vec::new();
         for attachment in &message.media {
-            media.push(
-                crate::web::import_media(
+            if let Some(previous) = existing.as_ref().and_then(|m| {
+                m.media.iter().find(|old| {
+                    old.sha256 == attachment.sha256
+                        && old.size == attachment.size
+                        && old.kind == attachment.kind
+                        && old.name == attachment.name
+                })
+            }) {
+                attachments.push(previous.clone());
+            } else {
+                let imported = crate::web::import_media(
                     app,
                     &message.group,
                     &attachment.path,
                     &attachment.name,
                     &attachment.kind,
                 )
-                .await?,
-            );
+                .await?;
+                attachments.push(imported.clone());
+                media.push(imported);
+            }
         }
-        message.media = media.clone();
+        message.media = attachments;
         message.status = "received".into();
         let selected = app.forwarding.read().await;
         if !selected.contains(&message.group) {
             anyhow::bail!("该群已取消转发");
         }
-        if let Some(event) = app
+        let event = app
             .db(move |s| {
-                if historical {
+                if let Some(existing) = existing {
+                    message.id = existing.id;
+                    s.enrich_native_record(&message, historical)
+                } else if historical {
                     s.insert_historical_message(&mut message)
                 } else {
                     s.insert_message(&mut message)
                 }
             })
-            .await?
-        {
+            .await?;
+        if let Some(event) = event {
             app.publish(event);
+        } else {
+            for attachment in media.drain(..) {
+                let id = attachment.id;
+                app.db(move |s| s.remove_media(&id)).await?;
+                let _ = tokio::fs::remove_file(&attachment.path).await;
+            }
         }
         Ok(())
     }
@@ -368,6 +409,7 @@ async fn run_stream<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     let mut policy = app.forwarding_changed.subscribe();
     let mut permissions = app.clients_changed.subscribe();
     let mut configure = true;
+    let mut record_repairs = std::collections::VecDeque::new();
     let mut recovering = app.db(|s| s.pending_recalls()).await?;
     let mut recalling = std::collections::BTreeSet::new();
     let result:Result<()>=async {
@@ -378,7 +420,17 @@ async fn run_stream<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
             if configure || policy.has_changed().unwrap_or(false) {
                 policy.borrow_and_update();
                 write_command(app,input,json!({"op":"configure","groups":*selected})).await?;
+                record_repairs=app.db(|store|store.legacy_record_sources()).await?.into_iter()
+                    .filter(|(group,_)|selected.contains(group)).collect();
                 configure=false;
+            }
+            if ready {
+                for _ in 0..8 {
+                    let Some((group,source))=record_repairs.pop_front() else {break;};
+                    if selected.contains(&group) {
+                        write_command(app,input,json!({"op":"record_refresh","group":group,"source_id":source})).await?;
+                    }
+                }
             }
             if ready && !recovering.is_empty() {
                 for message in recovering.drain(..) {
@@ -421,6 +473,7 @@ async fn run_stream<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                 _=crate::wait_for_shutdown(app.shutdown.subscribe())=>return Ok(()),
                 _=policy.changed()=>{configure=true;pending=true;},
                 _=permissions.changed()=>{pending=true;},
+                _=tokio::time::sleep(Duration::from_millis(50)),if ready && !record_repairs.is_empty()=>{},
                 line=output.next()=>{
                     let line=line.context("适配器已退出")?.context("适配器消息无效或超过 2 MiB 容量限制")?;
                     let value:Value=serde_json::from_str(&line).context("适配器协议无效")?;
@@ -476,6 +529,7 @@ async fn run_stream<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                             }
                             let source_server_id=body["_quote_server_id"].as_str().map(str::to_owned);
                             let message:ChatMessage=serde_json::from_value(body)?;
+                            let incomplete=message.record.as_ref().is_some_and(|record|record.pending);
                             let group=message.group.clone();let source=message.source_id.clone();
                             match import_message_with_quote_source(app,message,historical,source_server_id).await {
                                 Ok(true)=>{},
@@ -485,7 +539,7 @@ async fn run_stream<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                                     continue;
                                 }
                             }
-                            write_command(app,input,json!({"op":"receipt","group":group,"source_id":source})).await?;
+                            if !incomplete {write_command(app,input,json!({"op":"receipt","group":group,"source_id":source})).await?;}
                         },
                         "ack"=>{
                             if inflight.as_ref().is_some_and(|m|Some(m.id.as_str())==value["id"].as_str()) {
@@ -631,6 +685,93 @@ mod tests {
     fn message(id: &str) -> ChatMessage {
         serde_json::from_value(json!({"id":id,"group":"g","sender":"测试","text":"你好","timestamp":0,"status":"queued","outgoing":true})).unwrap()
     }
+    #[tokio::test]
+    async fn record_upgrade_queue_is_bounded_and_stops_when_the_group_is_revoked() {
+        let temp=tempfile::tempdir().unwrap();
+        let (app,receiver)=crate::test_app(temp.path());
+        for index in 0..11 {
+            let mut row=message(&format!("legacy-{index}"));
+            row.status="received".into();
+            if index==10 {row.group="h".into();}
+            row.source_id=format!("wx:{}:fixture:{index}:{index}",row.group);
+            row.text="title\nhttps://support.weixin.qq.com/favorite_record__w_unsupport".into();
+            app.store.insert_message(&mut row).unwrap();
+        }
+        let (task,mut output,mut input)=fixture(app.clone(),receiver).await;
+        emit(&mut output,json!({"type":"status","ready":true})).await;
+        for index in 0..8 {
+            assert_eq!(next(&mut input).await,json!({"op":"record_refresh","group":"g","source_id":format!("wx:g:fixture:{index}:{index}")}));
+        }
+        app.forwarding.write().await.clear();
+        app.forwarding_changed.send(()).unwrap();
+        assert_eq!(next(&mut input).await,json!({"op":"configure","groups":[]}));
+        assert!(tokio::time::timeout(Duration::from_millis(80),input.next()).await.is_err());
+        app.shutdown.send_replace(true);task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn merged_record_partial_import_retains_retry_and_reuses_media_when_completed() {
+        use sha2::{Digest, Sha256};
+        let temp = tempfile::tempdir().unwrap();
+        let (app, receiver) = crate::test_app(temp.path());
+        let (task, mut output, mut input) = fixture(app.clone(), receiver).await;
+        let mut events = app.events.subscribe();
+        let first = temp.path().join("first.bin");
+        let second = temp.path().join("second.bin");
+        std::fs::write(&first, b"first").unwrap();
+        std::fs::write(&second, b"second").unwrap();
+        let attachment = |path: &std::path::Path, bytes: &[u8]| json!({"id":"","name":path.file_name().unwrap().to_string_lossy(),"path":path,"kind":"file","size":bytes.len(),"sha256":format!("{:x}",Sha256::digest(bytes))});
+        let mut old = message("legacy-record");
+        old.source_id = "native-record".into();
+        old.text = "摘要".into();
+        old.record=Some(serde_json::from_value(json!({"title":"聊天记录","pending":false,"items":[{"id":"one","sender":"A","text":"[图片] 图片 · 暂时无法读取","timestamp":1,"media":[]}]})).unwrap());
+        app.store.insert_message(&mut old).unwrap();
+        let mut fresh = json!(&old);
+        fresh["id"] = json!("new-adapter-id");
+        fresh["media"] = json!([attachment(&first, b"first")]);
+        fresh["record"] = json!({"title":"聊天记录","pending":true,"items":[{"id":"one","sender":"A","text":"","timestamp":1,"media":[0]},{"id":"two","sender":"B","text":"下载中","timestamp":2,"media":[]}]});
+        emit(
+            &mut output,
+            json!({"type":"message","historical":true,"message":fresh}),
+        )
+        .await;
+        recall_barrier(&mut output, &mut events).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(40), input.next())
+                .await
+                .is_err()
+        );
+        let partial = app.store.message(&old.id).unwrap().unwrap();
+        assert!(partial.record.as_ref().unwrap().pending);
+        let first_id = partial.media[0].id.clone();
+        fresh["media"] = json!([attachment(&first, b"first"), attachment(&second, b"second")]);
+        fresh["record"]["pending"] = json!(false);
+        fresh["record"]["items"][1]["media"] = json!([1]);
+        fresh["record"]["items"][1]["text"] = json!("");
+        emit(
+            &mut output,
+            json!({"type":"message","historical":true,"message":fresh}),
+        )
+        .await;
+        assert_eq!(
+            next(&mut input).await,
+            json!({"op":"receipt","group":"g","source_id":"native-record"})
+        );
+        let complete = app.store.message(&old.id).unwrap().unwrap();
+        assert!(!complete.record.as_ref().unwrap().pending);
+        assert_eq!(complete.media.len(), 2);
+        assert_eq!(complete.media[0].id, first_id);
+        assert_eq!(complete.seq, old.seq);
+        let visible = crate::web::public(json!(&complete));
+        assert!(visible["media"][0].get("path").is_none());
+        let head = app.store.event_head().unwrap();
+        emit(&mut output, json!({"type":"message","message":fresh})).await;
+        next(&mut input).await;
+        assert_eq!(app.store.event_head().unwrap(), head);
+        app.shutdown.send_replace(true);
+        task.await.unwrap().unwrap();
+    }
+
     #[tokio::test]
     async fn native_history_refresh_adds_quote_metadata_without_reviving_recalled_or_client_content()
      {

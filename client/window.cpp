@@ -334,6 +334,7 @@ Window::Window(bool demo, const QString &tunnelExecutable)
     connect(messages, &MessageView::mediaClicked, this,
             [this](const QJsonObject &media, bool save) { fetchMedia(media, save); });
     connect(messages, &MessageView::mediaCopyRequested, this, &Window::copyMedia);
+    connect(messages, &MessageView::recordClicked, this, &Window::showForwardRecord);
     connect(QApplication::clipboard(), &QClipboard::dataChanged, this,
             [this] { pendingMediaCopy = {}; });
     connect(messages, &MessageView::mentionRequested, this,
@@ -368,6 +369,8 @@ Window::Window(bool demo, const QString &tunnelExecutable)
         { updateCachePins(); thumbnailTimer.start(); });
     connect(model, &QAbstractItemModel::modelReset, this, &Window::updateCachePins);
     connect(model, &QAbstractItemModel::dataChanged, this, &Window::updateCachePins);
+    connect(model, &QAbstractItemModel::modelReset, this, &Window::refreshForwardRecord);
+    connect(model, &QAbstractItemModel::dataChanged, this, &Window::refreshForwardRecord);
     connect(&demoServer, &QProcess::readyReadStandardError, this,
             [this]
             {
@@ -1098,6 +1101,14 @@ void Window::updateCachePins()
             }
     }
     if (!playingVoicePath.isEmpty()) paths.insert(playingVoicePath);
+    if (forwardDialog && forwardModel)
+        for (const auto &row : forwardModel->rows)
+            for (const auto &entry : row["media"].toArray())
+                for (const auto &field : {"_local", "_poster"})
+                {
+                    const auto path = entry.toObject()[field].toString();
+                    if (!path.isEmpty()) paths.insert(QFileInfo(path).absoluteFilePath());
+                }
     const auto requested = localFiles->pathForId(voiceGroup, requestedVoiceId);
     if (!requested.isEmpty()) paths.insert(requested);
     localFiles->pin(this, paths);
@@ -1143,6 +1154,9 @@ void Window::recoverCachedMessages(const QJsonArray &snapshot, std::function<voi
 }
 bool Window::hasCurrentMedia(const QJsonObject &media) const
 {
+    if (forwardDialog && forwardMessage["group"] == groupId && forwardMessage["status"] != "recalled")
+        for (const auto &entry : forwardMessage["media"].toArray())
+            if (sameMediaDescriptor(entry.toObject(),media)) return true;
     for (const auto &row : model->rows)
         if (row["group"] == groupId && row["status"] != "recalled")
             for (const auto &entry : row["media"].toArray())
@@ -1617,6 +1631,11 @@ void Window::loadGroups()
 
 void Window::invalidateAuxiliaryWindows()
 {
+    if (forwardDialog) forwardDialog->close();
+    forwardDialog.clear();
+    forwardMessage = {};
+    forwardModel = nullptr;
+    forwardView = nullptr;
     if (historyBrowser)
         historyBrowser->invalidate();
     if (announcementDialog)
@@ -1625,6 +1644,75 @@ void Window::invalidateAuxiliaryWindows()
     announcementDialog.clear();
     pendingRecordId.clear();
     pendingRecordMedia = {};
+}
+
+void Window::showForwardRecord(const QJsonObject &message)
+{
+    if (!connected || message["group"] != groupId || message["status"] == "recalled" || !message["record"].isObject()) return;
+    forwardMessage = localFiles->hydrate(message,groupId);
+    if (!forwardDialog)
+    {
+        forwardDialog = new QDialog(this);
+        forwardDialog->setObjectName("forwardRecordDialog");
+        forwardDialog->setAttribute(Qt::WA_DeleteOnClose);
+        forwardDialog->resize(600,720);
+        auto *layout = new QVBoxLayout(forwardDialog);
+        auto *state = new QLabel(forwardDialog);
+        state->setObjectName("forwardRecordState");
+        layout->addWidget(state);
+        forwardModel = new MessageModel(forwardDialog);
+        forwardModel->setProperty("preserveOrder",true);
+        forwardModel->setProperty("readOnlyRecord",true);
+        forwardView = new MessageView(forwardDialog);
+        forwardView->setObjectName("forwardRecordMessages");
+        forwardView->setProperty("readOnlyRecord",true);
+        forwardView->setProperty("canDownload",canDownload);
+        forwardView->setModel(forwardModel);
+        layout->addWidget(forwardView);
+        connect(forwardView,&MessageView::mediaClicked,this,[this](const QJsonObject &media,bool save){fetchMedia(media,save);});
+        connect(forwardView,&MessageView::mediaCopyRequested,this,&Window::copyMedia);
+        connect(forwardView,&MessageView::viewportChanged,this,[this]{updateCachePins();thumbnailTimer.start();});
+        connect(forwardDialog,&QDialog::finished,this,[this]{
+            forwardDialog.clear();forwardMessage={};forwardModel=nullptr;forwardView=nullptr;
+            updateCachePins();
+        });
+    }
+    refreshForwardRecord();
+    forwardDialog->show();
+    forwardDialog->raise();
+    forwardDialog->activateWindow();
+    thumbnailTimer.start();
+}
+
+void Window::refreshForwardRecord()
+{
+    if (!forwardDialog || !forwardModel) return;
+    for (const auto &row : model->rows)
+        if (row["group"] == groupId && row["id"] == forwardMessage["id"]) {forwardMessage=row;break;}
+    if (forwardMessage["group"] != groupId || forwardMessage["status"] == "recalled") {forwardDialog->close();return;}
+    forwardMessage=localFiles->hydrate(forwardMessage,groupId);
+    const auto record=forwardMessage["record"].toObject();
+    forwardDialog->setWindowTitle(record["title"].toString("聊天记录"));
+    const auto items=record["items"].toArray();
+    auto *state=forwardDialog->findChild<QLabel *>("forwardRecordState");
+    state->setText(QString("%1 条消息%2").arg(items.size()).arg(record["pending"].toBool() ? " · 附件后台下载中，会自动补齐" : ""));
+    QJsonArray rows;
+    const auto recordMedia=forwardMessage["media"].toArray();
+    for (const auto &value : items)
+    {
+        auto item=value.toObject();
+        QJsonArray media;
+        for (const auto &index : item["media"].toArray())
+            if (index.toInt(-1)>=0 && index.toInt()<recordMedia.size()) media.append(recordMedia[index.toInt()]);
+        item["media"]=media;
+        item["group"]=groupId;
+        item["status"]="received";
+        item["outgoing"]=false;
+        rows.append(item);
+    }
+    forwardModel->replace(rows);
+    updateCachePins();
+    thumbnailTimer.start();
 }
 
 void Window::showHistoryBrowser()
@@ -1666,6 +1754,7 @@ void Window::activateHistoryRecord(const QJsonObject &message, const QJsonObject
     if (!connected || message["group"] != groupId || groupId.isEmpty() ||
         message["id"].toString().isEmpty() || !locatingId.isEmpty())
         return;
+    if (message["record"].isObject() && media.isEmpty()) {showForwardRecord(message);return;}
     if (historyBrowser)
         historyBrowser->hide();
     showNormal();
@@ -2165,6 +2254,12 @@ void Window::handleEvent(const QJsonObject &event)
     else if (type == "message")
     {
         auto message = localFiles->hydrate(event["message"].toObject(), groupId);
+        if (forwardDialog && message["group"] == groupId && message["id"] == forwardMessage["id"])
+        {
+            forwardMessage=message;
+            if (message["status"] == "recalled") forwardDialog->close();
+            else refreshForwardRecord();
+        }
         if (historyBrowser)
             historyBrowser->updateMessage(message);
         if (message["status"] == "recalled" && message["id"] == pendingRecordId)
@@ -2934,6 +3029,7 @@ void Window::fetchMedia(const QJsonObject &media, bool saveOnly, bool thumbnail,
         else
         {
             model->setLocalMedia(id, local, media);
+            refreshForwardRecord();
             if (voice) openMedia(media, local);
         }
         return;
@@ -2964,6 +3060,7 @@ void Window::fetchMedia(const QJsonObject &media, bool saveOnly, bool thumbnail,
                            }
                            files->remember(group, media, path);
                            if (group == groupId) model->setLocalMedia(id, path, media);
+                           if (group == groupId) refreshForwardRecord();
                            const bool requestedOpen = openRequests.remove(id);
                            const bool requestedSave = saveRequests.remove(id);
                            if (requestedOpen || requestedSave)
@@ -2985,6 +3082,7 @@ void Window::saveMediaAndMaybeOpen(const QJsonObject &media, const QString &path
     if (!MediaStorage::isCachePath(path))
     {
         model->setLocalMedia(media["id"].toString(), path, media);
+        refreshForwardRecord();
         copyMediaToClipboard(media, path);
         if (open || (media["kind"] == "voice" && requestedVoiceId == media["id"].toString() &&
                      playingVoiceId != requestedVoiceId)) openMedia(media, path);
@@ -3018,6 +3116,7 @@ void Window::saveMediaAndMaybeOpen(const QJsonObject &media, const QString &path
             }
             self->localFiles->remember(self->groupId, media, saved);
             self->model->setLocalMedia(id, saved, media);
+            self->refreshForwardRecord();
             self->copyMediaToClipboard(media, saved);
             if (open || requestedOpen || (media["kind"] == "voice" && self->requestedVoiceId == id &&
                                          self->playingVoiceId != id))
@@ -3029,25 +3128,26 @@ void Window::visibleThumbnails()
 {
     if (!canDownload || !connected || isMinimized() || !isVisible() || cacheWorking)
         return;
-    const auto bounds = messages->viewport()->rect();
-    const auto first = messages->indexAt(QPoint(1, 0));
-    for (int i = qMax(0, first.row()); i < model->rowCount(); ++i)
+    for (const auto &pair : {qMakePair(messages,model),qMakePair(forwardDialog ? forwardView : nullptr, forwardDialog ? forwardModel : nullptr)})
     {
-        if (model->rows[i]["status"] == "recalled")
-            continue;
-        auto index = model->index(i);
-        const auto rect = messages->visualRect(index);
-        if (rect.top() > bounds.bottom()) break;
-        if (!rect.intersects(bounds))
-            continue;
-        for (const auto &entry : model->rows[i]["media"].toArray())
+        auto *view=pair.first; auto *source=pair.second;
+        if (!view || !source || !view->isVisible()) continue;
+        const auto bounds=view->viewport()->rect();
+        const auto first=view->indexAt(QPoint(1,0));
+        for (int i=qMax(0,first.row()); i<source->rowCount(); ++i)
         {
-            auto media = entry.toObject();
-            auto kind = media["kind"].toString();
-            if (kind == "video") fetchVideoPoster(media);
-            if ((kind == "image" || kind == "gif") && media["size"].toInteger() <= 8 * 1024 * 1024 &&
-                (media["_local"].toString().isEmpty() || !QFileInfo::exists(media["_local"].toString())))
-                fetchMedia(media, false, true);
+            if (source->rows[i]["status"] == "recalled") continue;
+            const auto rect=view->visualRect(source->index(i));
+            if (rect.top()>bounds.bottom()) break;
+            if (!rect.intersects(bounds)) continue;
+            if (source->rows[i]["record"].isObject()) continue;
+            for (const auto &entry : source->rows[i]["media"].toArray())
+            {
+                auto media=entry.toObject(); const auto kind=media["kind"].toString();
+                if (kind=="video") fetchVideoPoster(media);
+                if ((kind=="image" || kind=="gif") && media["size"].toInteger()<=8*1024*1024 &&
+                    (media["_local"].toString().isEmpty() || !QFileInfo::exists(media["_local"].toString()))) fetchMedia(media,false,true);
+            }
         }
     }
 }
@@ -3056,7 +3156,7 @@ void Window::fetchVideoPoster(const QJsonObject &media)
     const auto id = media["id"].toString();
     if (id.isEmpty() || pendingPosters.size() >= 2 || pendingPosters.contains(id) || failedPosters.contains(id)) return;
     const auto path = localFiles->findPoster(groupId, media);
-    if (!path.isEmpty()) { model->setLocalPoster(id, path, media); return; }
+    if (!path.isEmpty()) { model->setLocalPoster(id, path, media); refreshForwardRecord(); return; }
     pendingPosters.insert(id);
     const auto files = localFiles;
     const auto scope = chatPreferences.scope();
@@ -3072,7 +3172,7 @@ void Window::fetchVideoPoster(const QJsonObject &media)
             if (error.isEmpty()) files->rememberPoster(group, media, path);
             if (conversation == conversationGeneration && group == groupId)
             {
-                if (error.isEmpty()) { model->setLocalPoster(id, path, media); updateCachePins(); }
+                if (error.isEmpty()) { model->setLocalPoster(id, path, media); refreshForwardRecord(); updateCachePins(); }
                 else { if (failedPosters.size() >= 256) failedPosters.erase(failedPosters.begin()); failedPosters.insert(id); }
             }
             thumbnailTimer.start();

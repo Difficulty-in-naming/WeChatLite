@@ -62,6 +62,26 @@ pub struct Quote {
     pub unavailable: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForwardItem {
+    pub id: String,
+    #[serde(default)]
+    pub sender: String,
+    #[serde(default)]
+    pub text: String,
+    pub timestamp: i64,
+    #[serde(default)]
+    pub media: Vec<usize>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForwardRecord {
+    pub title: String,
+    pub items: Vec<ForwardItem>,
+    #[serde(default)]
+    pub pending: bool,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ChatMessage {
     #[serde(default)]
@@ -87,6 +107,8 @@ pub struct ChatMessage {
     pub mentions: Vec<Mention>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quote: Option<Quote>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record: Option<ForwardRecord>,
     pub timestamp: i64,
     pub status: String,
     #[serde(default)]

@@ -137,6 +137,31 @@ class ClientTests : public QObject
         QSettings::setDefaultFormat(QSettings::IniFormat);
         QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, settingsDirectory.path());
     }
+    void mergedRecordIsOneClickableCardAndRecallRemovesItsContent()
+    {
+        MessageModel model;
+        const QJsonObject message{{"id","record"},{"group","g"},{"sender","A"},{"text","聊天记录摘要"},
+            {"status","received"},{"timestamp",1},{"media",QJsonArray{QJsonObject{{"id","photo"},{"kind","image"}}}},
+            {"record",QJsonObject{{"title","合并聊天记录"},{"items",QJsonArray{QJsonObject{{"sender","B"},{"text","详情"},{"media",QJsonArray{0}}}}}}}};
+        model.replace({message});
+        MessageView view;
+        view.setModel(&model);
+        view.resize(700,500);
+        view.show();
+        QTest::qWait(20);
+        QSignalSpy opened(&view,&MessageView::recordClicked), media(&view,&MessageView::mediaClicked);
+        QStyleOptionViewItem option;
+        option.rect=view.visualRect(model.index(0));option.font=view.font();
+        const auto bubble=MessageDelegate::bubbleRect(option,model.index(0));
+        QCOMPARE(bubble.height(),132);
+        QTest::mouseClick(view.viewport(),Qt::LeftButton,{},bubble.center());
+        QCOMPARE(opened.size(),1);QCOMPARE(media.size(),0);
+        view.setCurrentIndex(model.index(0));
+        QTest::keyClick(&view,Qt::Key_Return);
+        QCOMPARE(opened.size(),2);
+        auto recalled=message;recalled["status"]="recalled";model.upsert(recalled);
+        QVERIFY(!model.rows[0].contains("record"));QVERIFY(model.rows[0]["media"].toArray().isEmpty());
+    }
     void bracketEmojiAliasesAreDisplayOnlyAndUnknownNamesStayIntact()
     {
         QCOMPARE(wechatDisplayText("[發][红包][凋谢][菜刀][炸弹][便便]"), "🀅🧧🥀🔪💣💩");

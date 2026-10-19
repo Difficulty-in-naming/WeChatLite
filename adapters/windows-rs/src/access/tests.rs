@@ -578,7 +578,7 @@ fn read_only_image_quote_identity_probe() {
             matched += 1;
             if access
                 .media
-                .inbound(&mut access.db, None, group, &original, "image")
+                .inbound(&mut access.db, group, &original, "image")
                 .is_ok()
             {
                 media_available += 1;

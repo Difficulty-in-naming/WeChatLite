@@ -103,7 +103,7 @@ RowLayout layoutRow(const QJsonObject &message, int width, const QFont &font)
              metrics.boundingRect(QRect(0, 0, available, 2000), Qt::TextWordWrap, text).height() + 2);
     result.text = QRect(70, 37, available, textHeight);
     int top = 37 + textHeight;
-    const auto media = message["status"] == "recalled" ? QJsonArray{} : message["media"].toArray();
+    const auto media = message["status"] == "recalled" || message["record"].isObject() ? QJsonArray{} : message["media"].toArray();
     for (int i = 0; i < qMin(8, media.size()); ++i)
     {
         top += 6;

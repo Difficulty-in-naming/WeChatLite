@@ -77,6 +77,12 @@ impl Query {
             && (self.q.is_empty()
                 || row.text.contains(&self.q)
                 || row.sender.contains(&self.q)
+                || row.record.as_ref().is_some_and(|record| {
+                    record
+                        .items
+                        .iter()
+                        .any(|item| item.text.contains(&self.q) || item.sender.contains(&self.q))
+                })
                 || row.media.iter().any(|m| m.name.contains(&self.q)))
             && match self.kind.as_str() {
                 "file" => row.media.iter().any(|m| m.kind == "file"),

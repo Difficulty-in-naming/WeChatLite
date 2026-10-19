@@ -33,6 +33,7 @@ class HistoryBrowser;
 class AnnouncementDialog;
 class PreferencesDialog;
 class QScreen;
+class QDialog;
 
 QRect chatWindowBounds(const QRect &available, const QRect &requested = {});
 
@@ -69,6 +70,8 @@ class Window : public QMainWindow
     void showHistoryBrowser();
     void showAnnouncement();
     void invalidateAuxiliaryWindows();
+    void showForwardRecord(const QJsonObject &message);
+    void refreshForwardRecord();
     void activateHistoryRecord(const QJsonObject &message, const QJsonObject &media);
     void playLocatedRecord(const QString &messageId);
     void clearPendingRecord(const QString &messageId);
@@ -134,6 +137,10 @@ class Window : public QMainWindow
     QPointer<PreferencesDialog> preferencesDialog;
     QPointer<HistoryBrowser> historyBrowser;
     QPointer<AnnouncementDialog> announcementDialog;
+    QPointer<QDialog> forwardDialog;
+    MessageModel *forwardModel = nullptr;
+    MessageView *forwardView = nullptr;
+    QJsonObject forwardMessage;
     QString pendingRecordId;
     QJsonObject pendingRecordMedia;
     QScrollArea *attachmentArea;
