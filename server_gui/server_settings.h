@@ -6,6 +6,7 @@ class QLabel;
 class QLineEdit;
 class QListWidget;
 class QPushButton;
+class QPlainTextEdit;
 
 class ForwardingSettings : public QWidget
 {
@@ -20,6 +21,7 @@ class ForwardingSettings : public QWidget
     QString configPath;
     Transport transport;
     QLineEdit *search;
+    QPlainTextEdit *patterns;
     QListWidget *groups;
     QLabel *status, *count;
     QPushButton *refreshButton, *applyButton;

@@ -20,6 +20,7 @@
 #include <QMessageBox>
 #include <QMenu>
 #include <QPushButton>
+#include <QPlainTextEdit>
 #include <QSaveFile>
 #include <QSettings>
 #include <QSignalSpy>
@@ -55,6 +56,9 @@ class AdminFixture final : public QTcpServer
     QString clientToken = "wxcl_" + QString(64, 'c');
     QString serverId = QString(64, 'b');
     QJsonObject client, rotationBody;
+    QJsonObject forwarding{{"groups", QJsonArray{QJsonObject{{"id", "offline-group"}, {"name", "离线群"}}}},
+        {"selected", QJsonArray{"offline-group"}}, {"manual_selected", QJsonArray{"offline-group"}}, {"patterns", QJsonArray{}}};
+    QJsonObject forwardingRequest;
 
     void seedClient()
     {
@@ -107,8 +111,15 @@ class AdminFixture final : public QTcpServer
                 response = {{"error", "fixture administrator authorization required"}};
             }
             else if (path == "/api/local/forwarding" && method == "GET")
-                response = {{"groups", QJsonArray{QJsonObject{{"id", "offline-group"}, {"name", "离线群"}}}},
-                    {"selected", QJsonArray{"offline-group"}}};
+                response = forwarding;
+            else if (path == "/api/local/forwarding" && method == "POST")
+            {
+                forwardingRequest = payload;
+                forwarding["manual_selected"] = payload["selected"];
+                forwarding["selected"] = payload["selected"];
+                forwarding["patterns"] = payload["patterns"];
+                response = forwarding;
+            }
             else if (path == "/api/local/p2p" && method == "GET")
             {
                 ++p2pReads;
@@ -316,6 +327,49 @@ class ServerGuiTests : public QObject
 {
     Q_OBJECT
   private slots:
+    void groupRulesRoundTripWithoutPromotingAutomaticMatchesIntoManualSelections()
+    {
+        QTemporaryDir directory;
+        AdminFixture fixture;
+        QVERIFY(fixture.listen(QHostAddress::LocalHost, 0));
+        QVERIFY(writeFixtureConfiguration(directory.path(), fixture));
+        fixture.forwarding["groups"] = QJsonArray{
+            QJsonObject{{"id", "offline-group"}, {"name", "手动群"}},
+            QJsonObject{{"id", "auto-group"}, {"name", "BB-PLY002 - jx"}}};
+        fixture.forwarding["selected"] = QJsonArray{"offline-group", "auto-group"};
+        fixture.forwarding["patterns"] = QJsonArray{"*-PLY* - jx"};
+        ForwardingSettings settings(directory.filePath("server.json"));
+        settings.show();
+        auto *rules = settings.findChild<QPlainTextEdit *>("forwardingPatterns");
+        auto *groups = settings.findChild<QListWidget *>("forwardingGroups");
+        QTRY_COMPARE(groups->count(), 2);
+        QCOMPARE(rules->toPlainText(), QString("*-PLY* - jx"));
+        QCOMPARE(groups->item(0)->checkState(), Qt::Checked);
+        QCOMPARE(groups->item(1)->checkState(), Qt::Unchecked);
+        QVERIFY(groups->item(1)->text().contains("规则自动转发"));
+        rules->setPlainText("  *-PLY* - jx  \n\n项目?群\n");
+        settings.findChild<QPushButton *>("forwardingApply")->click();
+        QTRY_COMPARE(fixture.forwardingRequest["patterns"].toArray(), (QJsonArray{"*-PLY* - jx", "项目?群"}));
+        QCOMPARE(fixture.forwardingRequest["selected"].toArray(), QJsonArray{"offline-group"});
+        QTRY_COMPARE(rules->toPlainText(), QString("*-PLY* - jx\n项目?群"));
+
+        fixture.seedClient();
+        fixture.client["group_patterns"] = QJsonArray{"*-PLY* - jx"};
+        ClientPermissions permissions(directory.filePath("server.json"));
+        permissions.show();
+        permissions.refresh();
+        auto *clientRules = permissions.findChild<QPlainTextEdit *>("clientAccessPatterns");
+        QTRY_COMPARE(clientRules->toPlainText(), QString("*-PLY* - jx"));
+        clientRules->setPlainText("*-PLY* - jx\n项目?群");
+        permissions.findChild<QPushButton *>("clientAccessApply")->click();
+        QTRY_COMPARE(fixture.updated, 1);
+        QCOMPARE(fixture.client["group_patterns"].toArray(), (QJsonArray{"*-PLY* - jx", "项目?群"}));
+        QTRY_VERIFY(permissions.findChild<QPushButton *>("clientAccessNew")->isEnabled());
+        permissions.findChild<QPushButton *>("clientAccessNew")->click();
+        QVERIFY(clientRules->toPlainText().isEmpty());
+        QCOMPARE(fixture.rejectedAuthorization, 0);
+    }
+
     void autostartRegistrationIsScopedReversibleAndTracksCurrentProgram_data()
     {
         QTest::addColumn<bool>("windows");

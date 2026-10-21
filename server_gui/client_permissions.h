@@ -9,6 +9,7 @@ class QLabel;
 class QLineEdit;
 class QListWidget;
 class QPushButton;
+class QPlainTextEdit;
 
 class ClientPermissions : public QWidget
 {
@@ -37,6 +38,7 @@ class ClientPermissions : public QWidget
     bool working = false, available = false;
     QListWidget *list, *groups;
     QLineEdit *name;
+    QPlainTextEdit *patterns;
     QCheckBox *enabled, *canSend, *canDownload;
     QLabel *status;
     QWidget *editor;

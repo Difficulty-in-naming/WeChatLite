@@ -9,6 +9,8 @@ pub struct ClientAccess {
     pub enabled: bool,
     pub revoked: bool,
     pub groups: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub group_patterns: BTreeSet<String>,
     pub can_send: bool,
     pub can_download: bool,
     pub created_at: i64,
@@ -23,6 +25,15 @@ pub struct ClientRecord {
     pub access: ClientAccess,
     pub token_hash: String,
     pub token: Option<String>,
+    pub matched_groups: BTreeSet<String>,
+}
+impl ClientRecord {
+    pub fn resolve_groups(&mut self, groups: &[crate::model::Group]) {
+        self.matched_groups = crate::group_rules::resolve(&self.access.group_patterns, groups);
+    }
+    pub fn allows_group(&self, group: &str) -> bool {
+        self.access.groups.contains(group) || self.matched_groups.contains(group)
+    }
 }
 pub type Clients = BTreeMap<String, ClientRecord>;
 
@@ -65,7 +76,7 @@ impl Principal {
         match self {
             Self::Admin => true,
             Self::Client { id, .. } => clients.get(id).is_some_and(|record| {
-                record.access.groups.contains(group)
+                record.allows_group(group)
                     && match capability {
                         Capability::Read => true,
                         Capability::Send => record.access.can_send,
@@ -88,13 +99,13 @@ pub fn can_submit(clients: &Clients, client: &str, group: &str) -> bool {
             record.access.enabled
                 && !record.access.revoked
                 && record.access.can_send
-                && record.access.groups.contains(group)
+                && record.allows_group(group)
         })
 }
 
 pub fn can_read(clients: &Clients, client: &str, group: &str) -> bool {
     client.is_empty()
         || clients.get(client).is_some_and(|record| {
-            record.access.enabled && !record.access.revoked && record.access.groups.contains(group)
+            record.access.enabled && !record.access.revoked && record.allows_group(group)
         })
 }

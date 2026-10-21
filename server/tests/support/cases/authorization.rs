@@ -73,6 +73,31 @@ async fn imported(relay: &Relay) -> Result<(Value, Value)> {
         relay.nonempty("fixture-b").await?[0].clone(),
     ))
 }
+
+pub async fn wildcard_rules_and_client_authorization_survive_restart() -> Result<()> {
+    let mut relay = Relay::new("forwarding").await?;
+    let snapshot = relay.api.get("/api/local/forwarding").await?;
+    let target = snapshot["groups"].as_array().unwrap().iter().find(|group| group["id"] == "fixture-a").unwrap();
+    let pattern = format!("{}*", target["name"].as_str().unwrap());
+    let policy = relay.api.post("/api/local/forwarding", json!({"selected":[],"patterns":[pattern]})).await?;
+    assert_eq!(policy["selected"], json!(["fixture-a"]));
+    assert_eq!(policy["manual_selected"], json!([]));
+    let credential = relay.api.post("/api/local/clients", json!({"name":"Rule client","groups":[],"group_patterns":[pattern]})).await?;
+    let token = credential["token"].as_str().unwrap();
+    assert_eq!(ids(&relay.api.get_as("/api/groups", token).await?), BTreeSet::from(["fixture-a".into()]));
+    relay.stop().await?;
+    relay.start().await?;
+    let policy = relay.api.get("/api/local/forwarding").await?;
+    assert_eq!(policy["patterns"], json!([pattern]));
+    assert_eq!(policy["selected"], json!(["fixture-a"]));
+    assert_eq!(policy["manual_selected"], json!([]));
+    assert_eq!(relay.api.get_as("/api/status", token).await?["permissions"]["groups"], json!(["fixture-a"]));
+    assert_eq!(serde_json::from_slice::<Value>(&std::fs::read(relay.dir.path().join("initial-policy.json"))?)?, json!(["fixture-a"]));
+    let policy = relay.api.post("/api/local/forwarding", json!({"selected":[],"patterns":[]})).await?;
+    assert_eq!(policy["selected"], json!([]));
+    assert_eq!(relay.api.get_as("/api/groups", token).await?, json!([]));
+    Ok(())
+}
 pub async fn history_members_media_old_cursors_and_live_events_cannot_bypass_selection()
 -> Result<()> {
     let relay = Relay::new("forwarding").await?;

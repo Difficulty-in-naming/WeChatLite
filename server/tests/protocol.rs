@@ -59,6 +59,7 @@ async fn main() -> std::process::ExitCode {
         case!(reliability::search_matches_visible_text_sender_and_filename_only),
         case!(reliability::concurrent_messages_reach_both_clients_in_durable_order),
         case!(authorization::default_empty_local_management_validation_and_restart),
+        case!(authorization::wildcard_rules_and_client_authorization_survive_restart),
         case!(authorization::history_members_media_old_cursors_and_live_events_cannot_bypass_selection),
         case!(authorization::deselection_cancels_queued_send_and_confirms_submitted_send_without_retry),
         case!(authorization::recoverable_credentials_defaults_and_restart_preserve_global_policy),

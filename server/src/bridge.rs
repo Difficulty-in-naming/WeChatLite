@@ -17,7 +17,7 @@ use tokio_util::codec::{FramedRead, LinesCodec};
 pub async fn start(app: Arc<App>, mut receiver: mpsc::Receiver<Value>) -> Result<JoinHandle<()>> {
     if app.demo {
         demo_seed(&app).await?;
-        *app.forwarding.write().await = app.db(|s| s.forward_groups()).await?.unwrap_or_default();
+        *app.forwarding.write().await = app.db(|s| s.effective_forward_groups()).await?;
         app.set_status_identity(true, "演示模式 · 未连接真实微信", "me")
             .await;
         return Ok(tokio::spawn(async move {
@@ -485,7 +485,7 @@ async fn run_stream<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                         },
                         "groups"=>{
                             let groups:Vec<Group>=serde_json::from_value(value["groups"].clone())?;
-                            app.db(move|s|s.set_groups(&groups)).await?;app.publish(json!({"type":"groups"}));
+                            app.set_groups(groups).await?;
                         },
                         "members"=>{
                             let group=value["group"].as_str().context("缺少群编号")?.to_owned();

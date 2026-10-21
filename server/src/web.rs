@@ -267,7 +267,7 @@ async fn principal_status(app: &App, principal: &Principal) -> Value {
             if let Some(record) = clients.get(id) {
                 status["authenticated_client"] =
                     json!({"id":id,"name":record.access.name,"admin":false});
-                status["permissions"] = json!({"groups":record.access.groups.intersection(&selected).collect::<Vec<_>>(),"can_send":record.access.can_send,"can_download":record.access.can_download});
+                status["permissions"] = json!({"groups":record.access.groups.union(&record.matched_groups).filter(|group|selected.contains(*group)).collect::<Vec<_>>(),"can_send":record.access.can_send,"can_download":record.access.can_download});
             }
         }
     }
@@ -312,6 +312,7 @@ struct ClientRequest {
     name: Option<String>,
     enabled: Option<bool>,
     groups: Option<BTreeSet<String>>,
+    group_patterns: Option<BTreeSet<String>>,
     can_send: Option<bool>,
     can_download: Option<bool>,
 }
@@ -327,6 +328,10 @@ fn apply_client_request(access: &mut ClientAccess, request: ClientRequest) -> Ap
     }
     if let Some(groups) = request.groups {
         access.groups = groups;
+    }
+    if let Some(patterns) = request.group_patterns {
+        crate::group_rules::validate(&patterns)?;
+        access.group_patterns = patterns;
     }
     if access.groups.len() > 2000
         || access
@@ -350,7 +355,8 @@ fn apply_client_request(access: &mut ClientAccess, request: ClientRequest) -> Ap
     }
     Ok(())
 }
-async fn persist_client(app: &App, record: ClientRecord, create: bool) -> ApiResult<ClientAccess> {
+async fn persist_client(app: &App, record: &mut ClientRecord, create: bool) -> ApiResult<ClientAccess> {
+    record.resolve_groups(&app.db(|store| store.groups()).await?);
     let events = app
         .db({
             let record = record.clone();
@@ -362,7 +368,7 @@ async fn persist_client(app: &App, record: ClientRecord, create: bool) -> ApiRes
     for event in events {
         app.publish(event);
     }
-    Ok(record.access)
+    Ok(record.access.clone())
 }
 async fn local_clients(
     State(app): State<Arc<App>>,
@@ -389,6 +395,7 @@ async fn create_client(
         enabled: true,
         revoked: false,
         groups: BTreeSet::new(),
+        group_patterns: BTreeSet::new(),
         can_send: false,
         can_download: false,
         created_at: now,
@@ -401,13 +408,14 @@ async fn create_client(
         uuid::Uuid::new_v4().simple(),
         uuid::Uuid::new_v4().simple()
     );
-    let record = ClientRecord {
+    let mut record = ClientRecord {
         access,
         token_hash: access::token_hash(&token),
         token: Some(token.clone()),
+        matched_groups: BTreeSet::new(),
     };
     let mut clients = app.clients.write().await;
-    let access = persist_client(&app, record.clone(), true).await?;
+    let access = persist_client(&app, &mut record, true).await?;
     clients.insert(access.id.clone(), record);
     app.clients_changed.send_replace(());
     Ok(credential_response(access, Some(token)))
@@ -468,7 +476,7 @@ async fn rotate_client(
     record.token = Some(token.clone());
     record.access.updated_at = chrono::Utc::now().timestamp_millis();
     record.access.revision += 1;
-    let access = persist_client(&app, record.clone(), false).await?;
+    let access = persist_client(&app, &mut record, false).await?;
     clients.insert(id, record);
     app.clients_changed.send_replace(());
     Ok(credential_response(access, Some(token)))
@@ -486,7 +494,7 @@ async fn update_client(
     apply_client_request(&mut record.access, request)?;
     record.access.updated_at = chrono::Utc::now().timestamp_millis();
     record.access.revision += 1;
-    let access = persist_client(&app, record.clone(), false).await?;
+    let access = persist_client(&app, &mut record, false).await?;
     clients.insert(id, record);
     app.clients_changed.send_replace(());
     Ok(Json(json!({"client":access})))
@@ -505,7 +513,7 @@ async fn revoke_client(
     record.token = None;
     record.access.updated_at = chrono::Utc::now().timestamp_millis();
     record.access.revision += 1;
-    let access = persist_client(&app, record.clone(), false).await?;
+    let access = persist_client(&app, &mut record, false).await?;
     clients.insert(id, record);
     app.clients_changed.send_replace(());
     Ok(Json(json!({"client":access})))
@@ -521,9 +529,10 @@ fn check_group(selected: &BTreeSet<String>, group: &str) -> ApiResult<()> {
 }
 async fn forwarding_snapshot(app: &App) -> ApiResult<Json<Value>> {
     let selected = app.forwarding.read().await;
-    Ok(Json(
-        json!({"groups":app.db(|s|s.group_summaries()).await?,"selected":*selected}),
-    ))
+    let (groups, manual, patterns) = app.db(|s| Ok((
+        s.group_summaries()?, s.forward_groups()?.unwrap_or_default(), s.forward_patterns()?
+    ))).await?;
+    Ok(Json(json!({"groups":groups,"selected":*selected,"manual_selected":manual,"patterns":patterns})))
 }
 async fn local_forwarding(
     State(app): State<Arc<App>>,
@@ -537,6 +546,7 @@ async fn local_forwarding(
 #[serde(deny_unknown_fields)]
 struct ForwardingRequest {
     selected: Vec<String>,
+    patterns: Option<BTreeSet<String>>,
 }
 async fn set_forwarding(
     State(app): State<Arc<App>>,
@@ -553,7 +563,7 @@ async fn set_forwarding(
     {
         bail_api("所选群列表无效或过长")?;
     }
-    app.set_forwarding(request.selected.into_iter().collect())
+    app.set_forwarding_policy(request.selected.into_iter().collect(), request.patterns)
         .await?;
     forwarding_snapshot(&app).await
 }
@@ -1613,6 +1623,95 @@ mod tests {
     use tower::ServiceExt;
 
     #[tokio::test]
+    async fn wildcard_rules_follow_new_groups_and_renames_with_independent_client_access() {
+        let temp = tempfile::tempdir().unwrap();
+        let (app, _) = crate::test_app(temp.path());
+        grant(&app).await;
+        let router = router(app.clone());
+        let call = |method: &str, path: &str, token: &str, body: Value| {
+            router.clone().oneshot(request(method, path, token, "127.0.0.1:2345", Body::from(body.to_string())))
+        };
+        let pattern = "*-PLY* - jx";
+        let response = call("POST", "/api/local/forwarding", &app.config.token,
+            json!({"selected":["g"],"patterns":[pattern]})).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(json_body(response).await["selected"], json!(["g"]));
+        let response = call("POST", "/api/local/clients", &app.config.token,
+            json!({"name":"Rule client","groups":[],"group_patterns":[pattern],"can_download":true})).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let credential = json_body(response).await;
+        let token = credential["token"].as_str().unwrap();
+        let client_id = credential["client"]["id"].as_str().unwrap();
+        let group = |id: &str, name: &str| crate::model::Group {
+            id: id.into(), name: name.into(), count: 1, avatar: String::new()
+        };
+        let mut catalog = vec![group("g", "Fixture"), group("a", "AA-PLY001-X - jx")];
+        let changed = app.forwarding_changed.subscribe();
+        app.set_groups(catalog.clone()).await.unwrap();
+        assert!(changed.has_changed().unwrap()); // The bridge must reconfigure its native download allowlist.
+        assert_eq!(*app.forwarding.read().await, BTreeSet::from(["g".into(), "a".into()]));
+        let groups = json_body(call("GET", "/api/groups", token, json!({})).await.unwrap()).await;
+        assert_eq!(groups.as_array().unwrap().len(), 1);
+        assert_eq!(groups[0]["id"], "a");
+        let explicit = json_body(call("GET", "/api/groups", "fixture-independent-secret", json!({})).await.unwrap()).await;
+        assert_eq!(explicit.as_array().unwrap().len(), 1);
+        assert_eq!(explicit[0]["id"], "g");
+        let status = json_body(call("GET", "/api/status", token, json!({})).await.unwrap()).await;
+        assert_eq!(status["permissions"]["groups"], json!(["a"]));
+        assert_eq!(status["permissions"]["can_send"], false);
+        assert_eq!(call("POST", "/api/messages", token,
+            json!({"id":uuid::Uuid::new_v4().to_string(),"group":"a","client_id":"fixture-client","sender":"Fixture","text":"fixture"})).await.unwrap().status(), StatusCode::FORBIDDEN);
+
+        let source = temp.path().join("media/fixture.bin");
+        tokio::fs::write(&source, b"fixture").await.unwrap();
+        app.store.set_media(&Media { id:"rule-media".into(), name:"fixture.bin".into(), kind:"file".into(),
+            size:7, sha256:"unused-by-download".into(), path:source.to_string_lossy().into() }, "a").unwrap();
+        assert_eq!(call("GET", "/api/media/rule-media", token, json!({})).await.unwrap().status(), StatusCode::OK);
+        assert_eq!(call("GET", "/api/media/rule-media", "fixture-independent-secret", json!({})).await.unwrap().status(), StatusCode::FORBIDDEN);
+
+        catalog.push(group("b", "BB-PLY002 - jx"));
+        catalog.push(group("unrelated", "MH-OTHER - jx"));
+        app.set_groups(catalog.clone()).await.unwrap();
+        let groups = json_body(call("GET", "/api/groups", token, json!({})).await.unwrap()).await;
+        assert_eq!(groups.as_array().unwrap().len(), 2);
+        let principal = Principal::Client { id:client_id.into(), revision:1 };
+        assert!(visible_event(&app, &principal, &json!({"type":"message","message":{"group":"b"}})).await);
+        assert!(!visible_event(&app, &principal, &json!({"type":"message","message":{"group":"unrelated"}})).await);
+
+        catalog[1].name = "Renamed ordinary group".into();
+        app.set_groups(catalog).await.unwrap();
+        assert_eq!(*app.forwarding.read().await, BTreeSet::from(["g".into(), "b".into()]));
+        assert_eq!(call("GET", "/api/media/rule-media", token, json!({})).await.unwrap().status(), StatusCode::FORBIDDEN);
+        assert!(!visible_event(&app, &principal, &json!({"type":"message","message":{"group":"a"}})).await);
+        let groups = json_body(call("GET", "/api/groups", token, json!({})).await.unwrap()).await;
+        assert_eq!(groups.as_array().unwrap().len(), 1);
+        assert_eq!(groups[0]["id"], "b");
+        let persisted = crate::store::Store::open(&temp.path().join("test.sqlite")).unwrap();
+        assert_eq!(persisted.forward_patterns().unwrap(), BTreeSet::from([pattern.into()]));
+        assert_eq!(persisted.effective_forward_groups().unwrap(), *app.forwarding.read().await);
+        assert!(persisted.clients().unwrap()[client_id].allows_group("b"));
+        assert!(!persisted.clients().unwrap()[client_id].allows_group("a"));
+        // An older administrator may update manual choices without erasing rules.
+        let response = call("POST", "/api/local/forwarding", &app.config.token, json!({"selected":["g"]})).await.unwrap();
+        let snapshot = json_body(response).await;
+        assert_eq!(snapshot["manual_selected"], json!(["g"]));
+        assert_eq!(snapshot["patterns"], json!([pattern]));
+        assert_eq!(snapshot["selected"], json!(["b","g"]));
+        let response = call("POST", &format!("/api/local/clients/{client_id}"), &app.config.token,
+            json!({"group_patterns":[]})).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(json_body(call("GET", "/api/groups", token, json!({})).await.unwrap()).await.as_array().unwrap().is_empty());
+        assert!(app.allows("b").await); // Client rules never alter the global selection.
+        let response = call("POST", "/api/local/forwarding", &app.config.token,
+            json!({"selected":["g"],"patterns":[]})).await.unwrap();
+        assert_eq!(json_body(response).await["selected"], json!(["g"]));
+        let response = call("POST", "/api/local/forwarding", &app.config.token,
+            json!({"selected":["g"],"patterns":["invalid\nrule"]})).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(app.store.forward_patterns().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn old_image_reference_is_refreshed_from_the_stored_reply_before_locating() {
         let temp = tempfile::tempdir().unwrap();
         let (app, mut commands) = crate::test_app(temp.path());
@@ -1752,6 +1851,7 @@ mod tests {
                 enabled: true,
                 revoked: false,
                 groups: BTreeSet::from(["g".into()]),
+                group_patterns: BTreeSet::new(),
                 can_send: true,
                 can_download: true,
                 created_at: 1,
@@ -1760,6 +1860,7 @@ mod tests {
             },
             token_hash: access::token_hash("fixture-independent-secret"),
             token: None,
+            matched_groups: BTreeSet::new(),
         }
     }
 
@@ -2752,7 +2853,7 @@ mod tests {
                 State(app.clone()),
                 Extension(Principal::Admin),
                 remote,
-                Json(ForwardingRequest { selected: vec![] })
+                Json(ForwardingRequest { selected: vec![], patterns: None })
             )
             .await
             .err()

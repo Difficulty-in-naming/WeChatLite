@@ -72,6 +72,7 @@ impl Store {
     }
 
     pub fn clients(&self) -> Result<Clients> {
+        let groups = self.groups()?;
         let conn = self.db.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT c.body,c.token_hash,s.token FROM access_clients c LEFT JOIN access_client_secrets s ON s.client_id=c.id ORDER BY c.id",
@@ -88,19 +89,19 @@ impl Store {
             let access: crate::access::ClientAccess = serde_json::from_str(&body)?;
             let token = token
                 .filter(|value| !access.revoked && crate::access::token_hash(value) == token_hash);
-            Ok((
-                access.id.clone(),
-                ClientRecord {
-                    access,
-                    token_hash,
-                    token,
-                },
-            ))
+            let mut record = ClientRecord {
+                access, token_hash, token, matched_groups: Default::default()
+            };
+            record.resolve_groups(&groups);
+            Ok((record.access.id.clone(), record))
         })
         .collect()
     }
 
     pub fn save_client(&self, record: &ClientRecord, create: bool) -> Result<Vec<Value>> {
+        crate::group_rules::validate(&record.access.group_patterns)?;
+        let mut record = record.clone();
+        record.resolve_groups(&self.groups()?);
         if let Some(token) = &record.token {
             ensure!(
                 crate::access::token_hash(token) == record.token_hash,
@@ -168,7 +169,7 @@ impl Store {
             if record.access.enabled
                 && !record.access.revoked
                 && record.access.can_send
-                && record.access.groups.contains(&message.group)
+                && record.allows_group(&message.group)
             {
                 continue;
             }
@@ -234,10 +235,47 @@ impl Store {
         Ok(())
     }
 
-    pub fn set_forward_groups(&self, selected: &BTreeSet<String>) -> Result<Vec<Value>> {
+    pub fn forward_patterns(&self) -> Result<BTreeSet<String>> {
+        let body: Option<String> = self.db.lock().unwrap()
+            .query_row("SELECT body FROM state WHERE key='forward_patterns'", [], |row| row.get(0))
+            .optional()?;
+        Ok(body.map(|body| serde_json::from_str(&body)).transpose()?.unwrap_or_default())
+    }
+
+    pub fn effective_forward_groups(&self) -> Result<BTreeSet<String>> {
+        let mut selected = self.forward_groups()?.unwrap_or_default();
+        selected.extend(crate::group_rules::resolve(
+            &self.forward_patterns()?, &self.groups()?
+        ));
+        Ok(selected)
+    }
+
+    pub fn reconcile_forwarding(&self) -> Result<(BTreeSet<String>, Vec<Value>)> {
+        let selected = self.effective_forward_groups()?;
         let mut conn = self.db.lock().unwrap();
         let tx = conn.transaction()?;
-        for group in selected {
+        let events = Self::cancel_unforwarded(&tx, &selected)?;
+        tx.commit()?;
+        Ok((selected, events))
+    }
+
+    #[cfg(test)]
+    pub fn set_forward_groups(&self, selected: &BTreeSet<String>) -> Result<Vec<Value>> {
+        Ok(self.set_forward_policy(selected, None)?.1)
+    }
+
+    pub fn set_forward_policy(
+        &self,
+        manual: &BTreeSet<String>,
+        patterns: Option<&BTreeSet<String>>,
+    ) -> Result<(BTreeSet<String>, Vec<Value>)> {
+        let patterns = patterns.cloned().unwrap_or(self.forward_patterns()?);
+        crate::group_rules::validate(&patterns)?;
+        let mut selected = manual.clone();
+        selected.extend(crate::group_rules::resolve(&patterns, &self.groups()?));
+        let mut conn = self.db.lock().unwrap();
+        let tx = conn.transaction()?;
+        for group in manual {
             let exists: bool = tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM groups WHERE id=?1)",
                 [group],
@@ -249,8 +287,21 @@ impl Store {
         }
         tx.execute(
             "INSERT OR REPLACE INTO state(key,body) VALUES('forward_groups',?1)",
-            [serde_json::to_string(selected)?],
+            [serde_json::to_string(manual)?],
         )?;
+        tx.execute(
+            "INSERT OR REPLACE INTO state(key,body) VALUES('forward_patterns',?1)",
+            [serde_json::to_string(&patterns)?],
+        )?;
+        let events = Self::cancel_unforwarded(&tx, &selected)?;
+        tx.commit()?;
+        Ok((selected, events))
+    }
+
+    fn cancel_unforwarded(
+        tx: &rusqlite::Transaction<'_>,
+        selected: &BTreeSet<String>,
+    ) -> Result<Vec<Value>> {
         let pending = {
             let mut stmt = tx.prepare("SELECT body FROM messages WHERE status='queued'")?;
             stmt.query_map([], |r| r.get::<_, String>(0))?
@@ -268,9 +319,8 @@ impl Store {
                 "UPDATE messages SET body=?1,status='failed' WHERE id=?2",
                 params![serde_json::to_string(&message)?, message.id],
             )?;
-            events.push(Self::append_event(&tx, &message, false)?);
+            events.push(Self::append_event(tx, &message, false)?);
         }
-        tx.commit()?;
         Ok(events)
     }
 
@@ -1130,6 +1180,7 @@ mod tests {
                 enabled: true,
                 revoked: false,
                 groups: Default::default(),
+                group_patterns: Default::default(),
                 can_send: false,
                 can_download: false,
                 created_at: 1,
@@ -1138,6 +1189,7 @@ mod tests {
             },
             token_hash: crate::access::token_hash(token),
             token: remember.then(|| token.into()),
+            matched_groups: Default::default(),
         }
     }
     #[test]

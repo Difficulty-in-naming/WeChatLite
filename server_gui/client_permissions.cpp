@@ -20,6 +20,7 @@
 #include <QMessageBox>
 #include <QNetworkInterface>
 #include <QPushButton>
+#include <QPlainTextEdit>
 #include <QSslCertificate>
 #include <QSplitter>
 #include <QTimer>
@@ -30,7 +31,7 @@ ClientPermissions::ClientPermissions(const QString &path, QWidget *parent)
 {
     setObjectName("clientPermissions");
     auto *layout = new QVBoxLayout(this);
-    auto *description = new QLabel("每个客户端使用独立密钥。实际可见群 = 本页授权的群 ∩ “转发群”页勾选的群。"
+    auto *description = new QLabel("每个客户端使用独立密钥。实际可见群 = 本页手动或规则授权的群 ∩ 服务端转发的群。"
         "\n停用或撤销立即断开该密钥的连接；本机管理员密钥不能用于远程客户端。");
     description->setWordWrap(true);
     layout->addWidget(description);
@@ -69,7 +70,15 @@ ClientPermissions::ClientPermissions(const QString &path, QWidget *parent)
     form->addRow(canSend);
     form->addRow(canDownload);
     editLayout->addLayout(form);
-    editLayout->addWidget(new QLabel("允许查看的群"));
+    auto *patternHelp = new QLabel("自动授权群名规则（每行一条；* 匹配任意内容，? 匹配一个字符；不区分大小写）");
+    patternHelp->setWordWrap(true);
+    editLayout->addWidget(patternHelp);
+    patterns = new QPlainTextEdit;
+    patterns->setObjectName("clientAccessPatterns");
+    patterns->setPlaceholderText("例如：*-PLY* - jx；符合规则的新群也会自动授权给此客户端");
+    patterns->setMaximumHeight(76);
+    editLayout->addWidget(patterns);
+    editLayout->addWidget(new QLabel("手动授权的群（与上方规则合并生效）"));
     groups = new QListWidget;
     groups->setObjectName("clientAccessGroups");
     editLayout->addWidget(groups, 1);
@@ -199,6 +208,7 @@ void ClientPermissions::newClient()
     selectedId.clear();
     editor->setEnabled(true);
     name->clear();
+    patterns->clear();
     enabled->setChecked(true);
     canSend->setChecked(false);
     canDownload->setChecked(false);
@@ -221,6 +231,9 @@ void ClientPermissions::selectClient()
     const auto client = list->currentItem()->data(Qt::UserRole).toJsonObject();
     selectedId = client.value("id").toString();
     name->setText(client.value("name").toString());
+    QStringList rules;
+    for (const auto &rule : client.value("group_patterns").toArray()) rules.append(rule.toString());
+    patterns->setPlainText(rules.join('\n'));
     enabled->setChecked(client.value("enabled").toBool());
     canSend->setChecked(client.value("can_send").toBool());
     canDownload->setChecked(client.value("can_download").toBool());
@@ -246,7 +259,11 @@ void ClientPermissions::apply()
         if (groups->item(i)->checkState() == Qt::Checked)
             allowed.append(groups->item(i)->data(Qt::UserRole).toString());
     const bool create = selectedId.isEmpty();
+    QJsonArray rules;
+    for (const auto &line : patterns->toPlainText().split('\n'))
+        if (!line.trimmed().isEmpty()) rules.append(line.trimmed());
     QJsonObject request{{"name", name->text().trimmed()}, {"groups", allowed},
+        {"group_patterns", rules},
         {"enabled", enabled->isChecked()}, {"can_send", canSend->isChecked()},
         {"can_download", canDownload->isChecked()}};
     setWorking(true);

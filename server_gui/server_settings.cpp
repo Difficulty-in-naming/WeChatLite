@@ -40,11 +40,19 @@ ForwardingSettings::ForwardingSettings(const QString &path, QWidget *parent)
     setObjectName("forwardingSettings");
     auto *layout = new QVBoxLayout(this);
     layout->setContentsMargins(12, 14, 12, 12);
-    auto *description = new QLabel("仅勾选的群会转发到客户端；取消勾选会立即从所有客户端移除。\n请先启动这台"
-                                   "电脑上的服务，再读取群列表。",
+    auto *description = new QLabel("手动勾选的群和群名规则匹配的群都会转发；微信发现符合规则的新群时会自动加入。\n"
+                                   "客户端还需获得对应群或群名规则的授权。",
                                    this);
     description->setWordWrap(true);
     layout->addWidget(description);
+    auto *patternHelp = new QLabel("自动转发群名规则（每行一条；* 匹配任意内容，? 匹配一个字符；不区分大小写）");
+    patternHelp->setWordWrap(true);
+    layout->addWidget(patternHelp);
+    patterns = new QPlainTextEdit;
+    patterns->setObjectName("forwardingPatterns");
+    patterns->setPlaceholderText("例如：*-PLY* - jx");
+    patterns->setMaximumHeight(76);
+    layout->addWidget(patterns);
     auto *searchRow = new QHBoxLayout;
     search = new QLineEdit;
     search->setObjectName("forwardingSearch");
@@ -62,7 +70,7 @@ ForwardingSettings::ForwardingSettings(const QString &path, QWidget *parent)
     groups->setMinimumHeight(210);
     layout->addWidget(groups, 1);
     auto *selection = new QHBoxLayout;
-    auto *all = new QPushButton("全选"), *none = new QPushButton("清空");
+    auto *all = new QPushButton("全选手动群"), *none = new QPushButton("清空手动选择");
     all->setObjectName("forwardingSelectAll");
     none->setObjectName("forwardingClear");
     selection->addWidget(all);
@@ -114,7 +122,7 @@ void ForwardingSettings::updateCount()
     for (int i = 0; i < groups->count(); ++i)
         if (groups->item(i)->checkState() == Qt::Checked)
             ++selected;
-    count->setText(QString("已选 %1 / %2 个群").arg(selected).arg(groups->count()));
+    count->setText(QString("手动已选 %1 / %2 个群").arg(selected).arg(groups->count()));
 }
 void ForwardingSettings::refresh()
 {
@@ -131,6 +139,7 @@ void ForwardingSettings::refresh()
     working = true;
     refreshButton->setEnabled(false);
     groups->setEnabled(false);
+    patterns->setEnabled(false);
     status->setText("正在读取本机服务的全部群…");
     transport.get(
         "/api/local/forwarding",
@@ -139,6 +148,7 @@ void ForwardingSettings::refresh()
             working = false;
             refreshButton->setEnabled(true);
             groups->setEnabled(true);
+            patterns->setEnabled(true);
             if (!error.isEmpty())
             {
                 status->setText("无法读取本机群列表，请先启动服务，再点击读取。\n" + error);
@@ -151,14 +161,20 @@ void ForwardingSettings::refresh()
                 return;
             }
             QSet<QString> selected;
-            for (const auto &id : object.value("selected").toArray())
+            const auto manual = object.contains("manual_selected") ? object.value("manual_selected").toArray() : object.value("selected").toArray();
+            for (const auto &id : manual)
                 selected.insert(id.toString());
+            QStringList rules;
+            for (const auto &rule : object.value("patterns").toArray()) rules.append(rule.toString());
+            patterns->setPlainText(rules.join('\n'));
             groups->blockSignals(true);
             groups->clear();
             for (const auto &entry : object.value("groups").toArray())
             {
                 const auto group = entry.toObject();
-                auto *item = new QListWidgetItem(group.value("name").toString(), groups);
+                const auto id = group.value("id").toString();
+                const bool automatic = object.value("selected").toArray().contains(id) && !selected.contains(id);
+                auto *item = new QListWidgetItem(group.value("name").toString() + (automatic ? "（规则自动转发）" : ""), groups);
                 item->setData(Qt::UserRole, group.value("id").toString());
                 item->setFlags(item->flags() | Qt::ItemIsUserCheckable);
                 item->setSizeHint({1, 34});
@@ -170,7 +186,8 @@ void ForwardingSettings::refresh()
             available = true;
             applyButton->setEnabled(true);
             updateCount();
-            status->setText("勾选需要转发的群，保存后立即生效；客户端还需单独获得这些群的权限。");
+            status->setText(QString("当前共转发 %1 个群。手动选择与群名规则合并生效；新群约每分钟自动检查一次。")
+                .arg(object.value("selected").toArray().size()));
         },
         5000);
 }
@@ -221,18 +238,23 @@ void ForwardingSettings::apply()
     for (int i = 0; i < groups->count(); ++i)
         if (groups->item(i)->checkState() == Qt::Checked)
             selected.append(groups->item(i)->data(Qt::UserRole).toString());
+    QJsonArray rules;
+    for (const auto &line : patterns->toPlainText().split('\n'))
+        if (!line.trimmed().isEmpty()) rules.append(line.trimmed());
     working = true;
     applyButton->setEnabled(false);
     refreshButton->setEnabled(false);
     groups->setEnabled(false);
+    patterns->setEnabled(false);
     status->setText("正在保存转发群…");
     transport.post(
-        "/api/local/forwarding", {{"selected", selected}},
+        "/api/local/forwarding", {{"selected", selected}, {"patterns", rules}},
         [this](const QJsonValue &, const QString &error)
         {
             working = false;
             refreshButton->setEnabled(true);
             groups->setEnabled(true);
+            patterns->setEnabled(true);
             if (!error.isEmpty())
             {
                 applyButton->setEnabled(true);

@@ -1,6 +1,7 @@
 mod access;
 mod announcement;
 mod bridge;
+mod group_rules;
 mod history;
 mod model;
 mod poster;
@@ -238,16 +239,47 @@ impl App {
     async fn allows(&self, group: &str) -> bool {
         self.forwarding.read().await.contains(group)
     }
+    #[cfg(test)]
     async fn set_forwarding(&self, groups: BTreeSet<String>) -> Result<()> {
+        self.set_forwarding_policy(groups, None).await
+    }
+    async fn set_forwarding_policy(
+        &self,
+        groups: BTreeSet<String>,
+        patterns: Option<BTreeSet<String>>,
+    ) -> Result<()> {
         let mut current = self.forwarding.write().await;
-        let events = self
+        let (selected, events) = self
+            .db(move |s| s.set_forward_policy(&groups, patterns.as_ref()))
+            .await?;
+        *current = selected;
+        self.forwarding_changed.send_replace(());
+        for event in events {
+            self.publish(event);
+        }
+        self.publish(json!({"type":"groups"}));
+        Ok(())
+    }
+    async fn set_groups(&self, groups: Vec<model::Group>) -> Result<()> {
+        let mut selected = self.forwarding.write().await;
+        let mut clients = self.clients.write().await;
+        let (next, events) = self
             .db({
                 let groups = groups.clone();
-                move |s| s.set_forward_groups(&groups)
+                move |s| {
+                    s.set_groups(&groups)?;
+                    s.reconcile_forwarding()
+                }
             })
             .await?;
-        *current = groups;
-        self.forwarding_changed.send_replace(());
+        if *selected != next {
+            *selected = next;
+            self.forwarding_changed.send_replace(());
+        }
+        for record in clients.values_mut() {
+            record.resolve_groups(&groups);
+        }
+        self.clients_changed.send_replace(());
         for event in events {
             self.publish(event);
         }
@@ -436,7 +468,7 @@ async fn main() -> Result<()> {
     if !demo {
         store.initialize_forward_groups(&BTreeSet::new())?;
     }
-    let forwarding = store.forward_groups()?.unwrap_or_default();
+    let forwarding = store.effective_forward_groups()?;
     let clients = store.clients()?;
     let (events, _) = broadcast::channel(256);
     let (commands, receiver) = mpsc::channel(100);
