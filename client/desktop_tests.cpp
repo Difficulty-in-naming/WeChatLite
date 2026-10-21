@@ -2815,6 +2815,73 @@ class DesktopTests : public QObject
         QCOMPARE(api.count("/api/media/" + imageId), 1);
         const auto downloadedFile = descriptors.last().toObject()["id"].toString();
         QVERIFY(QFileInfo::exists(retained.value(downloadedFile))); // User downloads are outside the cache.
+
+        // Repeated image clicks must reuse one download and one saved file.
+        const auto picture = descriptors.first().toObject();
+        QString savedPicture;
+        QDateTime pictureModified;
+        const auto openedBefore = opened.urls.size();
+        for (int click = 0; click < 5; ++click)
+        {
+            view->scrollTo(model->index(0), QAbstractItemView::PositionAtCenter);
+            QStyleOptionViewItem option;
+            option.rect = view->visualRect(model->index(0)); option.font = view->font();
+            QTest::mouseClick(view->viewport(), Qt::LeftButton, {},
+                             MessageDelegate::bubbleRect(option, model->index(0)).center());
+            QTRY_COMPARE(opened.urls.size(), openedBefore + click + 1);
+            const auto path = opened.urls.last().toLocalFile();
+            if (!click) { savedPicture = path; pictureModified = QFileInfo(path).lastModified(); }
+            QCOMPARE(path, savedPicture);
+            QCOMPARE(QFileInfo(path).lastModified(), pictureModified);
+            QVERIFY(!MediaStorage::isCachePath(path));
+            QCOMPARE(api.count("/api/media/" + imageId), 1);
+        }
+        QCOMPARE(QDir(QFileInfo(savedPicture).absolutePath()).entryList({unique + "-image*.png"}, QDir::Files).size(), 1);
+
+        // The separate merged-record window shares the same persistent media index.
+        auto recordPicture = picture;
+        const auto recordImageId = unique + "-forward-image";
+        recordPicture["id"] = recordImageId;
+        recordPicture["name"] = recordImageId + ".png";
+        contents[recordImageId] = png;
+        const QJsonObject merged{{"id", "cached-image-record"}, {"group", "media-A"},
+            {"timestamp", 3000}, {"status", "received"}, {"media", QJsonArray{recordPicture}},
+            {"record", QJsonObject{{"title", "合成图片记录"}, {"items", QJsonArray{
+                QJsonObject{{"id", "record-picture"}, {"sender", "合成图片"},
+                    {"timestamp", 3000}, {"media", QJsonArray{0}}}}}}}};
+        transport->event({{"type", "message"}, {"message", merged}});
+        QString savedRecordPicture;
+        QDateTime recordPictureModified;
+        for (int opening = 0; opening < 2; ++opening)
+        {
+            view->recordClicked(merged);
+            QPointer<QDialog> dialog = isolated.findChild<QDialog *>("forwardRecordDialog");
+            QVERIFY(dialog);
+            auto *details = dialog->findChild<MessageModel *>();
+            auto *detailView = dialog->findChild<MessageView *>();
+            QCOMPARE(details->rowCount(), 1);
+            QTRY_VERIFY(!details->rows.first()["media"].toArray().first().toObject()["_local"].toString().isEmpty());
+            for (int click = 0; click < 3; ++click)
+            {
+                const auto previousOpens = opened.urls.size();
+                QStyleOptionViewItem option;
+                option.rect = detailView->visualRect(details->index(0)); option.font = detailView->font();
+                QTest::mouseClick(detailView->viewport(), Qt::LeftButton, {},
+                                 MessageDelegate::bubbleRect(option, details->index(0)).topLeft() + QPoint(10, 10));
+                QTRY_COMPARE(opened.urls.size(), previousOpens + 1);
+                const auto path = opened.urls.last().toLocalFile();
+                if (savedRecordPicture.isEmpty())
+                { savedRecordPicture = path; recordPictureModified = QFileInfo(path).lastModified(); }
+                QCOMPARE(path, savedRecordPicture);
+                QCOMPARE(QFileInfo(path).lastModified(), recordPictureModified);
+                QVERIFY(!MediaStorage::isCachePath(path));
+                QCOMPARE(api.count("/api/media/" + recordImageId), 1);
+            }
+            dialog->close();
+            QTRY_VERIFY(!dialog);
+        }
+        QCOMPARE(QDir(QFileInfo(savedRecordPicture).absolutePath()).entryList({recordImageId + "*.png"}, QDir::Files).size(), 1);
+        QVERIFY(api.clientCredentialOnly);
         transport->disconnectService();
     }
     void lateDownloadsAndCopiesCannotRestoreChangedOrRecalledAttachments()
