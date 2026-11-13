@@ -1061,19 +1061,72 @@ class ClientTests : public QObject
         // Godot's page/8 * 0.3 keeps a notch well under a full page.
         QVERIFY(notchTravel < bar->pageStep() * 0.5);
     }
-    void imageQuoteLabelsHideLegacyNativeMetadata()
+    void quoteLabelsHideLegacyNativeMetadata()
     {
         QJsonObject quote{{"sender", "成员"}, {"text", "<?xml version=\"1.0\"?><msg><img md5=\"0123456789abcdef0123456789abcdef\" cdnmidimgurl=\"private-media\"/></msg>"}};
         QCOMPARE(messageQuoteLabel(quote), "成员: [图片]");
         quote["text"] = "<msg><img md5=\"0123456789abcdef0123456789abcdef\"></img></msg>";
         QCOMPARE(messageQuoteLabel(quote), "成员: [图片]");
+        quote["text"] = "<?xml version=\"1.0\"?>\n<msg>\n  <appmsg appid=\"\" sdkver=\"0\">"
+                        "<title>一篇值得阅读的文章</title><type>5</type>"
+                        "<url>https://mp.weixin.qq.com/s/private-cdn-key</url>"
+                        "<des>摘要</des></appmsg>\n</msg>";
+        QCOMPARE(messageQuoteLabel(quote), "成员: [链接] 一篇值得阅读的文章");
+        QVERIFY(!messageQuoteLabel(quote).contains("weixin.qq.com"));
+        quote["text"] = "<msg><appmsg><title>季度报告.pdf</title><type>6</type></appmsg></msg>";
+        QCOMPARE(messageQuoteLabel(quote), "成员: [文件] 季度报告.pdf");
+        quote["text"] = "<msg><appmsg><title>群聊的聊天记录</title><type>19</type></appmsg></msg>";
+        QCOMPARE(messageQuoteLabel(quote), "成员: [聊天记录] 群聊的聊天记录");
+        // The exact shape from a real broken reference: declaration, spacing and
+        // an appmsg without the tags this build needs.
+        quote["text"] = "<?xml version=\"1.0\"?>\n<msg>\n  <appmsg appid=\"\" sdkver=\"0\">";
+        QCOMPARE(messageQuoteLabel(quote), "成员: [消息]");
+        quote["text"] = "<msg><appmsg appid=\"\" sdkver=\"0\"><title>季度报告</title></appmsg></msg>";
+        QCOMPARE(messageQuoteLabel(quote), "成员: [消息] 季度报告");
+        quote["text"] = "<msg><appmsg><type>33</type><title>示例小程序</title></appmsg></msg>";
+        QCOMPARE(messageQuoteLabel(quote), "成员: [小程序] 示例小程序");
+        quote["text"] = "<msg><appmsg><type>2001</type><title>恭喜发财</title></appmsg></msg>";
+        QCOMPARE(messageQuoteLabel(quote), "成员: [红包] 恭喜发财");
+        // A nested refermsg title belongs to the quoted reply, never to this card.
+        quote["text"] = "<msg><appmsg><type>57</type><title>我的回复</title>"
+                        "<refermsg><type>5</type><title>嵌套标题</title></refermsg></appmsg></msg>";
+        QCOMPARE(messageQuoteLabel(quote), "成员: [引用] 我的回复");
+        quote["text"] = "<msg username=\"wxid_fixture\" nickname=\"张三\" alias=\"zhangsan\"/>";
+        QCOMPARE(messageQuoteLabel(quote), "成员: [名片] 张三");
+        quote["text"] = "<msg><voicemsg length=\"3000\"/></msg>";
+        QCOMPARE(messageQuoteLabel(quote), "成员: [语音]");
+        // A group row may keep its sender envelope in front of the native payload.
+        quote["text"] = "wxid_member:\r\n<msg><appmsg><title>季度报告.pdf</title><type>6</type></appmsg></msg>";
+        QCOMPARE(messageQuoteLabel(quote), "成员: [文件] 季度报告.pdf");
+        quote["text"] = "wxid_member:\n普通多行文字\n<msg>不是整段 XML</msg>";
+        QCOMPARE(messageQuoteLabel(quote),
+                 "成员: " + wechatDisplayText("wxid_member:\n普通多行文字\n<msg>不是整段 XML</msg>").replace('\n', ' '));
+        quote["text"] = "<msg><videomsg length=\"10\"/></msg>";
+        QCOMPARE(messageQuoteLabel(quote), "成员: [视频]");
         for (const QString text : {QString("[图片]"), QString("正常文本 [微笑]"),
-                                   QString("<config><img/></config>"), QString("<msg><img/></msg>"),
-                                   QString("<msg><img md5=\"x\"/>截断"),
+                                   QString("<config><img/></config>"), QString("<hello>不是消息</hello>"),
+                                   QString("<msg>用户自己输入的尖括号</msg>"),
                                    QString("<!DOCTYPE msg [<!ENTITY image 'x'>]><msg><img md5=\"x\"/></msg>")})
         {
             quote["text"] = text;
             QCOMPARE(messageQuoteLabel(quote), "成员: " + wechatDisplayText(text));
+        }
+        // Any payload that really is a native message never reaches layout as XML,
+        // even when this build does not know its card type or the tail is truncated.
+        for (const QString text : {QString("<msg><img/></msg>"),
+                                   QString("<msg><img md5=\"x\"/>截断"),
+                                   QString("<msg><unknown/></msg>"),
+                                   QString("<?xml version=\"1.0\"?>纯文本")})
+        {
+            quote["text"] = text;
+            QCOMPARE(messageQuoteLabel(quote), "成员: [消息]");
+        }
+        for (const QString text : {QString("<msg><appmsg><title>超长</title></appmsg></msg>").repeated(1000),
+                                   QString("<msg><appmsg><title>实体</title></appmsg></msg>")
+                                       .replace("<title>", "<!DOCTYPE msg [<!ENTITY x 'y'>]><title>")})
+        {
+            quote["text"] = text;
+            QCOMPARE(messageQuoteLabel(quote), "成员: [消息]");
         }
         quote["unavailable"] = true;
         QCOMPARE(messageQuoteLabel(quote), "原消息已撤回或不可用");

@@ -292,6 +292,88 @@ pub fn prepare_source(group: &str, row: &Value, raw: &Value, wxid: &str) -> Resu
     source_fields(group, row, raw, wxid)
 }
 
+/// Row label and raw local type for each refermsg kind WeChat can quote. Appmsg
+/// cards (link, file, chat record, mini program, transfer, red packet, another
+/// reply) are all stored locally as type 49, while the reference keeps the inner
+/// card type, so a direct numeric comparison would never resolve them.
+pub(crate) fn reference_shape(kind: u64) -> Option<(&'static str, &'static [i64])> {
+    Some(match kind {
+        1 => ("文本", &[1]),
+        3 => ("图片", &[3]),
+        34 => ("语音", &[34]),
+        43 => ("视频", &[43]),
+        47 | 11000 => ("动画表情", &[47, 11000]),
+        48 => ("位置", &[48]),
+        // WeChat stores every appmsg card locally as type 49. Depending on its
+        // version the refermsg keeps either 49 or the inner card type.
+        5 | 6 | 19 | 33 | 36 | 42 | 49 | 51 | 57 | 63 | 74 | 2000 | 2001 => {
+            ("文件/链接/卡片", &[49])
+        }
+        50 => ("音视频通话", &[50]),
+        _ => return None,
+    })
+}
+
+/// Direct children of a native `<msg>` root, or the appmsg identity when present.
+fn native_shape(content: &str) -> Option<(Option<(String, String)>, Vec<String>)> {
+    if content.len() > 2 * 1024 * 1024
+        || content.contains("<!DOCTYPE")
+        || content.contains("<!ENTITY")
+    {
+        return None;
+    }
+    let doc = roxmltree::Document::parse(content).ok()?;
+    let root = doc.root_element();
+    if !root.has_tag_name("msg") {
+        return None;
+    }
+    let mut card = None;
+    let mut tags = Vec::new();
+    for child in root.children().filter(|node| node.is_element()) {
+        tags.push(child.tag_name().name().to_owned());
+        if child.has_tag_name("appmsg") {
+            let kind = scalar(child, "type").unwrap_or_default();
+            let title = scalar(child, "title").unwrap_or_default();
+            card = Some((kind.trim().to_owned(), clean_title(&title)));
+        }
+    }
+    Some((card, tags))
+}
+
+fn same_native_shape(source: &str, reference: &str, kind: u64) -> bool {
+    if xml_newlines(source) == xml_newlines(reference) {
+        return true;
+    }
+    let (Some((source_card, source_tags)), Some((card, tags))) =
+        (native_shape(source), native_shape(reference))
+    else {
+        return false;
+    };
+    if let Some(expected) = match kind {
+        34 => Some("voicemsg"),
+        43 => Some("videomsg"),
+        47 | 11000 => Some("emoji"),
+        48 => Some("location"),
+        _ => None,
+    } {
+        // Voice, video, emoji and location rows carry the same element; their
+        // payload can be rewritten (lengths, thumbnails) between quote time and
+        // the database row, so the element itself is the stable identity.
+        return tags.iter().any(|tag| tag == expected)
+            && source_tags.iter().any(|tag| tag == expected);
+    }
+    // The reference keeps the inner card type (link, file, mini program, ...),
+    // while the database row only says appmsg. Compare that type and, when the
+    // reference carries one, the title.
+    let Some((reference_type, reference_title)) = card else {
+        return false;
+    };
+    let Some((source_type, source_title)) = source_card else {
+        return false;
+    };
+    reference_type == source_type && (reference_title.is_empty() || reference_title == source_title)
+}
+
 /// Resolve received references without enabling additional native send types.
 pub fn matches_reference(
     group: &str,
@@ -300,31 +382,41 @@ pub fn matches_reference(
     wxid: &str,
     reference: &Value,
 ) -> bool {
-    let label = match reference["type"].as_u64() {
-        Some(1) => "文本",
-        Some(3) => "图片",
-        _ => return false,
+    let Some(kind) = reference["type"].as_u64() else {
+        return false;
     };
-    if row["type"] != label || raw["local_type"] != reference["type"] {
+    let Some((label, local_types)) = reference_shape(kind) else {
+        return false;
+    };
+    let local_type = raw["local_type"].as_i64();
+    if row["type"] != label || !local_type.is_some_and(|value| local_types.contains(&value)) {
         return false;
     }
     let Ok(source) = source_fields(group, row, raw, wxid) else {
         return false;
     };
-    source["server_id"] == reference["server_id"]
+    if source["server_id"] != reference["server_id"]
         // Received cards use either the original author or the conversation as fromusr.
         // Neither spelling may override the actor confirmed by this exact group's DB row.
-        && (reference["fromusr"] == source["chatusr"] || reference["fromusr"] == group)
-        && source["chatusr"] == reference["chatusr"]
-        && if reference["type"] == 3 {
+        || (reference["fromusr"] != source["chatusr"] && reference["fromusr"] != group)
+        || source["chatusr"] != reference["chatusr"]
+    {
+        return false;
+    }
+    let actor = text(&source, "chatusr");
+    let source_body = remove_envelope(text(&source, "content"), actor);
+    let reference_body = remove_envelope(text(reference, "text"), actor);
+    match kind {
+        1 => xml_newlines(source_body) == xml_newlines(reference_body),
+        3 => {
             // CDN URLs, thumbnail fields and XML formatting can change when WeChat quotes an image.
             // The exact group/server ID/DB actor above plus the original image digest identify it.
-            image_digest(text(&source, "content")).is_some_and(|digest| {
-                image_digest(remove_envelope(text(reference, "text"), text(&source, "chatusr"))).as_deref() == Some(digest.as_str())
+            image_digest(source_body).is_some_and(|digest| {
+                image_digest(reference_body).as_deref() == Some(digest.as_str())
             })
-        } else {
-            xml_newlines(text(&source, "content")) == xml_newlines(text(reference, "text"))
         }
+        _ => same_native_shape(source_body, reference_body, kind),
+    }
 }
 
 fn image_digest(content: &str) -> Option<String> {
@@ -654,6 +746,156 @@ pub fn reference(content: &str) -> Option<Value> {
     parse_card(content).map(|card| card.source)
 }
 
+const MAX_PREVIEW: usize = 160;
+
+fn clean_title(value: &str) -> String {
+    let mut title = String::new();
+    let mut space = false;
+    for character in value.chars() {
+        if character.is_whitespace() {
+            space = !title.is_empty();
+            continue;
+        }
+        if character.is_control() {
+            continue;
+        }
+        if space {
+            title.push(' ');
+            space = false;
+        }
+        if title.chars().count() >= MAX_PREVIEW {
+            break;
+        }
+        title.push(character);
+    }
+    title
+}
+
+fn appmsg_label(app: roxmltree::Node<'_, '_>) -> Option<String> {
+    let kind = scalar(app, "type")?;
+    let title = scalar(app, "title").map(|title| clean_title(&title)).unwrap_or_default();
+    let label = match kind.trim() {
+        "3" => "[图片]",
+        "5" => "[链接]",
+        "6" | "74" => "[文件]",
+        "19" => "[聊天记录]",
+        "33" | "36" => "[小程序]",
+        "51" => "[视频号]",
+        "57" => "[引用]",
+        "63" => "[直播]",
+        "2000" => "[转账]",
+        "2001" => "[红包]",
+        _ => "[卡片]",
+    };
+    Some(if title.is_empty() {
+        label.to_owned()
+    } else {
+        format!("{label} {title}")
+    })
+}
+
+/// A native preview instead of the refermsg payload. Appmsg bodies are raw XML
+/// carrying CDN URLs and keys, so only a short label and the card title leave the adapter.
+fn native_label(content: &str) -> Option<String> {
+    if content.len() > 2 * 1024 * 1024
+        || content.to_ascii_uppercase().contains("<!DOCTYPE")
+        || content.to_ascii_uppercase().contains("<!ENTITY")
+    {
+        return None;
+    }
+    let start = content.find('<')?;
+    let doc = roxmltree::Document::parse(&content[start..]).ok()?;
+    let root = doc.root_element();
+    if root.has_tag_name("appmsg") {
+        return appmsg_label(root);
+    }
+    if !root.has_tag_name("msg") {
+        return None;
+    }
+    let mut apps = root.children().filter(|node| node.has_tag_name("appmsg"));
+    if let Some(app) = apps.next() {
+        // An appmsg without its own <type> is a truncated or unknown card; its
+        // title still describes it, but the raw XML must not be forwarded.
+        return if apps.next().is_some() {
+            None
+        } else {
+            appmsg_label(app).or_else(|| {
+                scalar(app, "title")
+                    .map(|title| format!("[卡片] {}", clean_title(&title)))
+            })
+        };
+    }
+    if root
+        .descendants()
+        .filter(|node| node.has_tag_name("img"))
+        .any(|node| {
+            node.parent() == Some(root)
+                && node
+                    .attribute("md5")
+                    .is_some_and(|digest| digest.len() == 32 && digest.bytes().all(|b| b.is_ascii_hexdigit()))
+        })
+    {
+        return Some("[图片]".into());
+    }
+    for (tag, label) in [
+        ("voicemsg", "[语音]"),
+        ("videomsg", "[视频]"),
+        ("emoji", "[动画表情]"),
+        ("location", "[位置]"),
+    ] {
+        if root.children().any(|node| node.has_tag_name(tag)) {
+            return Some(label.into());
+        }
+    }
+    let username = root.attribute("username").unwrap_or_default();
+    let nickname = clean_title(root.attribute("nickname").unwrap_or_default());
+    if root.children().all(|node| !node.is_element())
+        && !username.is_empty()
+        && !nickname.is_empty()
+    {
+        return Some(format!("[名片] {nickname}"));
+    }
+    None
+}
+
+fn type_label(reference: &Value) -> &'static str {
+    // Appmsg cards keep their inner kind in `type` (link 5, file 6, record 19,
+    // mini program 33/36, ...). Without a parseable payload only a generic label
+    // is safe, never the raw body.
+    match reference["type"].as_u64() {
+        Some(34) => "[语音]",
+        Some(43) => "[视频]",
+        Some(47 | 11000) => "[动画表情]",
+        Some(48) => "[位置]",
+        Some(50) => "[音视频通话]",
+        Some(10000) => "[系统消息]",
+        Some(8594229559345) => "[红包]",
+        Some(5 | 6 | 19 | 33 | 36 | 42 | 49 | 51 | 57 | 63 | 74 | 2000 | 2001) => "[卡片]",
+        _ => "[消息]",
+    }
+}
+
+/// Display text for a received reference. Never returns the native card payload.
+pub fn reference_preview(reference: &Value) -> String {
+    if reference["type"] == 3 {
+        return "[图片]".into();
+    }
+    let body = text(reference, "text");
+    // A text message is literal user input: even XML-shaped text stays as written.
+    // Only the verified sender envelope WeChat stores in group rows is removed.
+    if reference["type"] == 1 {
+        return remove_envelope(body, text(reference, "chatusr")).to_owned();
+    }
+    if let Some(label) = native_label(body) {
+        return label;
+    }
+    let trimmed = body.trim();
+    if !trimmed.is_empty() && !trimmed.starts_with('<') {
+        return clean_title(trimmed);
+    }
+    type_label(reference).into()
+}
+
 fn xml_newlines(value: &str) -> Cow<'_, str> {
     if value.contains('\r') {
         Cow::Owned(value.replace("\r\n", "\n").replace('\r', "\n"))
@@ -907,6 +1149,86 @@ mod tests {
             &format!("<!DOCTYPE msg [<!ENTITY x SYSTEM 'file:///private'>]>{value}"),
             &expected
         ));
+    }
+    #[test]
+    fn card_and_media_references_resolve_only_the_same_native_row() {
+        let link = "<msg><appmsg><title>一篇文章</title><type>5</type><url>https://example.invalid/a</url></appmsg></msg>";
+        let (mut row, mut raw) = rows(false, link);
+        row["type"] = json!("文件/链接/卡片");
+        raw["local_type"] = json!(49);
+        let reference = json!({"type":49,"server_id":"42","fromusr":GROUP,"chatusr":"wxid_member","text":link});
+        assert!(matches_reference(GROUP, &row, &raw, SELF, &reference));
+        // A rewritten URL/whitespace keeps resolving, but another card type or title cannot.
+        let refreshed = link.replace("https://example.invalid/a", "https://other.invalid/b");
+        let mut changed = reference.clone();
+        changed["text"] = json!(refreshed);
+        assert!(matches_reference(GROUP, &row, &raw, SELF, &changed));
+        changed["text"] = json!(link.replace("<type>5</type>", "<type>6</type>"));
+        assert!(!matches_reference(GROUP, &row, &raw, SELF, &changed));
+        changed["text"] = json!(link.replace("一篇文章", "另一篇文章"));
+        assert!(!matches_reference(GROUP, &row, &raw, SELF, &changed));
+        // The card is displayable but still cannot be used as a native text quote source.
+        assert!(prepare_source(GROUP, &row, &raw, SELF).is_err());
+
+        let voice = "<msg><voicemsg length='3000' voiceformat='4'/></msg>";
+        let (mut row, mut raw) = rows(false, voice);
+        row["type"] = json!("语音");
+        raw["local_type"] = json!(34);
+        let reference = json!({"type":34,"server_id":"42","fromusr":GROUP,"chatusr":"wxid_member","text":"<msg><voicemsg length='9000' voiceformat='4'/></msg>"});
+        assert!(matches_reference(GROUP, &row, &raw, SELF, &reference));
+        changed = json!({"type":34,"server_id":"42","fromusr":GROUP,"chatusr":"wxid_member","text":"<msg><videomsg length='9000'/></msg>"});
+        assert!(!matches_reference(GROUP, &row, &raw, SELF, &changed));
+        assert!(prepare_source(GROUP, &row, &raw, SELF).is_err());
+        // Unknown reference kinds stay unresolved rather than borrowing an unrelated row.
+        assert!(reference_shape(2).is_none());
+        assert!(reference_shape(10002).is_none());
+    }
+    #[test]
+    fn received_card_preview_never_exposes_native_xml_or_keys() {
+        let body = "<msg><appmsg appid='' sdkver='0'><title>一篇值得阅读的文章</title><type>5</type><url>https://mp.weixin.qq.com/s/private-key</url><des>摘要</des></appmsg></msg>";
+        let reference = json!({"type":49,"server_id":"42","fromusr":GROUP,"chatusr":"member","text":body});
+        let preview = reference_preview(&reference);
+        assert_eq!(preview, "[链接] 一篇值得阅读的文章");
+        assert!(!preview.contains('<') && !preview.contains("weixin.qq.com"));
+        for (kind, expected) in [
+            ("3", "[图片]"),
+            ("6", "[文件] 季度报告.pdf"),
+            ("74", "[文件] 季度报告.pdf"),
+            ("19", "[聊天记录] 群聊的聊天记录"),
+            ("33", "[小程序] 示例小程序"),
+            ("2000", "[转账] 转账"),
+            ("2001", "[红包] 恭喜发财"),
+        ] {
+            let title = if kind == "3" || kind == "74" { "" } else { "<title>标题</title>" };
+            let xml = format!("<msg><appmsg>{title}<type>{kind}</type></appmsg></msg>");
+            let reference = json!({"type":49,"text":xml});
+            let preview = reference_preview(&reference);
+            if kind == "3" {
+                assert_eq!(preview, "[图片]");
+                continue;
+            }
+            assert!(!preview.contains('<'), "{preview}");
+            assert!(preview.starts_with(&expected[..expected.find(' ').unwrap_or(expected.len())]), "{preview}");
+        }
+        assert_eq!(reference_preview(&json!({"type":3,"text":"<msg><img md5='deadbeef'/></msg>"})), "[图片]");
+        assert_eq!(reference_preview(&json!({"type":34,"text":"<msg/>"})), "[语音]");
+        assert_eq!(reference_preview(&json!({"type":1,"text":"纯文本 [微笑]"})), "纯文本 [微笑]");
+        assert_eq!(reference_preview(&json!({"type":1,"chatusr":"wxid_member","text":"wxid_member:\n群里的原文"})), "群里的原文");
+        // A lookalike prefix that is not the verified actor stays untouched.
+        assert_eq!(reference_preview(&json!({"type":1,"chatusr":"wxid_member","text":"wxid_other:\n群里的原文"})), "wxid_other:\n群里的原文");
+        assert_eq!(reference_preview(&json!({"type":1,"text":"<msg>用户自己输入的尖括号</msg>"})), "<msg>用户自己输入的尖括号</msg>");
+        assert_eq!(reference_preview(&json!({"type":47,"text":"<msg><emoji/></msg>"})), "[动画表情]");
+        assert_eq!(reference_preview(&json!({"type":47,"text":"旧版纯文本"})), "旧版纯文本");
+        assert_eq!(reference_preview(&json!({"type":49,"text":"<msg><unknowntag/></msg>"})), "[卡片]");
+        // A malformed or unknown card payload must not leak XML either.
+        assert_eq!(reference_preview(&json!({"type":5,"text":"<msg><appmsg"})), "[卡片]");
+        assert_eq!(reference_preview(&json!({"type":6,"text":"<msg></msg>"})), "[卡片]");
+        assert_eq!(reference_preview(&json!({"type":5,"text":"<msg><appmsg appid='' sdkver='0'><title>季度报告</title></appmsg></msg>"})), "[卡片] 季度报告");
+        assert_eq!(reference_preview(&json!({"type":8594229559345_i64,"text":""})), "[红包]");
+        assert_eq!(reference_preview(&json!({"type":10002,"text":"<msg><x/></msg>"})), "[消息]");
+        assert_eq!(reference_preview(&json!({"type":49,"text":"<msg><appmsg><type>5</type></appmsg></msg>"})), "[链接]");
+        assert_eq!(reference_preview(&json!({"type":49,"text":"<msg><appmsg><type>5</type><title> 多个\n   空白\t</title></appmsg></msg>"})), "[链接] 多个 空白");
+        assert_eq!(reference_preview(&json!({"type":49,"text":"<!DOCTYPE msg [<!ENTITY x 'y'>]><msg/>"})), "[卡片]");
     }
     #[test]
     fn received_reference_has_one_direct_scope_and_a_real_server_identifier() {

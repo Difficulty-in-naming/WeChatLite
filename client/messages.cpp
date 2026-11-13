@@ -12,6 +12,7 @@
 #include <QDateTime>
 #include <QFile>
 #include <QFileInfo>
+#include <QHash>
 #include <QHideEvent>
 #include <QImageReader>
 #include <QKeyEvent>
@@ -62,38 +63,304 @@ void MessageView::setRecallCapability(const QJsonObject &status)
     if (recallUnavailableReason == "当前微信版本的后台撤回暂不可用；请在原版微信中撤回")
         recallUnavailableReason = "后台撤回暂不可用，请在微信中撤回";
 }
-static bool nativeImageReference(const QString &text)
+namespace
 {
-    if (text.size() > 24000 || !text.trimmed().startsWith('<'))
-        return false;
-    QXmlStreamReader xml(text);
-    int depth = 0;
-    bool image = false, root = false;
-    while (!xml.atEnd())
+struct NativeCardFields
+{
+    bool found = false;
+    QString type;
+    QString title;
+};
+
+// Consumes one element whose start tag the reader is positioned on. Only a leaf
+// element qualifies: a title containing markup is not a trustworthy label.
+static QString scalarElement(QXmlStreamReader &xml)
+{
+    int depth = 1;
+    bool scalar = true;
+    QString value;
+    while (depth > 0 && !xml.atEnd())
     {
         const auto token = xml.readNext();
         if (token == QXmlStreamReader::DTD || token == QXmlStreamReader::EntityReference)
-            return false;
+        {
+            scalar = false;
+            continue;
+        }
         if (xml.isStartElement())
         {
             ++depth;
+            scalar = false;
+        }
+        else if (xml.isEndElement())
+            --depth;
+        else if (xml.isCharacters() && scalar && depth == 1)
+            value += xml.text();
+    }
+    return scalar ? value : QString();
+}
+static void skipElement(QXmlStreamReader &xml)
+{
+    int depth = 1;
+    while (depth > 0 && !xml.atEnd())
+    {
+        xml.readNext();
+        if (xml.isStartElement())
+            ++depth;
+        else if (xml.isEndElement())
+            --depth;
+    }
+}
+// Reads an <appmsg> element, but only its own direct title/type children. A
+// nested <refermsg> may contain another title and must never supply this label.
+static NativeCardFields appmsgFields(QXmlStreamReader &xml)
+{
+    NativeCardFields fields;
+    fields.found = true;
+    int depth = 1;
+    while (depth > 0 && !xml.atEnd())
+    {
+        const auto token = xml.readNext();
+        if (token == QXmlStreamReader::DTD || token == QXmlStreamReader::EntityReference)
+            return {};
+        if (xml.isStartElement())
+        {
             if (depth == 1)
-                root = xml.name() == QLatin1String("msg");
-            if (!root)
-                return false;
-            if (depth == 2 && xml.name() == QLatin1String("img"))
             {
-                const auto md5 = xml.attributes().value("md5");
-                image = md5.size() == 32 && std::all_of(md5.begin(), md5.end(), [](QChar c)
+                const auto name = xml.name();
+                if (name == QLatin1String("title") || name == QLatin1String("type"))
                 {
-                    return (c >= '0' && c <= '9') || (c.toLower() >= 'a' && c.toLower() <= 'f');
-                });
+                    const auto value = scalarElement(xml);
+                    if (name == QLatin1String("title") && fields.title.isEmpty())
+                        fields.title = value;
+                    else if (name == QLatin1String("type") && fields.type.isEmpty())
+                        fields.type = value;
+                    continue;
+                }
             }
+            ++depth;
         }
         else if (xml.isEndElement())
             --depth;
     }
-    return !xml.hasError() && image;
+    return xml.hasError() ? NativeCardFields{} : fields;
+}
+static bool validImageDigest(QStringView digest)
+{
+    return digest.size() == 32 && std::all_of(digest.begin(), digest.end(), [](QChar character)
+    {
+        return (character >= u'0' && character <= u'9') ||
+               (character.toLower() >= u'a' && character.toLower() <= u'f');
+    });
+}
+static QString quoteTitle(const QString &value)
+{
+    // Card titles come from message payloads, not from this app; keep the row
+    // bounded even if the sender wrote an exceptionally long one.
+    QString title;
+    title.reserve(qMin(value.size(), 161));
+    bool space = false;
+    for (const auto character : value)
+    {
+        if (character.isSpace())
+        {
+            space = !title.isEmpty();
+            continue;
+        }
+        if (character.isNull() || character.category() == QChar::Other_Control)
+            continue;
+        if (space)
+        {
+            title += ' ';
+            space = false;
+        }
+        if (title.size() >= 160)
+        {
+            title += "…";
+            break;
+        }
+        title += character;
+    }
+    return title;
+}
+static QString appmsgLabel(const NativeCardFields &fields)
+{
+    const auto type = fields.type.trimmed();
+    const auto title = quoteTitle(fields.title);
+    const auto suffix = title.isEmpty() ? QString() : " " + title;
+    // A truncated or older payload may carry no card type at all.
+    if (type.isEmpty()) return "[消息]" + suffix;
+    if (type == "3") return "[图片]";
+    if (type == "5") return "[链接]" + suffix;
+    if (type == "6" || type == "74") return "[文件]" + suffix;
+    if (type == "19") return "[聊天记录]" + suffix;
+    if (type == "33" || type == "36") return "[小程序]" + suffix;
+    if (type == "51") return "[视频号]" + suffix;
+    if (type == "57") return "[引用]" + suffix;
+    if (type == "63") return "[直播]" + suffix;
+    if (type == "2000") return "[转账]" + suffix;
+    if (type == "2001") return "[红包]" + suffix;
+    return "[卡片]" + suffix;
+}
+struct NativeQuoteLabel
+{
+    bool native = false;
+    QString label;
+};
+static bool nativeRootStart(QStringView value)
+{
+    while (!value.isEmpty() && value.front().isSpace())
+        value = value.mid(1);
+    if (value.startsWith(u"<?xml"))
+        return true;
+    if (!value.startsWith(u"<msg"))
+        return false;
+    value = value.mid(4);
+    return value.isEmpty() || value.front().isSpace() || value.front() == u'>' ||
+           (value.front() == u'/' && value.size() > 1 && value.at(1) == u'>');
+}
+// Older adapters stored the raw <msg> payload as a received quote preview. It
+// contains CDN URLs and keys that are not display text, so every native shape
+// this client understands is translated to a short label before layout.
+static NativeQuoteLabel parseNativeQuoteLabel(const QString &text)
+{
+    // Legacy adapters stored the raw payload; later ones store a label. Only
+    // these two roots are native previews, so ordinary text is never rewritten.
+    if (!nativeRootStart(text))
+        return {};
+    // Whatever the size or safety of a native payload, its raw XML never reaches
+    // layout: oversized or entity-bearing payloads degrade to a neutral label.
+    if (text.size() > 24000 ||
+        text.contains("<!DOCTYPE", Qt::CaseInsensitive) ||
+        text.contains("<!ENTITY", Qt::CaseInsensitive))
+        return {true, "[消息]"};
+    QXmlStreamReader xml(text);
+    while (!xml.atEnd())
+    {
+        const auto token = xml.readNext();
+        if (token == QXmlStreamReader::DTD || token == QXmlStreamReader::EntityReference)
+            return {};
+        if (xml.isStartElement())
+            break;
+        if (xml.isCharacters() && !xml.isWhitespace())
+            return {};
+    }
+    if (!xml.isStartElement())
+        return {true, "[消息]"};
+    const auto root = xml.name();
+    if (root == QLatin1String("appmsg"))
+    {
+        const auto fields = appmsgFields(xml);
+        return fields.found ? NativeQuoteLabel{true, appmsgLabel(fields)}
+                            : NativeQuoteLabel{true, "[消息]"};
+    }
+    if (root != QLatin1String("msg"))
+        return {};
+    const auto username = xml.attributes().value("username").toString();
+    const auto nickname = xml.attributes().value("nickname").toString();
+    bool image = false, voice = false, video = false, emoji = false, location = false;
+    int elements = 0;
+    QString directText;
+    NativeCardFields card;
+    int depth = 1;
+    while (depth > 0 && !xml.atEnd())
+    {
+        const auto token = xml.readNext();
+        if (token == QXmlStreamReader::DTD || token == QXmlStreamReader::EntityReference)
+            return {};
+        if (xml.isStartElement())
+        {
+            if (depth != 1)
+            {
+                ++depth;
+                continue;
+            }
+            ++elements;
+            const auto name = xml.name();
+            if (name == QLatin1String("appmsg"))
+            {
+                const auto fields = appmsgFields(xml);
+                if (!fields.found)
+                    return {true, "[消息]"};
+                if (!card.found)
+                    card = fields;
+                continue;
+            }
+            if (name == QLatin1String("img"))
+                image = image || validImageDigest(xml.attributes().value("md5"));
+            else if (name == QLatin1String("voicemsg"))
+                voice = true;
+            else if (name == QLatin1String("videomsg"))
+                video = true;
+            else if (name == QLatin1String("emoji"))
+                emoji = true;
+            else if (name == QLatin1String("location"))
+                location = true;
+            skipElement(xml);
+        }
+        else if (xml.isEndElement())
+            --depth;
+        else if (xml.isCharacters() && depth == 1)
+            directText += xml.text();
+    }
+    if (xml.hasError())
+        return {true, "[消息]"};
+    if (card.found)
+        return NativeQuoteLabel{true, appmsgLabel(card)};
+    if (image)
+        return NativeQuoteLabel{true, "[图片]"};
+    if (voice)
+        return NativeQuoteLabel{true, "[语音]"};
+    if (video)
+        return NativeQuoteLabel{true, "[视频]"};
+    if (emoji)
+        return NativeQuoteLabel{true, "[动画表情]"};
+    if (location)
+        return NativeQuoteLabel{true, "[位置]"};
+    if (!nickname.isEmpty() || !username.isEmpty())
+        return NativeQuoteLabel{true, "[名片] " + quoteTitle(nickname.isEmpty() ? username : nickname)};
+    // Literal text that merely starts with "<msg" has no child elements; keep it
+    // as written. Everything else here is a native payload whose inner type this
+    // build cannot name, and raw XML must never reach layout.
+    if (elements == 0 && !directText.contains('<'))
+        return {};
+    return NativeQuoteLabel{true, "[消息]"};
+}
+// Group rows may keep the sender envelope in front of the native payload. Only
+// the first line counts, and only when a native root follows it.
+static QString nativePayload(const QString &text)
+{
+    if (const auto newline = text.indexOf('\n'); newline > 0)
+    {
+        auto header = QStringView(text).left(newline);
+        if (header.endsWith('\r'))
+            header.chop(1);
+        if (header.endsWith(':'))
+        {
+            const auto body = QStringView(text).mid(newline + 1);
+            if (nativeRootStart(body))
+                return text.mid(newline + 1);
+        }
+    }
+    return text;
+}
+static NativeQuoteLabel nativeQuoteLabel(const QString &text)
+{
+    // Legacy quotes are painted on every scroll frame; parse each payload once.
+    static QHash<QString, NativeQuoteLabel> cache;
+    if (const auto found = cache.constFind(text); found != cache.cend())
+        return *found;
+    const auto result = parseNativeQuoteLabel(nativePayload(text));
+    // Bound the cache in both entries and retained characters; only tiny or
+    // repeated payloads benefit from parsing during a paint anyway.
+    if (result.native && text.size() <= 8192)
+    {
+        if (cache.size() >= 64)
+            cache.clear();
+        cache.insert(text, result);
+    }
+    return result;
+}
 }
 QString messageQuoteText(const QJsonObject &message)
 {
@@ -116,9 +383,13 @@ QString messageQuoteLabel(const QJsonObject &quote)
     if (quote["unavailable"].toBool())
         return "原消息已撤回或不可用";
     const auto text = messageQuoteText(quote);
-    // Older saved references contain native image XML instead of a display label.
-    return quote["sender"].toString() + ": " +
-           (nativeImageReference(text) ? QString("[图片]") : wechatDisplayText(QString(text).replace('\n', ' ')));
+    // Older saved references contain native XML instead of a display label.
+    const auto native = nativeQuoteLabel(text);
+    // Label tags such as "[红包]" name the kind of card; only ordinary text goes
+    // through the display-only emoji alias conversion.
+    const auto body = native.native ? native.label
+                                    : wechatDisplayText(QString(text).replace('\n', ' '));
+    return quote["sender"].toString() + ": " + (body.isEmpty() ? QString("[消息]") : body);
 }
 static QJsonObject redactedMessage(QJsonObject message)
 {

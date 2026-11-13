@@ -27,6 +27,9 @@ pub struct Local {
     actions_error: String,
     quotes: Option<crate::quotes::Quotes>,
     quotes_error: String,
+    // A quoted reply can itself quote another message; expand at most one extra
+    // row so a long chain never recurses through the whole database.
+    quote_depth: usize,
 }
 impl Local {
     pub fn connect(directory: PathBuf) -> Result<Self> {
@@ -54,6 +57,7 @@ impl Local {
             actions_error,
             quotes,
             quotes_error,
+            quote_depth: 0,
         })
     }
     fn avatar(&mut self, id: &str) -> String {
@@ -86,7 +90,7 @@ impl Local {
     }
     fn referenced_original(&mut self, group: &str, reference: &Value) -> Result<Option<Value>> {
         use md5::{Digest, Md5};
-        if reference["type"] != 1 && reference["type"] != 3 {
+        if crate::quotes::reference_shape(reference["type"].as_u64().unwrap_or(0)).is_none() {
             return Ok(None);
         }
         let server = text(reference, "server_id")
@@ -335,8 +339,13 @@ impl Backend for Local {
                 .map(|row| source(group, row))
                 .transpose()?;
             // A referenced image can still be downloading; its reply and stable source ID are ready.
-            let original = if let Some(row) = &source_row {
-                match self.convert(group, row) {
+            let original = if let Some(row) = &source_row
+                && self.quote_depth < 2
+            {
+                self.quote_depth += 1;
+                let converted = self.convert(group, row);
+                self.quote_depth -= 1;
+                match converted {
                     Err(error) if error.is::<crate::media::MediaPending>() => None,
                     result => result?,
                 }
@@ -354,11 +363,7 @@ impl Backend for Local {
                 .as_ref()
                 .map(|source| Uuid::new_v5(&Uuid::NAMESPACE_URL, source.as_bytes()).to_string())
                 .unwrap_or_else(|| format!("unavailable-{}", text(&reference, "server_id")));
-            let preview = if reference["type"] == 3 {
-                "[图片]"
-            } else {
-                text(&reference, "text")
-            };
+            let preview = crate::quotes::reference_preview(&reference);
             message["quote"] = json!({"id":id,"sender":if caption.is_empty(){"群成员"}else{&caption},"text":preview,"unavailable":false});
             // Internal proof for repairing legacy unresolved IDs; it is not part of the public Quote model.
             message["_quote_server_id"] = reference["server_id"].clone();
