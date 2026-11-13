@@ -82,6 +82,19 @@ void SystemNotifier::showMessage(const QString &groupId, const QString &title, c
     Q_ASSERT(QThread::currentThread() == thread());
     if (!validGroup(groupId))
         return;
+    showValidated(groupId, title, body);
+}
+
+void SystemNotifier::showStatus(const QString &title, const QString &body)
+{
+    Q_ASSERT(QThread::currentThread() == thread());
+    // Reuses a synthetic identity so the platform layers keep one code path, but this
+    // identifier never matches a real conversation, so clicking it cannot activate one.
+    showValidated(QStringLiteral("wechat-lite.status"), title, body);
+}
+
+void SystemNotifier::showValidated(const QString &groupId, const QString &title, const QString &body)
+{
     const auto heading = limitedText(title.isEmpty() ? QStringLiteral("微信轻聊") : title, 128);
     const auto message = limitedText(body, 512);
     emit requested(groupId, heading, message);
