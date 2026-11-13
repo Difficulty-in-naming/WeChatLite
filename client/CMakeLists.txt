@@ -109,12 +109,14 @@ if(APPLE)
         connection-tests notifier-tests PROPERTIES ENVIRONMENT "QT_SSL_USE_TEMPORARY_KEYCHAIN=1")
 endif()
 foreach(target wechat-lite desktop-tests client-tests)
-    target_sources(${target} PRIVATE theme.cpp theme.h wechat_emoji.cpp wechat_emoji.h)
+    target_sources(${target} PRIVATE theme.cpp theme.h wechat_emoji.cpp wechat_emoji.h
+        message_cache.cpp message_cache.h)
 endforeach()
 foreach(target wechat-lite desktop-tests)
     target_sources(${target} PRIVATE preferences_dialog.cpp preferences_dialog.h media_storage.cpp media_storage.h)
 endforeach()
 qt_add_executable(preferences-tests preferences_tests.cpp preferences_dialog.cpp preferences_dialog.h
+    connection_info.cpp connection_info.h
     media_storage.cpp media_storage.h attachment.cpp attachment.h theme.cpp theme.h)
 target_link_libraries(preferences-tests PRIVATE Qt6::Widgets Qt6::Test)
 if(MSVC)
@@ -132,4 +134,3 @@ if(MSVC)
 endif()
 add_test(NAME update-tests COMMAND update-tests -o update-tests.txt,txt)
 install(TARGETS wechat-lite BUNDLE DESTINATION . RUNTIME DESTINATION .)
-

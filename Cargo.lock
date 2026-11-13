@@ -4571,6 +4571,7 @@ dependencies = [
  "futures-util",
  "iroh",
  "iroh-relay",
+ "jni 0.21.1",
  "libc",
  "reqwest",
  "rustls",

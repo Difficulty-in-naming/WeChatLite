@@ -133,6 +133,25 @@ class NotifierTests final : public QObject
         QVERIFY(notifier.children().isEmpty());
     }
 
+    void clientStatusNoticesNeverTargetAConversation()
+    {
+        SystemNotifier notifier;
+        QSignalSpy requested(&notifier, &SystemNotifier::requested);
+        notifier.showStatus(QStringLiteral("微信轻聊 · 无法连接服务器"), QStringLiteral("连接服务器超时"));
+        QCOMPARE(requested.count(), 1);
+        // Clicking a status banner must do nothing: the synthetic identity cannot match
+        // a real conversation, so activation cannot open or select one.
+        const auto group = requested.first()[0].toString();
+        QVERIFY(!group.isEmpty());
+        QVERIFY(group.startsWith("wechat-lite.status"));
+        QCOMPARE(requested.first()[1].toString(), QStringLiteral("微信轻聊 · 无法连接服务器"));
+        QCOMPARE(requested.first()[2].toString(), QStringLiteral("连接服务器超时"));
+        notifier.showStatus({}, QString(600, 'b'));
+        QCOMPARE(requested.count(), 2);
+        QCOMPARE(requested.last()[1].toString(), QStringLiteral("微信轻聊"));
+        QCOMPARE(requested.last()[2].toString(), QString(512, 'b') + QChar(0x2026));
+    }
+
     void nativeActivationArgumentsAreRemovedWithoutDroppingClientArguments()
     {
         QProcess fixture;

@@ -46,6 +46,7 @@ int main(int argc, char **argv)
         return app.exec();
     Window window(parser.isSet("demo"));
     QObject::connect(&window, &Window::systemNotificationRequested, &notifier, &SystemNotifier::showMessage);
+    QObject::connect(&window, &Window::statusNotificationRequested, &notifier, &SystemNotifier::showStatus);
     QObject::connect(&window, &Window::notificationSoundPreviewRequested, &notifier, &SystemNotifier::previewSound);
     QObject::connect(&notifier, &SystemNotifier::activated, &window, &Window::activateConversation);
     QObject::connect(&window, &Window::unreadTotalChanged, &notifier, &SystemNotifier::setUnreadTotal);

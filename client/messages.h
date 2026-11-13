@@ -104,6 +104,10 @@ class MessageView : public StableListView
     QMenu *contextMenuFor(const QModelIndex &index, bool avatar, int mediaIndex = -1);
     QMenu *quoteContextMenuFor(const QModelIndex &index);
     void stopScrollAnimation();
+    // Keyboard scrolling for a list that deliberately has no current item: arrow keys move
+    // one reading step and PageUp/PageDown move a viewport. Returns true when the view moved
+    // or requested another history page, so callers can consume the key event.
+    bool scrollByKeyboard(int direction, bool page = false);
     bool scrollAnimationActive() const;
     bool locateMessage(const QString &id);
     void setVoiceState(const QString &id, const QString &state);
@@ -122,6 +126,9 @@ class MessageView : public StableListView
     void latestRequested();
     void olderRequested();
     void viewportChanged();
+    // Escape from the conversation returns to the editor, so Tab -> arrows -> Tab is a
+    // complete keyboard loop and typing does not require clicking the input box again.
+    void editorFocusRequested();
 
   protected:
     void mousePressEvent(QMouseEvent *event) override;

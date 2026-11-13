@@ -1,6 +1,7 @@
 #pragma once
 #include "attachment.h"
 #include "chat_preferences.h"
+#include "message_cache.h"
 #include "recall_drafts.h"
 #include "transport.h"
 #include "tunnel_session.h"
@@ -34,6 +35,7 @@ class AnnouncementDialog;
 class PreferencesDialog;
 class QScreen;
 class QDialog;
+class QFrame;
 
 QRect chatWindowBounds(const QRect &available, const QRect &requested = {});
 
@@ -42,13 +44,19 @@ class Window : public QMainWindow
     Q_OBJECT
   public:
     explicit Window(bool demo = false, const QString &tunnelExecutable = {});
+    // Landing page for the preferences window; connection failures open it on
+    // Connection so a wrong address is one click from being fixed.
+    enum class PreferencesPage { Connection, Storage, Appearance, Notification, Update };
     void showSettings();
-    void showPreferences();
+    void showPreferences(PreferencesPage page = PreferencesPage::Storage);
     void startDemo();
     void activateConversation(const QString &id);
     QMenu *groupContextMenuFor(const QString &id);
   signals:
     void systemNotificationRequested(const QString &groupId, const QString &title, const QString &body);
+    // Client-level trouble (unreachable server, rejected certificate). Not tied to a
+    // conversation and deliberately not activatable.
+    void statusNotificationRequested(const QString &title, const QString &body);
     void notificationSoundPreviewRequested();
     // Aggregate unread across conversations, mirrored to the Dock tile by the native notifier.
     void unreadTotalChanged(int count);
@@ -82,6 +90,11 @@ class Window : public QMainWindow
     void updateUnreadTotal();
     void markConversationRead();
     void selectGroup(const QString &id, const QString &name);
+    // Paints the stored rows of the current group before the first history page.
+    void restoreCachedMessages();
+    void storeCachedMessages();
+    void scheduleCacheWrite();
+    void initializeMessageCache();
     void loadHistory(bool older = false, int pendingAttempt = 0);
     void loadMembers();
     void activateCurrentGroup();
@@ -113,6 +126,11 @@ class Window : public QMainWindow
     void saveDraft();
     void restoreDraft();
     void notify(const QString &text, bool error = false);
+    void showBanner(const QString &text, bool error, const QString &action = QStringLiteral("settings"),
+                    const QString &actionText = QStringLiteral("打开设置"));
+    void hideBanner();
+    void positionBanner();
+    void setConnectionState(const QString &text, bool reconnecting);
     void fetchMedia(const QJsonObject &media, bool saveOnly = false, bool thumbnail = false, bool resumed = false);
     void copyMedia(const QJsonObject &media);
     void copyMediaToClipboard(const QJsonObject &media, const QString &path);
@@ -126,12 +144,22 @@ class Window : public QMainWindow
     Transport transport;
     TunnelSession tunnel;
     AttachmentStore attachments;
-    MessageModel *model;
-    MessageView *messages;
-    Composer *composer;
-    QListWidget *groups;
+    // Uninitialised pointers are read by event filters installed during makeUi(), before
+    // the corresponding widgets exist; keep them nullable from construction.
+    MessageModel *model = nullptr;
+    MessageView *messages = nullptr;
+    Composer *composer = nullptr;
+    QListWidget *groups = nullptr;
     QLineEdit *groupSearch;
     QLabel *title, *subtitle, *connection, *transferLabel, *attachmentCount, *demoLabel;
+    // Floating status strip. It is a child overlay rather than a layout row so that a
+    // connection message can never resize the compose box under the user's cursor.
+    QFrame *banner = nullptr;
+    QLabel *bannerLabel = nullptr;
+    QToolButton *bannerAction = nullptr;
+    QToolButton *bannerRetrySettings = nullptr;
+    bool bannerError = false;
+    bool positioningBanner = false;
     QPushButton *sendButton = nullptr, *historyButton = nullptr, *announcementButton = nullptr,
                 *preferencesButton = nullptr;
     QPointer<PreferencesDialog> preferencesDialog;
@@ -157,6 +185,9 @@ class Window : public QMainWindow
     QJsonObject p2pSettings;
     RecallDrafts recallDrafts;
     ChatPreferences chatPreferences;
+    // Last known rows per conversation, so opening one does not start blank.
+    MessageCache messageCache;
+    bool cacheReady = false;
     QSet<QByteArray> seenMessages;
     QQueue<QByteArray> seenMessageOrder;
     bool notificationsSynced = false;
@@ -167,9 +198,17 @@ class Window : public QMainWindow
     quint64 locateGeneration = 0;
     QProcess demoServer;
     QSystemTrayIcon tray;
-    QTimer draftTimer, thumbnailTimer, cachePruneTimer;
+    QTimer draftTimer, thumbnailTimer, cachePruneTimer, cacheWriteTimer;
+    // Startup watchdog: if nothing has connected shortly after launch, say so once even
+    // when the transport has not produced an error yet (silent SYN retries, helper hang).
+    QTimer startupWatchdog;
+    bool startupAlerted = false;
+    bool demoMode = false;
     bool cacheWorking = false;
     bool composeDragging = false, screenWatching = false;
+    // True while the highlighted conversation is being changed from the keyboard, so the
+    // focus can stay in the list instead of jumping back to the editor after every row.
+    bool groupSelectionFromKeyboard = false;
     int composeHeightPreference = 0, composeDragHeight = 0;
     QPoint composeDragStart;
     QList<QWidget *> resizeEdges;

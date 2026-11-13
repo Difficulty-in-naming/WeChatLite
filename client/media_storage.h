@@ -54,6 +54,11 @@ class LocalFiles final
     mutable QCache<QString, Entry> entries{1024};
     QHash<quintptr, QSet<QString>> pins;
 };
+// Resolves the platform alias of the selected download root only (macOS ~/Downloads is a
+// link to another volume). Nested links below the root are still refused by every caller,
+// because only this one hop is applied. The deepest existing ancestor is resolved and the
+// not-yet-created remainder is appended, so a first-run folder still lands in canonical form.
+QString resolveRoot(const QString &path);
 QString cacheDirectory();
 bool isCachePath(const QString &path);
 qint64 cacheLimit();

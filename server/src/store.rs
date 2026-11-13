@@ -485,17 +485,25 @@ impl Store {
     }
 
     pub fn insert_message(&self, message: &mut ChatMessage) -> Result<Option<Value>> {
-        self.insert_message_kind(message, false)
+        self.insert_message_kind(message, false, true)
     }
 
     pub fn insert_historical_message(&self, message: &mut ChatMessage) -> Result<Option<Value>> {
-        self.insert_message_kind(message, true)
+        self.insert_message_kind(message, true, true)
+    }
+
+    /// Seed history that no client should ever receive as a live event. Demo mode writes its
+    /// backlog before anyone connects, so notifying would only make every new client replay
+    /// hundreds of rows before it reaches "synced".
+    pub fn insert_silent_history(&self, message: &mut ChatMessage) -> Result<Option<Value>> {
+        self.insert_message_kind(message, true, false)
     }
 
     fn insert_message_kind(
         &self,
         message: &mut ChatMessage,
         historical: bool,
+        notify: bool,
     ) -> Result<Option<Value>> {
         let mut conn = self.db.lock().unwrap();
         let tx = conn.transaction()?;
@@ -555,17 +563,23 @@ impl Store {
             "UPDATE messages SET body=?1 WHERE id=?2",
             params![serde_json::to_string(message)?, message.id],
         )?;
-        let mut event = Self::append_event(&tx, message, true)?;
+        let mut event = None;
         if historical {
             tx.execute(
                 "INSERT INTO history_imports(group_id,seq) VALUES(?1,?2)",
                 params![message.group, message.seq],
             )?;
-            event["historical"] = json!(true);
-            tx.execute(
-                "UPDATE events SET body=?1 WHERE seq=?2",
-                params![event.to_string(), event["seq"].as_i64().unwrap()],
-            )?;
+        }
+        if notify {
+            let mut created = Self::append_event(&tx, message, true)?;
+            if historical {
+                created["historical"] = json!(true);
+                tx.execute(
+                    "UPDATE events SET body=?1 WHERE seq=?2",
+                    params![created.to_string(), created["seq"].as_i64().unwrap()],
+                )?;
+            }
+            event = Some(created);
         }
         if !message.source_id.is_empty() {
             tx.execute(
@@ -574,7 +588,7 @@ impl Store {
             )?;
         }
         tx.commit()?;
-        Ok(Some(event))
+        Ok(event)
     }
 
     pub fn enrich_native_quote(

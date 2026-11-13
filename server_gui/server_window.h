@@ -1,5 +1,6 @@
 #pragma once
 #include "transport.h"
+#include <QFile>
 #include <QJsonObject>
 #include <QMainWindow>
 #include <QProcess>
@@ -31,6 +32,7 @@ class ServerWindow : public QMainWindow
     void showAutostart();
     void pollStatus();
     void appendLog(const QString &text);
+    void openLogFile();
     QString configPath;
     bool demo, quitting = false, polling = false, p2pPolling = false, observedHttp = false;
     quint64 serviceGeneration = 0;
@@ -42,6 +44,7 @@ class ServerWindow : public QMainWindow
     QLabel *state, *bridge, *address, *online, *feedback, *p2pState, *p2pId;
     QPushButton *start, *stop, *settings;
     QPlainTextEdit *log;
+    QFile logFile;
     ForwardingSettings *forwarding;
     ClientPermissions *clients;
 };

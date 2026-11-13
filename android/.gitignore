@@ -1,0 +1,12 @@
+# Build output and machine-local toolchain state. The Gradle/Android user homes are redirected here by
+# scripts/build-android.sh so the shared caches never leak into the repository.
+.gradle/
+.gradle-user-home/
+.android-user-home/
+.kotlin/
+build/
+app/build/
+local.properties
+
+# Built from network/ by scripts/build-android.sh; regenerated on every build.
+app/src/main/jniLibs/

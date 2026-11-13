@@ -166,6 +166,12 @@ pub trait Backend {
         Ok(None)
     }
     fn release(&mut self);
+    /// Drops only the snapshots whose shard changed on disk. Defaults to a full
+    /// release for backends without observed state.
+    fn release_changed(&mut self) -> Result<()> {
+        self.release();
+        Ok(())
+    }
 }
 
 pub struct Receipts {
@@ -825,6 +831,7 @@ impl Job {
             }
             state = json!({"expected_hash":expected_hash,"before":before,"group":group,"expected":matching,"await_started":now});
             store.set(&self.attempt_key(), &state)?;
+            let submit_started = std::time::Instant::now();
             if let Err(error) = access.submit(
                 group,
                 step,
@@ -836,6 +843,12 @@ impl Job {
                 }
                 return Err(error);
             }
+            // Diagnostics only: how long the native submit call itself blocked.
+            eprintln!(
+                "[timing] submit kind={} took={}ms",
+                text(&expected, "kind"),
+                submit_started.elapsed().as_millis()
+            );
             state["response"] = json!({"status":"queued","ret":0});
             store.set(&self.attempt_key(), &state)?;
         }
@@ -846,11 +859,13 @@ impl Job {
         let before = state["before"]
             .as_i64()
             .context("已提交消息的确认游标无效")?;
+        let poll_started = std::time::Instant::now();
         let rows = access.page(
             group,
             &json!({"sort_seq":before,"shard":"\u{10ffff}","local_id":i64::MAX}),
             2000,
         )?;
+        let scan_started = std::time::Instant::now();
         let mut matches = vec![];
         for row in &rows {
             if access.matches(group, row, &state["expected"])? {
@@ -860,11 +875,30 @@ impl Job {
                 }
             }
         }
+        // Diagnostics only: separates database snapshot cost from row matching,
+        // and reports how long the message waited for its native server_id.
+        eprintln!(
+            "[timing] poll kind={} rows={} snapshot={}ms match={}ms waited={}ms",
+            text(&expected, "kind"),
+            rows.len(),
+            scan_started.duration_since(poll_started).as_millis(),
+            scan_started.elapsed().as_millis(),
+            now - state["await_started"]
+                .as_f64()
+                .unwrap_or(now),
+        );
         ensure!(
             matches.len() <= 1,
             "微信出现多条相同内容，不能唯一确认发送，未自动重发"
         );
         if let Some((ack, id, created)) = matches.first() {
+            // Diagnostics only: the end-to-end wait that blocked the send queue.
+            eprintln!(
+                "[timing] confirmed kind={} total_wait={}ms server_id={}",
+                text(&expected, "kind"),
+                (now - state["await_started"].as_f64().unwrap_or(now)) * 1000.0,
+                id
+            );
             state["ack"] = json!(ack);
             state["server_id"] = json!(id);
             if created.as_i64().is_some() {
@@ -1025,7 +1059,12 @@ impl<A: Backend> Engine<A> {
     pub fn cycle(&mut self, commands: &[Value], now: f64) -> Vec<Value> {
         let mut events = vec![];
         let result = self.cycle_inner(commands, now, &mut events);
-        self.access.release();
+        // Only rebuild snapshots whose shard actually moved. Dropping every one
+        // made each cycle re-decrypt the whole database (~0.8 s for 125 MB), which
+        // starved the queue while a message waited for native confirmation.
+        if let Err(error) = self.access.release_changed() {
+            events.push(json!({"type":"warning","text":error.to_string()}));
+        }
         if let Err(error) = result {
             events.push(json!({"type":"warning","text":error.to_string()}));
         }
@@ -1262,6 +1301,9 @@ impl<A: Backend> Engine<A> {
         }
         if !self.watched.is_empty() && now - self.last_media >= 1.4 {
             self.last_media = now;
+            // Diagnostics only: inbound delivery shares this single thread with
+            // send confirmation, so a slow send step is also a slow receive.
+            let inbox_started = std::time::Instant::now();
             let placeholders = std::iter::repeat_n("?", self.watched.len())
                 .collect::<Vec<_>>()
                 .join(",");
@@ -1285,6 +1327,8 @@ impl<A: Backend> Engine<A> {
                 pending.push(row?);
             }
             drop(statement);
+            let scanned = pending.len();
+            let mut converted = 0usize;
             for (key, group, raw_locator) in pending {
                 if self.store.contains("echoes", "key", &key)? {
                     self.store
@@ -1294,6 +1338,8 @@ impl<A: Backend> Engine<A> {
                 }
                 let mut retry_locator = None;
                 let mut waiting = None;
+                let item_started = std::time::Instant::now();
+                let mut outcome_converted = false;
                 let result: Result<bool> = (|| {
                     retry_locator = Some(serde_json::from_str::<Value>(&raw_locator)?);
                     let locator = retry_locator.as_ref().context("消息定位缺失")?;
@@ -1313,6 +1359,8 @@ impl<A: Backend> Engine<A> {
                                 "聊天记录附件下载中".into(),
                             ))
                         });
+                        converted += 1;
+                        outcome_converted = true;
                         events.push(json!({"type":"message","historical":locator["historical"]==true,"message":message}));
                     } else {
                         self.store
@@ -1346,6 +1394,23 @@ impl<A: Backend> Engine<A> {
                         params![now + delay, key],
                     )?;
                 }
+                // A single inbound attachment costs an extra snapshot reload plus
+                // a decode, so one slow item delays every later arrival in the list.
+                let item_ms = item_started.elapsed().as_millis();
+                if item_ms >= 50 {
+                    eprintln!(
+                        "[timing] inbox item group={group} outcome={outcome} took={item_ms}ms",
+                        outcome = if outcome_converted { "converted" } else { "pending" },
+                    );
+                }
+            }
+            if scanned > 0 {
+                eprintln!(
+                    "[timing] inbox poll groups={} due={scanned} converted={converted} took={}ms send_job={}",
+                    self.watched.len(),
+                    inbox_started.elapsed().as_millis(),
+                    !self.jobs.is_empty(),
+                );
             }
         }
         Ok(())

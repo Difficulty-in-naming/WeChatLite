@@ -1,5 +1,6 @@
 #include "media_storage.h"
 #include "preferences_dialog.h"
+#include "smooth_scroll.h"
 #include "theme.h"
 #include <QApplication>
 #include <QCheckBox>
@@ -84,6 +85,14 @@ class PreferencesTests final : public QObject
         return value;
     }
 
+    // The dialog takes connection state separately from the savable Values, so
+    // every construction site needs one. Tests that do not exercise the link pages
+    // use this offline default.
+    static PreferencesDialog::Connection offline()
+    {
+        return {};
+    }
+
     QString indexDirectory() const
     {
         return QDir(QFileInfo(currentFiles->path()).canonicalFilePath()).filePath("index");
@@ -124,7 +133,7 @@ class PreferencesTests final : public QObject
     {
         auto initial = defaults();
         QSettings().setValue("themeMode", "light");
-        PreferencesDialog dialog(initial);
+        PreferencesDialog dialog(initial, offline());
         QSignalSpy applied(&dialog, &PreferencesDialog::applied);
         QSignalSpy accepted(&dialog, &QDialog::accepted);
         QSignalSpy usage(&dialog, &PreferencesDialog::usageRequested);
@@ -138,12 +147,15 @@ class PreferencesTests final : public QObject
         dialog.show();
         QTRY_COMPARE(usage.size(), 1);
         QCOMPARE(usage.first()[0].toString(), initial.downloads);
-        QCOMPARE(navigation->count(), 4);
-        navigation->setCurrentRow(3);
+        QCOMPARE(navigation->count(), 5);
+        navigation->setCurrentRow(4);
         QCOMPARE(pages->currentWidget()->objectName(), QString("preferencesUpdatePage"));
         QVERIFY(dialog.findChild<QPushButton *>("updateCheck")->isEnabled());
         QVERIFY(dialog.findChild<QLabel *>("updateStatus")->text().contains("尚未检查"));
+        // The connection page is first so an offline client lands on the fix.
         navigation->setCurrentRow(0);
+        QCOMPARE(pages->currentWidget()->objectName(), QString("preferencesConnectionPage"));
+        navigation->setCurrentRow(1);
         QCOMPARE(pages->currentWidget()->objectName(), QString("preferencesStoragePage"));
         for (int row = 0; row < navigation->count(); ++row)
         {
@@ -153,15 +165,15 @@ class PreferencesTests final : public QObject
             if (row)
                 QVERIFY(navigation->visualItemRect(navigation->item(row - 1)).bottom() < rect.top());
         }
-        QTest::mouseClick(navigation->viewport(), Qt::LeftButton, {}, navigation->visualItemRect(navigation->item(1)).center());
+        QTest::mouseClick(navigation->viewport(), Qt::LeftButton, {}, navigation->visualItemRect(navigation->item(2)).center());
         QCOMPARE(pages->currentWidget()->objectName(), QString("preferencesAppearancePage"));
         theme->setCurrentIndex(theme->findData("dark"));
-        QTest::mouseClick(navigation->viewport(), Qt::LeftButton, {}, navigation->visualItemRect(navigation->item(2)).center());
+        QTest::mouseClick(navigation->viewport(), Qt::LeftButton, {}, navigation->visualItemRect(navigation->item(3)).center());
         QCOMPARE(pages->currentWidget()->objectName(), QString("preferencesNotificationPage"));
         QTest::mouseClick(sound, Qt::LeftButton);
         QTest::mouseClick(dialog.findChild<QPushButton *>("preferencesSoundPreview"), Qt::LeftButton);
         QCOMPARE(soundPreview.size(), 1); // A spy observes the request; no sound backend is connected.
-        QTest::mouseClick(navigation->viewport(), Qt::LeftButton, {}, navigation->visualItemRect(navigation->item(0)).center());
+        QTest::mouseClick(navigation->viewport(), Qt::LeftButton, {}, navigation->visualItemRect(navigation->item(1)).center());
         quota->setCurrentIndex(quota->findData(1024LL * 1024 * 1024));
         PreferencesDialog::Values saved;
         connect(&dialog, &PreferencesDialog::applied, &dialog, [&] { saved = dialog.values(); });
@@ -178,13 +190,36 @@ class PreferencesTests final : public QObject
         QCOMPARE(Theme::mode(), QString("light")); // Applying and saving belong to the caller.
     }
 
+    void wheelSpeedIsOfferedOnTheAppearancePageAndReturnsTheSavedValue()
+    {
+        auto initial = defaults();
+        initial.wheelDamping = 0.5;
+        PreferencesDialog dialog(initial, offline());
+        auto *speed = dialog.findChild<QComboBox *>("preferencesWheelSpeed");
+        QVERIFY(speed);
+        // Offering the raw 1:1 speed is what makes the wheel unusable, so it is opt-in only.
+        QCOMPARE(speed->count(), 5);
+        QCOMPARE(speed->currentData().toReal(), 0.5);
+        QCOMPARE(dialog.values().wheelDamping, 0.5);
+        // An unknown stored value falls back to the standard step instead of index 0.
+        initial.wheelDamping = 0.123;
+        PreferencesDialog fallback(initial, offline());
+        QCOMPARE(fallback.findChild<QComboBox *>("preferencesWheelSpeed")->currentData().toReal(), 0.35);
+        QCOMPARE(fallback.values().wheelDamping, 0.35);
+        // Damping is clamped, and the smooth scroll reads it back.
+        qputenv("WECHAT_LITE_WHEEL_DAMPING", "5");
+        QCOMPARE(SmoothScroll::savedDamping(), 1.0);
+        qputenv("WECHAT_LITE_WHEEL_DAMPING", "0");
+        QCOMPARE(SmoothScroll::savedDamping(), 0.05);
+        qunsetenv("WECHAT_LITE_WHEEL_DAMPING");
+    }
     void cancelPreservesOriginalValuesAndNeverRequestsSoundAutomatically()
     {
         auto initial = defaults();
         initial.theme = "dark";
         initial.notificationSound = false;
         initial.cacheLimitBytes = 256LL * 1024 * 1024;
-        PreferencesDialog dialog(initial);
+        PreferencesDialog dialog(initial, offline());
         QSignalSpy applied(&dialog, &PreferencesDialog::applied);
         QSignalSpy soundPreview(&dialog, &PreferencesDialog::previewSoundRequested);
         dialog.findChild<QComboBox *>("preferencesTheme")->setCurrentIndex(1);
@@ -194,7 +229,7 @@ class PreferencesTests final : public QObject
         QCOMPARE(dialog.result(), int(QDialog::Rejected));
         QVERIFY(applied.isEmpty() && soundPreview.isEmpty());
         QVERIFY(!QSettings().contains("themeMode"));
-        PreferencesDialog restored(initial);
+        PreferencesDialog restored(initial, offline());
         QCOMPARE(restored.values().theme, QString("dark"));
         QVERIFY(!restored.values().notificationSound);
         QCOMPARE(restored.values().cacheLimitBytes, 256LL * 1024 * 1024);
@@ -202,7 +237,7 @@ class PreferencesTests final : public QObject
 
     void staleUsageAndCleanupCallbacksCannotReplaceCurrentStatistics()
     {
-        PreferencesDialog dialog(defaults());
+        PreferencesDialog dialog(defaults(), offline());
         QSignalSpy usage(&dialog, &PreferencesDialog::usageRequested);
         QSignalSpy cleared(&dialog, &PreferencesDialog::clearCacheRequested);
         dialog.show();
@@ -259,7 +294,7 @@ class PreferencesTests final : public QObject
         {
             auto value = defaults();
             value.downloads = path;
-            PreferencesDialog dialog(value);
+            PreferencesDialog dialog(value, offline());
             QSignalSpy applied(&dialog, &PreferencesDialog::applied);
             dialog.show();
             QTest::mouseClick(dialog.findChild<QPushButton *>("preferencesSave"), Qt::LeftButton);
@@ -270,7 +305,7 @@ class PreferencesTests final : public QObject
         }
         auto sibling = defaults();
         sibling.downloads = cacheRoot + "-saved-files";
-        PreferencesDialog allowed(sibling);
+        PreferencesDialog allowed(sibling, offline());
         QSignalSpy applied(&allowed, &PreferencesDialog::applied);
         allowed.show();
         QTest::mouseClick(allowed.findChild<QPushButton *>("preferencesSave"), Qt::LeftButton);
@@ -290,7 +325,7 @@ class PreferencesTests final : public QObject
         });
         auto value = defaults();
         value.downloads = alias;
-        PreferencesDialog dialog(value);
+        PreferencesDialog dialog(value, offline());
         QSignalSpy applied(&dialog, &PreferencesDialog::applied);
         dialog.show();
         QTest::mouseClick(dialog.findChild<QPushButton *>("preferencesSave"), Qt::LeftButton);
@@ -326,7 +361,7 @@ class PreferencesTests final : public QObject
         QCOMPARE(Theme::isDark(), QGuiApplication::styleHints()->colorScheme() == Qt::ColorScheme::Dark);
         auto value = defaults();
         value.theme = QSettings().value("themeMode").toString();
-        PreferencesDialog restored(value);
+        PreferencesDialog restored(value, offline());
         QCOMPARE(restored.values().theme, QString("system"));
     }
 
@@ -395,6 +430,51 @@ class PreferencesTests final : public QObject
         QCOMPARE(usage.cache, qint64(0));
     }
 
+    void downloadRootResolvesItsOwnAliasAndStillRejectsNestedLinks()
+    {
+        // macOS keeps ~/Downloads as a symlink onto another volume. The selected root
+        // must be stored in canonical form or every indexed download is discarded and
+        // fetched a second time, but links *below* the root stay refused.
+        QTemporaryDir tree;
+        QVERIFY(tree.isValid());
+        const auto real = QDir(QFileInfo(tree.path()).canonicalFilePath()).filePath("real-downloads");
+        QVERIFY(QDir().mkpath(real));
+        const auto alias = tree.filePath("downloads-alias");
+        std::error_code error;
+        std::filesystem::create_directory_symlink(
+            QFileInfo(real).canonicalFilePath().toStdString(), alias.toStdString(), error);
+        if (error) QSKIP("This account cannot create a directory symlink.");
+        QCOMPARE(MediaStorage::resolveRoot(alias), QFileInfo(real).canonicalFilePath());
+        // A not-yet-created child resolves the existing part and keeps the rest.
+        const auto missing = QDir(alias).filePath("2026-10-22");
+        QCOMPARE(MediaStorage::resolveRoot(missing),
+                 QDir(QFileInfo(real).canonicalFilePath()).filePath("2026-10-22"));
+        // Plain paths are unchanged, and the canonical root is indexable as before.
+        QCOMPARE(MediaStorage::resolveRoot(real), QFileInfo(real).canonicalFilePath());
+        const auto contents = QByteArray("delivered");
+        const auto descriptor = media("alias-id", "image", "点开的图片.png", contents);
+        const auto path = QDir(real).filePath("点开的图片.png");
+        QVERIFY(store(path, contents));
+        const auto resolved = MediaStorage::resolveRoot(alias);
+        MediaStorage::LocalFiles files("alias-scope", QDir(QFileInfo(tree.path()).canonicalFilePath()).filePath("index"));
+        files.remember("g", descriptor, path);
+        QVERIFY2(!files.find("g", descriptor).isEmpty(),
+                 "A root resolved through its own alias must stay indexed.");
+        QCOMPARE(QDir(resolved).filePath("点开的图片.png"), files.find("g", descriptor));
+        // Nesting a link below the root is still rejected by the index.
+        const auto nestedTarget = QDir(QFileInfo(tree.path()).canonicalFilePath()).filePath("outside");
+        QVERIFY(QDir().mkpath(nestedTarget));
+        const auto nested = QDir(real).filePath("nested");
+        std::error_code nestedError;
+        std::filesystem::create_directory_symlink(
+            QFileInfo(nestedTarget).canonicalFilePath().toStdString(), nested.toStdString(), nestedError);
+        if (nestedError) return;
+        const auto hidden = QDir(nested).filePath("hidden.png");
+        QVERIFY(store(hidden, contents));
+        const auto nestedDescriptor = media("nested-id", "image", "hidden.png", contents);
+        files.remember("g", nestedDescriptor, hidden);
+        QVERIFY(files.find("g", nestedDescriptor).isEmpty());
+    }
     void chosenDownloadRootResolvesAliasButNestedLinksAreSkipped()
     {
         const auto outside = currentFiles->filePath("outside");

@@ -407,6 +407,25 @@ bool LocalFiles::removeIfUnpinned(const QString &path, bool &pinned)
     // The deletion and live pin updates share this lock, closing the check/delete race.
     return QFile::remove(path);
 }
+QString resolveRoot(const QString &path)
+{
+    if (!QDir::isAbsolutePath(path)) return path;
+    const auto clean = QDir::cleanPath(path);
+    QString remainder;
+    auto current = clean;
+    while (!current.isEmpty())
+    {
+        const auto resolved = QFileInfo(current).canonicalFilePath();
+        if (!resolved.isEmpty()) return QDir::cleanPath(resolved + remainder);
+        const auto name = QFileInfo(current).fileName();
+        if (name.isEmpty()) break;
+        remainder.prepend('/' + name);
+        const auto parent = QFileInfo(current).absolutePath();
+        if (parent == current) break;
+        current = parent;
+    }
+    return clean;
+}
 QString cacheDirectory()
 {
     return QDir(QStandardPaths::writableLocation(QStandardPaths::CacheLocation)).filePath("media");

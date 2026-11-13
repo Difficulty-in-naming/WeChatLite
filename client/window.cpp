@@ -29,6 +29,7 @@
 #include <QHBoxLayout>
 #include <QImageReader>
 #include <QJsonDocument>
+#include <QKeyEvent>
 #include <QLabel>
 #include <QLineEdit>
 #include <QListWidget>
@@ -49,6 +50,7 @@
 #include <QSplitter>
 #include <QStandardPaths>
 #include <QThreadPool>
+#include <QScopeGuard>
 #include <QSvgRenderer>
 #include <QTcpServer>
 #include <QToolButton>
@@ -173,6 +175,7 @@ Window::Window(bool demo, const QString &tunnelExecutable)
     : transport(this), tunnel(this, tunnelExecutable), attachments(this), demoServer(this), tray(this)
 {
     connect(this, &QObject::destroyed, [generation = cacheRecoveryGeneration] { ++*generation; });
+    demoMode = demo;
 #ifdef Q_OS_WIN
     demoServer.setCreateProcessArgumentsModifier([](QProcess::CreateProcessArguments *arguments)
                                                  { arguments->flags |= 0x08000000; });
@@ -181,15 +184,24 @@ Window::Window(bool demo, const QString &tunnelExecutable)
     serverUrl = settings.value("serverUrl").toString();
     secret = settings.value("token").toString();
     nickname = settings.value("nickname", "我").toString();
-    downloadRoot =
+    // Store the canonical form of the selected root. ~/Downloads is a symlink onto
+    // another volume on many Macs, and every index write rejects aliased paths, so
+    // keeping the alias made each download impossible to remember and therefore
+    // fetched again on every click.
+    const auto configuredDownloads =
         settings
             .value("downloads",
                    QStandardPaths::writableLocation(QStandardPaths::DownloadLocation) + "/微信轻聊")
             .toString();
+    downloadRoot = MediaStorage::resolveRoot(configuredDownloads);
+    // Write the resolved form back so the setting, the delivered paths and the media
+    // index all agree from now on, instead of silently differing on every launch.
+    if (downloadRoot != configuredDownloads) settings.setValue("downloads", downloadRoot);
     pin = settings.value("certificatePin").toString();
     p2pSettings = QJsonDocument::fromJson(settings.value("p2p").toByteArray()).object();
     chatPreferences.configure(serverUrl, secret);
     localFiles = std::make_shared<MediaStorage::LocalFiles>(chatPreferences.scope());
+    initializeMessageCache();
     clientId = settings.value("clientId").toString();
     if (clientId.isEmpty())
     {
@@ -228,6 +240,9 @@ Window::Window(bool demo, const QString &tunnelExecutable)
     thumbnailTimer.setInterval(180);
     thumbnailTimer.setSingleShot(true);
     connect(&thumbnailTimer, &QTimer::timeout, this, &Window::visibleThumbnails);
+    cacheWriteTimer.setSingleShot(true);
+    cacheWriteTimer.setInterval(800);
+    connect(&cacheWriteTimer, &QTimer::timeout, this, &Window::storeCachedMessages);
     cachePruneTimer.setSingleShot(true);
     cachePruneTimer.setInterval(1000);
     connect(&cachePruneTimer, &QTimer::timeout, this, [this]
@@ -249,6 +264,30 @@ Window::Window(bool demo, const QString &tunnelExecutable)
             });
     connect(&attachments, &AttachmentStore::warning, this,
             [this](const QString &text) { notify(text, true); });
+    // Backup reminder for the case this whole change exists for: the client is configured
+    // but nothing connects and no error ever arrives. One banner and one system
+    // notification, so a window left in the background still reports the problem.
+    startupWatchdog.setSingleShot(true);
+    startupWatchdog.setInterval(20000);
+    connect(&startupWatchdog, &QTimer::timeout, this,
+            [this]
+            {
+                if (connected || quitting || startupAlerted)
+                    return;
+                startupAlerted = true;
+                const auto reason = lastError.isEmpty()
+                                        ? QStringLiteral("连接服务器超时，请检查网络或连接设置。")
+                                        : lastError;
+                // The transport may already have reported the precise cause; the banner
+                // stays useful either way, but the OS notification is only for the silent
+                // case so a certificate error is not announced twice.
+                if (lastError.isEmpty())
+                    setConnectionState(reason, true);
+                if (!demoMode && !quitting && !QStandardPaths::isTestModeEnabled())
+                    emit statusNotificationRequested(
+                        QStringLiteral("微信轻聊 · 无法连接服务器"),
+                        reason.size() > 160 ? reason.left(160) + QStringLiteral("…") : reason);
+            });
     connect(composer, &QTextEdit::textChanged, this,
             [this]
             {
@@ -260,6 +299,19 @@ Window::Window(bool demo, const QString &tunnelExecutable)
                 updateSendButton();
             });
     connect(composer, &Composer::sendRequested, this, &Window::send);
+    connect(composer, &Composer::scrollRequested, this,
+            [this](int direction, bool page) { messages->scrollByKeyboard(direction, page); });
+    // Keyboard focus decides which region the arrows move: the editor keeps them for the
+    // caret, while the conversation and the group list scroll themselves when focused.
+    // Tab walks editor -> conversation -> group list -> editor. QTextEdit would otherwise
+    // insert a literal tab and QListView would keep Tab for itself, so the three widgets
+    // hand focus to each other explicitly; Escape returns here from the conversation.
+    connect(composer, &Composer::focusMoveRequested, this,
+            [this](bool backward)
+            {
+                auto *target = backward ? static_cast<QWidget *>(groups) : static_cast<QWidget *>(messages);
+                target->setFocus(Qt::TabFocusReason);
+            });
     connect(sendButton, &QPushButton::clicked, this, &Window::send);
     connect(&transport, &Transport::event, this, &Window::handleEvent);
     connect(&transport, &Transport::warning, this, [this](const QString &text) { notify(text, true); });
@@ -287,7 +339,7 @@ Window::Window(bool demo, const QString &tunnelExecutable)
         transport.configure({}, secret, pin);
         clearConversation();
         subtitle->setText(text);
-        notify(text, true);
+        notify("自动连接失败：" + text, true);
         setProperty("connectionPath", "failed");
     });
     connect(&transport, &Transport::connectionChanged, this,
@@ -299,11 +351,16 @@ Window::Window(bool demo, const QString &tunnelExecutable)
                 connection->setText(value ? "● 已连接服务器" : "○ 正在连接服务器…");
                 if (value)
                 {
+                    startupWatchdog.stop();
+                    hideBanner();
+                    lastError.clear();
+                    setWindowTitle("微信轻聊");
                     loadPermissions();
                     loadGroups();
                 }
                 else
                 {
+                    storeCachedMessages();
                     selfMemberId.clear();
                     invalidateAuxiliaryWindows();
                     historyButton->setEnabled(false);
@@ -320,6 +377,25 @@ Window::Window(bool demo, const QString &tunnelExecutable)
                     sendButton->setEnabled(false);
                     ready = false;
                     subtitle->setText("服务器连接已断开，正在自动重连");
+                    // Visible in the window list and Mission Control too, so a backgrounded
+                    // window still shows that it is not connected.
+                    setWindowTitle("微信轻聊 · 未连接");
+                    // A transport that cannot succeed (wrong pin, plain http with a pin) stays
+                    // disconnected on purpose; do not promise a retry that will not happen.
+                    if (transport.isBlocked())
+                    {
+                        if (lastError.isEmpty())
+                            setConnectionState("无法连接服务器，请检查连接设置后重试。", false);
+                    }
+                    else if (!quitting)
+                    {
+                        // The reason (timeout, refused, DNS) is more useful than a generic
+                        // "reconnecting"; the transport already reported it via warning().
+                        if (lastError.isEmpty())
+                            setConnectionState("无法连接服务器，正在自动重连。", true);
+                        else
+                            setConnectionState(lastError, true);
+                    }
                 }
             });
     connect(&transport, &Transport::progress, this,
@@ -367,10 +443,17 @@ Window::Window(bool demo, const QString &tunnelExecutable)
             });
     connect(messages, &MessageView::viewportChanged, this, [this]
         { updateCachePins(); thumbnailTimer.start(); });
+    connect(messages, &MessageView::editorFocusRequested, this, [this] { composer->setFocus(); });
     connect(model, &QAbstractItemModel::modelReset, this, &Window::updateCachePins);
     connect(model, &QAbstractItemModel::dataChanged, this, &Window::updateCachePins);
     connect(model, &QAbstractItemModel::modelReset, this, &Window::refreshForwardRecord);
     connect(model, &QAbstractItemModel::dataChanged, this, &Window::refreshForwardRecord);
+    // Everything that changes the list also refreshes the snapshot opened with, but
+    // coalesced: a burst of live messages must not rewrite the file per row.
+    connect(model, &QAbstractItemModel::modelReset, this, &Window::scheduleCacheWrite);
+    connect(model, &QAbstractItemModel::dataChanged, this, &Window::scheduleCacheWrite);
+    connect(model, &QAbstractItemModel::rowsInserted, this, &Window::scheduleCacheWrite);
+    connect(model, &QAbstractItemModel::rowsRemoved, this, &Window::scheduleCacheWrite);
     connect(&demoServer, &QProcess::readyReadStandardError, this,
             [this]
             {
@@ -399,7 +482,7 @@ Window::Window(bool demo, const QString &tunnelExecutable)
                         activateWindow();
                     });
     menu->addAction("连接与下载设置", this, &Window::showSettings);
-    menu->addAction("设置", this, &Window::showPreferences);
+    menu->addAction("设置", this, [this] { showPreferences(); });
     menu->addSeparator();
     menu->addAction("退出客户端", this,
                     [this]
@@ -425,6 +508,7 @@ Window::Window(bool demo, const QString &tunnelExecutable)
             {
                 quitting = true;
                 saveDraft();
+                storeCachedMessages();
                 transport.disconnectService();
                 tunnel.stop();
                 if (demoServer.state() != QProcess::NotRunning)
@@ -433,7 +517,10 @@ Window::Window(bool demo, const QString &tunnelExecutable)
     if (demo)
         QTimer::singleShot(0, this, &Window::startDemo);
     else if (!serverUrl.isEmpty() && secret.size() >= 24)
+    {
+        startupWatchdog.start();
         QTimer::singleShot(0, this, &Window::connectService);
+    }
 }
 
 void Window::makeUi()
@@ -498,7 +585,7 @@ void Window::makeUi()
     preferencesButton->setFixedSize(26, 26);
     preferencesButton->setIconSize({20, 20});
     preferencesButton->setIcon(svgIcon(":/client/icons/settings.svg"));
-    connect(preferencesButton, &QPushButton::clicked, this, &Window::showPreferences);
+    connect(preferencesButton, &QPushButton::clicked, this, [this] { showPreferences(); });
     sideTopLayout->addWidget(preferencesButton);
     groupSearch = new QLineEdit;
     groupSearch->setObjectName("search");
@@ -517,6 +604,11 @@ void Window::makeUi()
     groups->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
     groups->setSpacing(0);
     groups->setContextMenuPolicy(Qt::CustomContextMenu);
+    // Make a click in the list establish it as the keyboard target, so its arrows move the
+    // highlighted conversation and scroll the list instead of editing a draft the user is
+    // no longer looking at. The filter also closes the Tab loop back to the editor.
+    groups->viewport()->installEventFilter(this);
+    groups->installEventFilter(this);
     new SmoothScroll(groups);
     sideLayout->addWidget(groups, 1);
     connect(groups, &QListWidget::customContextMenuRequested, this, [this](const QPoint &position)
@@ -597,6 +689,7 @@ void Window::makeUi()
     model = new MessageModel(this);
     messages = new MessageView;
     messages->setModel(model);
+    messages->installEventFilter(this);
     layout->addWidget(messages, 1);
     connect(messages, &MessageView::olderRequested, this, [this] { loadHistory(true); });
 
@@ -706,10 +799,112 @@ void Window::makeUi()
         handle->installEventFilter(this);
         resizeEdges.append(handle);
     }
+    // Overlay banner: raised above the content and shown only when there is something the
+    // user must know (unreachable server, rejected certificate, lost link). Keeping it out
+    // of the layout means showing or hiding it never moves the compose box.
+    banner = new QFrame(this);
+    banner->setObjectName("statusBanner");
+    banner->hide();
+    auto *bannerLayout = new QHBoxLayout(banner);
+    bannerLayout->setContentsMargins(12, 8, 8, 8);
+    bannerLayout->setSpacing(10);
+    bannerLabel = new QLabel(banner);
+    bannerLabel->setObjectName("statusBannerText");
+    bannerLabel->setTextFormat(Qt::PlainText);
+    bannerLabel->setWordWrap(true);
+    bannerLabel->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
+    bannerLayout->addWidget(bannerLabel, 1);
+    // QToolButton rather than QPushButton: the window's action buttons are deliberately
+    // limited to the chat/header set, and these two belong to the transient strip.
+    bannerAction = new QToolButton(banner);
+    bannerAction->setObjectName("statusBannerAction");
+    bannerAction->setCursor(Qt::PointingHandCursor);
+    bannerAction->setAutoRaise(true);
+    bannerAction->hide();
+    bannerLayout->addWidget(bannerAction, 0, Qt::AlignVCenter);
+    // While retrying, the primary action stays "重试"; this secondary one guarantees a
+    // way to correct the address without hunting through the tray menu.
+    bannerRetrySettings = new QToolButton(banner);
+    bannerRetrySettings->setObjectName("statusBannerSettings");
+    bannerRetrySettings->setText("连接设置");
+    bannerRetrySettings->setCursor(Qt::PointingHandCursor);
+    bannerRetrySettings->setAutoRaise(true);
+    bannerRetrySettings->hide();
+    bannerLayout->addWidget(bannerRetrySettings, 0, Qt::AlignVCenter);
+    auto *bannerClose = new QToolButton(banner);
+    bannerClose->setObjectName("statusBannerClose");
+    bannerClose->setText("×");
+    bannerClose->setAccessibleName("关闭提示");
+    bannerClose->setCursor(Qt::PointingHandCursor);
+    bannerClose->setAutoRaise(true);
+    bannerClose->setFixedSize(18, 18);
+    bannerLayout->addWidget(bannerClose, 0, Qt::AlignVCenter);
+    connect(bannerClose, &QToolButton::clicked, this, &Window::hideBanner);
+    connect(bannerAction, &QToolButton::clicked, this,
+            [this]
+            {
+                // "retry" retries once; "settings" opens the connection page so a
+                // wrong address can be corrected instead of retried forever.
+                if (bannerAction->property("action").toString() == "retry")
+                    transport.reconnectNow();
+                else
+                    showSettings();
+            });
+    connect(bannerRetrySettings, &QToolButton::clicked, this, &Window::showSettings);
 }
 
 bool Window::eventFilter(QObject *watched, QEvent *event)
 {
+    if (groups && watched == groups->viewport() && event->type() == QEvent::MouseButtonPress &&
+        static_cast<QMouseEvent *>(event)->button() == Qt::LeftButton)
+    {
+        groupSelectionFromKeyboard = false;
+        groups->setFocus(Qt::MouseFocusReason);
+    }
+    if (groups && watched == groups && event->type() == QEvent::FocusOut)
+        groupSelectionFromKeyboard = false;
+    // The filter is installed while makeUi() is still building the compose area, so the
+    // editor and conversation must be checked before use; early focus events do arrive.
+    if (messages && watched == messages && event->type() == QEvent::KeyPress)
+    {
+        // Neither list would advance focus with Tab on its own, so complete the loop here.
+        // Escape also returns to the editor, so typing never requires the mouse again.
+        const auto *key = static_cast<QKeyEvent *>(event);
+        if (key->key() == Qt::Key_Tab)
+        {
+            groups->setFocus(Qt::TabFocusReason);
+            return true;
+        }
+        if (key->key() == Qt::Key_Backtab)
+        {
+            composer->setFocus(Qt::TabFocusReason);
+            return true;
+        }
+    }
+    if (groups && composer && messages && watched == groups && event->type() == QEvent::KeyPress)
+    {
+        const auto *key = static_cast<QKeyEvent *>(event);
+        if (key->key() == Qt::Key_Tab)
+        {
+            composer->setFocus(Qt::TabFocusReason);
+            return true;
+        }
+        if (key->key() == Qt::Key_Backtab)
+        {
+            messages->setFocus(Qt::TabFocusReason);
+            return true;
+        }
+        if (key->key() == Qt::Key_Up || key->key() == Qt::Key_Down || key->key() == Qt::Key_PageUp ||
+            key->key() == Qt::Key_PageDown || key->key() == Qt::Key_Home || key->key() == Qt::Key_End)
+            groupSelectionFromKeyboard = true;
+        if (key->key() == Qt::Key_Escape)
+        {
+            composer->setFocus(Qt::OtherFocusReason);
+            return true;
+        }
+        // Up/Down keep the list's own meaning: move the highlighted conversation, which
+        // also scrolls it into view. That is exactly the focus rule used elsewhere.
+    }
     if (watched == composeResizeHandle)
     {
         if (event->type() == QEvent::MouseButtonPress && static_cast<QMouseEvent *>(event)->button() == Qt::LeftButton)
@@ -776,6 +971,8 @@ void Window::resizeEvent(QResizeEvent *event)
         resizeEdges[i]->setVisible(!isMaximized());
         resizeEdges[i]->raise();
     }
+    if (banner && banner->isVisible())
+        positionBanner();
 }
 void Window::showEvent(QShowEvent *event)
 {
@@ -951,16 +1148,22 @@ bool Window::nativeEvent(const QByteArray &type, void *message, qintptr *result)
     return QMainWindow::nativeEvent(type, message, result);
 }
 
-void Window::showPreferences()
+void Window::showPreferences(PreferencesPage page)
 {
     if (preferencesDialog)
     {
+        preferencesDialog->selectPage(static_cast<int>(page));
         preferencesDialog->show(); preferencesDialog->raise(); preferencesDialog->activateWindow();
         return;
     }
     invalidateAuxiliaryWindows();
+    const PreferencesDialog::Connection connection{
+        serverUrl, secret, nickname, pin,
+        QSettings().value("connectionMode", QUrl(serverUrl).scheme() == "p2p" ? "p2p" : "direct").toString(),
+        p2pSettings, ready, connected && !ready, subtitle->text()};
     auto *dialog = new PreferencesDialog({downloadRoot, Theme::mode(),
-        QSettings().value("notificationSound", true).toBool(), MediaStorage::cacheLimit()}, this);
+        QSettings().value("notificationSound", true).toBool(), MediaStorage::cacheLimit(),
+        SmoothScroll::savedDamping()}, connection, this);
     dialog->setAttribute(Qt::WA_DeleteOnClose);
     preferencesDialog = dialog;
     const auto scanGeneration = std::make_shared<std::atomic<quint64>>(0);
@@ -985,6 +1188,48 @@ void Window::showPreferences()
                 { if (target) target->cacheCleared(id, error); });
         });
     connect(dialog, &PreferencesDialog::previewSoundRequested, this, &Window::notificationSoundPreviewRequested);
+    // Applying a connection is immediate: the dialog stays open so the user can see
+    // the result, and the chat banner reflects the same state.
+    connect(dialog, &PreferencesDialog::connectRequested, this, [this, dialog]
+    {
+        const auto connection = dialog->connection();
+        QJsonObject input{{"version", 1}, {"mode", connection.mode},
+            {"serverUrl", connection.serverUrl}, {"token", connection.token},
+            {"certificatePin", connection.certificatePin}, {"p2p", connection.p2p}};
+        QJsonObject validated;
+        QString error;
+        if (!ConnectionInfo::parse(QJsonDocument(input).toJson(QJsonDocument::Compact), validated, error))
+        {
+            dialog->setConnectionState(false, false, error);
+            return;
+        }
+        if (ready || connected || !serverUrl.isEmpty())
+            transport.disconnectService();
+        clearConversation();
+        serverUrl = connection.serverUrl;
+        secret = connection.token;
+        nickname = connection.nickname.isEmpty() ? QStringLiteral("我") : connection.nickname.left(64);
+        pin = connection.certificatePin;
+        p2pSettings = connection.mode == "p2p" ? connection.p2p : QJsonObject{};
+        QSettings settings;
+        settings.setValue("serverUrl", serverUrl);
+        settings.setValue("token", secret);
+        settings.setValue("nickname", nickname);
+        settings.setValue("certificatePin", pin);
+        settings.setValue("connectionMode", connection.mode);
+        settings.setValue("p2p", QJsonDocument(p2pSettings).toJson(QJsonDocument::Compact));
+        chatPreferences.configure(serverUrl, secret);
+        localFiles = std::make_shared<MediaStorage::LocalFiles>(chatPreferences.scope());
+        dialog->setConnectionState(false, true, "正在连接…");
+        connectService();
+    });
+    connect(dialog, &PreferencesDialog::disconnectRequested, this, [this, dialog]
+    {
+        quitting = false;
+        transport.disconnectService();
+        dialog->setConnectionState(false, false, "已断开；地址与密钥已保留，可随时重新连接。");
+        setConnectionState("已断开连接。可在设置中重新连接。", false);
+    });
     connect(dialog, &PreferencesDialog::applied, this, [this, dialog]
     {
         const auto values = dialog->values();
@@ -995,15 +1240,18 @@ void Window::showPreferences()
             invalidateAuxiliaryWindows();
             localFiles = std::make_shared<MediaStorage::LocalFiles>(chatPreferences.scope());
         }
-        downloadRoot = values.downloads;
+        downloadRoot = MediaStorage::resolveRoot(values.downloads);
         QSettings settings;
         settings.setValue("downloads", downloadRoot);
         settings.setValue("notificationSound", values.notificationSound);
         settings.setValue("mediaCacheLimit", values.cacheLimitBytes);
+        settings.setValue("wheelDamping", values.wheelDamping);
+        SmoothScroll::refreshAll();
         Theme::apply(values.theme);
         refreshThemeIcons();
         cachePruneTimer.start();
     });
+    dialog->selectPage(static_cast<int>(page));
     dialog->open();
 }
 
@@ -1120,6 +1368,71 @@ QJsonArray Window::hydrateMessages(const QJsonArray &snapshot) const
         result.append(localFiles->hydrate(message.toObject(), groupId));
     return result;
 }
+void Window::initializeMessageCache()
+{
+    // The test binaries drive fixtures that expect an empty conversation right after a switch,
+    // and a cache shared between runs would make those expectations depend on history. Off means
+    // off: no disk file, and no in-process rows either.
+    cacheWriteTimer.stop();
+    if (QStandardPaths::isTestModeEnabled())
+    {
+        messageCache.configure(QString());
+        cacheReady = false;
+        return;
+    }
+    cacheReady = messageCache.configure(chatPreferences.scope());
+}
+void Window::scheduleCacheWrite()
+{
+    // Restarting the timer per row would let a busy conversation postpone the write
+    // forever, so a burst is coalesced into the first 800 ms window.
+    // While the reader is looking at an older window the model no longer holds the
+    // newest page; keeping the previous snapshot is better than caching that window.
+    if (!cacheReady || groupId.isEmpty() || cacheWriteTimer.isActive() ||
+        messages->property("locatedHistory").toBool())
+        return;
+    cacheWriteTimer.start();
+}
+void Window::storeCachedMessages()
+{
+    cacheWriteTimer.stop();
+    if (!cacheReady || groupId.isEmpty() || messages->property("locatedHistory").toBool())
+        return;
+    QList<QJsonObject> rows;
+    rows.reserve(model->rows.size());
+    for (const auto &row : model->rows)
+        if (row["group"].toString() == groupId)
+            rows.append(row);
+    // An empty model usually means the first page has not arrived (or failed), not
+    // that the conversation has no messages, so it must not erase a usable snapshot.
+    if (rows.isEmpty())
+        return;
+    // Written as-is: this is the window the list actually shows, so reopening paints
+    // the same rows instead of a union with a previous session's window.
+    messageCache.write(groupId, rows);
+}
+void Window::restoreCachedMessages()
+{
+    if (!cacheReady || groupId.isEmpty() || !model->rows.isEmpty())
+        return;
+    const auto cached = messageCache.read(groupId);
+    if (cached.isEmpty())
+        return;
+    QJsonArray snapshot;
+    for (const auto &row : cached)
+    {
+        // Counted as seen so a replay of these rows after reconnect cannot notify again.
+        rememberMessage(row);
+        snapshot.append(row);
+    }
+    model->replace(hydrateMessages(snapshot));
+    messages->setProperty("locatedHistory", false);
+    // Leaves the list exactly where a blank open would be: at the newest row, so the
+    // first history page takes the "replace the window" branch and never merges into it.
+    messages->scrollToBottom();
+    refreshReeditLinks();
+    thumbnailTimer.start();
+}
 void Window::recoverCachedMessages(const QJsonArray &snapshot, std::function<void()> callback)
 {
     bool missing = false;
@@ -1166,151 +1479,10 @@ bool Window::hasCurrentMedia(const QJsonObject &media) const
 
 void Window::showSettings()
 {
-    QDialog dialog(this);
-    dialog.setObjectName("connectionSettings");
-    dialog.setWindowTitle("连接服务器与下载设置");
-    dialog.setMinimumWidth(560);
-    auto *layout = new QVBoxLayout(&dialog);
-    layout->setContentsMargins(26, 24, 26, 24);
-    layout->setSpacing(16);
-    auto *form = new QFormLayout;
-    form->setSpacing(14);
-    auto *mode = new QComboBox;
-    mode->setObjectName("connectionMode");
-    mode->addItem("直接地址", "direct");
-    mode->addItem("自动连接（直连优先）", "p2p");
-    mode->setCurrentIndex(QUrl(serverUrl).scheme() == "p2p" ? 1 : 0);
-    form->addRow("连接方式", mode);
-    auto automatic = p2pSettings;
-    auto *url = new QLineEdit(serverUrl), *token = new QLineEdit(secret), *name = new QLineEdit(nickname),
-         *directory = new QLineEdit(downloadRoot), *fingerprint = new QLineEdit(pin);
-    url->setObjectName("connectionServerUrl");
-    token->setObjectName("connectionAccessKey");
-    name->setObjectName("connectionNickname");
-    directory->setObjectName("connectionDownloads");
-    fingerprint->setObjectName("connectionCertificatePin");
-    url->setPlaceholderText("https://服务器地址:8765");
-    token->setEchoMode(QLineEdit::Password);
-    token->setPlaceholderText("填写服务端管理员创建的客户端接入密钥");
-    fingerprint->setPlaceholderText("自签名证书填写服务端提供的 SHA-256 指纹");
-    form->addRow("服务器地址", url);
-    form->addRow("客户端接入密钥", token);
-    form->addRow("我的显示名", name);
-    auto *pathRow = new QHBoxLayout;
-    pathRow->addWidget(directory);
-    auto *browse = button("选择…");
-    pathRow->addWidget(browse);
-    connect(browse, &QPushButton::clicked, &dialog,
-            [&]
-            {
-                auto selected =
-                    QFileDialog::getExistingDirectory(&dialog, "选择附件保存目录", directory->text());
-                if (!selected.isEmpty())
-                    directory->setText(selected);
-            });
-    form->addRow("下载位置", pathRow);
-    form->addRow("证书指纹", fingerprint);
-    auto *automaticInfo = new QLabel;
-    automaticInfo->setObjectName("connectionAutomaticInfo");
-    automaticInfo->setTextFormat(Qt::PlainText);
-    automaticInfo->setWordWrap(true);
-    form->addRow(automaticInfo);
-    const auto updateAutomatic = [=, &automatic]
-    {
-        const bool enabled = mode->currentData() == "p2p";
-        automaticInfo->setVisible(enabled);
-        automaticInfo->setText(automatic.isEmpty() ? "请粘贴服务端提供的自动连接信息。" :
-            "服务器设备：" + automatic.value("server_id").toString() +
-            "\n公网入口：" + automatic.value("relay_url").toString());
-        url->setReadOnly(enabled);
-        url->setPlaceholderText(enabled ? "p2p://服务器设备 ID" : "https://服务器地址:8765");
-    };
-    connect(mode, &QComboBox::currentIndexChanged, &dialog, updateAutomatic);
-    updateAutomatic();
-    layout->addLayout(form);
-    auto *description = new QLabel("连接独立部署的服务端，地址和客户端接入密钥由服务端管理员提供。"
-                                   "其他电脑上的服务器请使用 HTTPS。\n附件保存在这台电脑的下载位置，"
-                                   "并按下载当天的日期新建文件夹。");
-    description->setObjectName("muted");
-    description->setWordWrap(true);
-    layout->addWidget(description);
-    auto *pasteRow = new QHBoxLayout;
-    auto *pasteConnection = button("粘贴连接信息");
-    pasteConnection->setObjectName("pasteConnectionInfo");
-    auto *pasteResult = new QLabel;
-    pasteResult->setObjectName("connectionPasteResult");
-    pasteResult->setWordWrap(true);
-    pasteRow->addWidget(pasteConnection);
-    pasteRow->addWidget(pasteResult, 1);
-    layout->addLayout(pasteRow);
-    connect(pasteConnection, &QPushButton::clicked, &dialog,
-            [&, url, token, fingerprint, pasteResult]
-            {
-                const auto text = QApplication::clipboard()->text();
-                QJsonObject info;
-                QString error;
-                if (text.size() > ConnectionInfo::maximumBytes ||
-                    !ConnectionInfo::parse(text.toUtf8(), info, error))
-                {
-                    pasteResult->setStyleSheet("color:#b54c3e;");
-                    pasteResult->setText(error.isEmpty() ? "连接信息超过 64 KiB，未导入。" : error);
-                    return;
-                }
-                automatic = info.value("p2p").toObject();
-                mode->setCurrentIndex(info.value("mode") == "p2p" ? 1 : 0);
-                url->setText(info["serverUrl"].toString().trimmed());
-                token->setText(info["token"].toString().trimmed());
-                fingerprint->setText(info["certificatePin"].toString().trimmed());
-                updateAutomatic();
-                pasteResult->setStyleSheet("color:#666666;");
-                pasteResult->setText("已填入，请核对后保存并连接");
-            });
-    auto save = [&]
-    {
-        clearConversation();
-        serverUrl = url->text().trimmed();
-        secret = token->text().trimmed();
-        nickname = name->text().trimmed().left(64);
-        if (nickname.isEmpty())
-            nickname = "我";
-        downloadRoot = directory->text();
-        pin = fingerprint->text();
-        QSettings settings;
-        settings.setValue("serverUrl", serverUrl);
-        settings.setValue("token", secret);
-        settings.setValue("nickname", nickname);
-        settings.setValue("downloads", downloadRoot);
-        settings.setValue("certificatePin", pin);
-        settings.setValue("connectionMode", mode->currentData());
-        p2pSettings = mode->currentData() == "p2p" ? automatic : QJsonObject{};
-        settings.setValue("p2p", QJsonDocument(p2pSettings).toJson(QJsonDocument::Compact));
-        localFiles = std::make_shared<MediaStorage::LocalFiles>(chatPreferences.scope());
-    };
-    auto *buttons = new QDialogButtonBox(QDialogButtonBox::Save | QDialogButtonBox::Cancel);
-    buttons->button(QDialogButtonBox::Save)->setText("保存并连接");
-    buttons->button(QDialogButtonBox::Save)->setObjectName("connectionSave");
-    buttons->button(QDialogButtonBox::Cancel)->setText("取消");
-    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
-    connect(buttons, &QDialogButtonBox::accepted, &dialog,
-            [&]
-            {
-                const QJsonObject input{{"version", 1}, {"mode", mode->currentData().toString()},
-                    {"serverUrl", url->text().trimmed()}, {"token", token->text().trimmed()},
-                    {"certificatePin", fingerprint->text().trimmed()}, {"p2p", automatic}};
-                QJsonObject validated;
-                QString error;
-                if (!ConnectionInfo::parse(QJsonDocument(input).toJson(QJsonDocument::Compact), validated, error))
-                {
-                    pasteResult->setStyleSheet("color:#b54c3e;");
-                    pasteResult->setText(error);
-                    return;
-                }
-                save();
-                dialog.accept();
-                connectService();
-            });
-    layout->addWidget(buttons);
-    dialog.exec();
+    // Connection settings live in the preferences dialog now, so every entry point
+    // (banner, tray menu, initial setup) lands on the same page instead of a second
+    // dialog that could drift from it.
+    showPreferences(PreferencesPage::Connection);
 }
 
 void Window::startDemo()
@@ -1424,6 +1596,9 @@ void Window::cancelSend()
 }
 void Window::clearConversation()
 {
+    // Before `locatedHistory` is cleared below: a conversation showing an older window
+    // must not be saved as if that window were the newest page.
+    storeCachedMessages();
     invalidateAuxiliaryWindows();
     historyButton->setEnabled(false);
     announcementButton->setEnabled(false);
@@ -1465,12 +1640,16 @@ void Window::clearConversation()
 }
 void Window::connectService()
 {
+    // Persist the conversation still on screen before the identity (and with it the
+    // cache scope) changes, so one server's rows never land in another's file.
+    storeCachedMessages();
     selfMemberId.clear();
     notificationsSynced = false;
     notificationSyncSeq = 0;
     if (chatPreferences.configure(serverUrl, secret))
     {
         localFiles = std::make_shared<MediaStorage::LocalFiles>(chatPreferences.scope());
+        initializeMessageCache();
         seenMessages.clear();
         seenMessageOrder.clear();
     }
@@ -1500,10 +1679,12 @@ void Window::connectService()
             subtitle->setText(error);
             return;
         }
+        setConnectionState("正在通过公网入口连接服务器…", true);
         tunnel.start(p2pSettings);
         return;
     }
     transport.configure(serverUrl, secret, pin);
+    setConnectionState("正在连接服务器…", true);
     transport.connectEvents();
     loadGroups();
 }
@@ -1603,7 +1784,12 @@ void Window::loadGroups()
                       updateUnreadTotal();
                       sortGroups();
                       if (!previous.isEmpty() && !selected)
+                      {
+                          // The admin revoked this conversation: its rows are no longer
+                          // readable, so the local copy goes with it.
+                          messageCache.remove(previous);
                           clearConversation();
+                      }
                       groups->blockSignals(false);
                       if (!activated)
                           pendingActivatedGroup.clear();
@@ -2002,6 +2188,11 @@ void Window::selectGroup(const QString &id, const QString &name)
 {
     if (id == groupId)
         return;
+    // restoreDraft() focuses the editor, which is right for a mouse click but would eject
+    // a keyboard user from the group list after the first arrow key. Remember where the
+    // selection was driven from and give focus back once the switch is complete.
+    const bool keepListFocus = groupSelectionFromKeyboard;
+    groupSelectionFromKeyboard = false;
     if (busy)
     {
         groups->blockSignals(true);
@@ -2014,6 +2205,7 @@ void Window::selectGroup(const QString &id, const QString &name)
     }
     invalidateAuxiliaryWindows();
     saveDraft();
+    storeCachedMessages();
     stopVoice();
     openRequests.clear();
     saveRequests.clear();
@@ -2052,9 +2244,12 @@ void Window::selectGroup(const QString &id, const QString &name)
     composer->setMembers({});
     restoreDraft();
     model->replace({});
+    restoreCachedMessages();
     loadHistory();
     loadMembers();
     activateCurrentGroup();
+    if (keepListFocus)
+        groups->setFocus(Qt::OtherFocusReason);
 }
 void Window::activateCurrentGroup()
 {
@@ -2112,6 +2307,8 @@ void Window::loadHistory(bool older, int pendingAttempt)
             else
             {
                 const auto *bar = messages->verticalScrollBar();
+                // Cached rows are already painted, so "was at the bottom" is the only signal that
+                // the newest page may replace them; a reader scrolled up keeps their window.
                 const bool followLatest = model->rows.isEmpty() ||
                     (!messages->property("locatedHistory").toBool() &&
                      !messages->scrollAnimationActive() && bar->maximum() - bar->value() <= 2);
@@ -2135,8 +2332,12 @@ void Window::loadHistory(bool older, int pendingAttempt)
                     // Refresh existing rows and fill unused capacity, retaining every current ID.
                     QJsonArray retained;
                     QHash<QString, int> positions;
+                    // Only this conversation: switching groups leaves the previous rows in place
+                    // until the model is emptied, and carrying them over would duplicate them.
                     for (const auto &message : model->rows)
                     {
+                        if (message["group"].toString() != id)
+                            continue;
                         positions.insert(message["id"].toString(), int(retained.size()));
                         retained.append(message);
                     }
@@ -2237,6 +2438,7 @@ void Window::handleEvent(const QJsonObject &event)
         invalidateAuxiliaryWindows();
         notificationsSynced = false;
         notificationSyncSeq = 0;
+        restoreCachedMessages();
         loadHistory();
         loadGroups();
     }
@@ -2939,6 +3141,96 @@ void Window::notify(const QString &text, bool error)
     }
     if (error)
         lastError = text.left(1200);
+    // Every failure the user needs to act on becomes visible. Previously this only
+    // recorded the string, so a rejected certificate or an unreachable host looked
+    // exactly like a working client that simply never updated.
+    showBanner(text, error);
+}
+
+void Window::setConnectionState(const QString &text, bool reconnecting)
+{
+    // Both "retrying" and "blocked" need a way out: a failing address must be
+    // editable without hunting for the tray menu, so the strip always offers
+    // settings and keeps retry as the primary action while it still retries.
+    showBanner(text, true, reconnecting ? "retry" : "settings",
+               reconnecting ? "重试" : "打开设置");
+    if (preferencesDialog)
+        preferencesDialog->setConnectionState(ready, reconnecting, text);
+}
+
+void Window::showBanner(const QString &text, bool error, const QString &action,
+                        const QString &actionText)
+{
+    if (!banner || text.trimmed().isEmpty())
+        return;
+    const auto message = text.left(600);
+    // Repeated connection failures arrive on every retry; keep the strip stable instead
+    // of repainting it, and never let a routine notice replace a connection error.
+    if (bannerError && !error)
+        return;
+    if (banner->isVisible() && bannerLabel->text() == message &&
+        bannerAction->property("action").toString() == action)
+        return;
+    bannerLabel->setText(message);
+    bannerAction->setText(actionText);
+    bannerAction->setProperty("action", action);
+    bannerAction->show();
+    // Only shown alongside "重试", where it is the escape hatch for a wrong address.
+    bannerRetrySettings->setVisible(action == "retry");
+    bannerError = error;
+    banner->setProperty("error", error);
+    banner->style()->unpolish(banner);
+    banner->style()->polish(banner);
+    banner->show();
+    banner->raise();
+    // Layout is only final after show(); re-place on the next event-loop turn so the
+    // width/height derived from the compose pane are not one frame stale.
+    positionBanner();
+    QTimer::singleShot(0, this, [this] { positionBanner(); });
+}
+
+void Window::hideBanner()
+{
+    if (!banner)
+        return;
+    banner->hide();
+}
+
+void Window::positionBanner()
+{
+    if (!banner || !banner->isVisible())
+        return;
+    // setFixedWidth/setFixedHeight below can re-enter through layout activation. The
+    // guard keeps that from becoming recursion; one placement per change is enough.
+    if (positioningBanner)
+        return;
+    positioningBanner = true;
+    const QScopeGuard release([this] { positioningBanner = false; });
+    // Width follows the conversation pane, and the strip sits just above the compose
+    // box so it never covers the newest message or the send button.
+    const auto *composeArea = findChild<QWidget *>("composeArea");
+    const int margin = 14;
+    const auto right = composeArea ? mapFromGlobal(composeArea->mapToGlobal(QPoint(composeArea->width(), 0))).x()
+                                   : width() - margin;
+    const auto left = composeArea ? mapFromGlobal(composeArea->mapToGlobal(QPoint(0, 0))).x() : margin;
+    // Span the conversation pane rather than a fixed narrow toast: long but actionable
+    // causes (certificate, wrong port) must stay readable without being cut off.
+    const int bannerWidth = qMax(240, right - left - margin * 2);
+    banner->setFixedWidth(bannerWidth);
+    // A wrapped QLabel does not report a trustworthy sizeHint, so drive the height from
+    // the layout's heightForWidth with the width we just fixed.
+    if (auto *bannerLayout = banner->layout())
+    {
+        bannerLayout->activate();
+        const int height = bannerLayout->hasHeightForWidth()
+                               ? bannerLayout->heightForWidth(bannerWidth)
+                               : bannerLayout->sizeHint().height();
+        banner->setFixedHeight(qMax(30, height));
+    }
+    const int bottom = composeArea
+                           ? mapFromGlobal(composeArea->mapToGlobal(QPoint(0, 0))).y() - 10
+                           : height() - margin;
+    banner->move(left + margin, qMax(margin, bottom - banner->height()));
 }
 void Window::copyMedia(const QJsonObject &media)
 {
@@ -3223,6 +3515,7 @@ void Window::closeEvent(QCloseEvent *event)
     if (!isMinimized()) QSettings().setValue("windowBounds", isMaximized() ? normalGeometry() : geometry());
     stopVoice();
     saveDraft();
+    storeCachedMessages();
     if (!quitting && demoServer.state() != QProcess::NotRunning && QSystemTrayIcon::isSystemTrayAvailable())
     {
         hide();

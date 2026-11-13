@@ -42,6 +42,7 @@ fn announcement_author_and_local_avatar_are_resolved_without_enabling_native_sen
         actions_error: String::new(),
         quotes: None,
         quotes_error: String::new(),
+        quote_depth: 0,
     };
     let announcement = access.announcement("123456@chatroom").unwrap();
     assert_eq!(announcement["available"], true);
@@ -162,6 +163,7 @@ fn assert_blob_source(source: &[u8]) {
         actions_error: String::new(),
         quotes: None,
         quotes_error: String::new(),
+        quote_depth: 0,
     };
     let rows = access
         .db
@@ -259,6 +261,7 @@ fn recall_db_fixture() -> (TempDir, Local, String) {
         actions_error: String::new(),
         quotes: None,
         quotes_error: String::new(),
+        quote_depth: 0,
     };
     (temp, access, table)
 }
@@ -326,6 +329,40 @@ fn received_image_quote_uses_a_label_and_real_source_even_before_media_is_cached
     assert_eq!(ready["quote"], converted["quote"]);
     assert_eq!(ready["_quote_original"]["id"], ready["quote"]["id"]);
     assert_eq!(ready["_quote_original"]["media"][0]["kind"], "image");
+    assert!(access.native.pid.is_none());
+    assert!(!temp.path().join("native").exists());
+}
+
+#[test]
+fn received_link_quote_resolves_the_real_row_and_stores_a_readable_preview() {
+    let (temp, mut access, table) = recall_db_fixture();
+    let link = "<msg><appmsg appid=\"\" sdkver=\"0\"><title>一篇文章</title><type>5</type><url>https://example.invalid/private?key=secret</url><des>摘要</des></appmsg></msg>";
+    access
+        .db
+        .open("message/message_0.db")
+        .unwrap()
+        .execute(
+            &format!("INSERT INTO {table} VALUES(5,49,2,1002,?1,NULL,NULL,NULL,777,35)"),
+            [link],
+        )
+        .unwrap();
+
+    let card = format!(
+        "<msg><appmsg><type>57</type><title>这个不错</title><refermsg><type>5</type><svrid>777</svrid><fromusr>wxid_self</fromusr><chatusr>wxid_self</chatusr><displayname>鸳鸯茶</displayname><content><![CDATA[{link}]]></content></refermsg></appmsg></msg>"
+    );
+    let reply = json!({"local_id":6,"sort_seq":40,"shard":"message__message_0.db","sender_id":2,"create_time":1003,"type":"文件/链接/卡片","content":card});
+    let converted = access.convert(RECALL_GROUP, &reply).unwrap().unwrap();
+    assert_eq!(converted["text"], "这个不错");
+    assert_eq!(converted["quote"]["sender"], "鸳鸯茶");
+    assert_eq!(converted["quote"]["text"], "[链接] 一篇文章");
+    let expected_source = format!("wx:{RECALL_GROUP}:message__message_0.db:5:35");
+    assert_eq!(converted["quote"]["id"], Uuid::new_v5(&Uuid::NAMESPACE_URL, expected_source.as_bytes()).to_string());
+    assert_eq!(converted["_quote_source"], expected_source);
+    // The linked article itself still renders as its own message (title, summary, URL);
+    // only the reference preview is reduced to a label.
+    assert_eq!(converted["_quote_original"]["text"], "一篇文章\n摘要\nhttps://example.invalid/private?key=secret");
+    let serialized = converted.to_string();
+    assert!(!serialized.contains("appid") && !serialized.contains("sdkver"));
     assert!(access.native.pid.is_none());
     assert!(!temp.path().join("native").exists());
 }
@@ -466,6 +503,7 @@ fn read_only_image_quote_identity_probe() {
             actions_error: String::new(),
             quotes: None,
             quotes_error: String::new(),
+            quote_depth: 0,
         };
         let (mut reloaded, mut parsed, mut matched, mut media_available) = (0, 0, 0, 0);
         let (mut classified, mut converted_source_matched) = (0, 0);

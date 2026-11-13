@@ -351,6 +351,39 @@ class TransportTests : public QObject
         QCOMPARE(warnings.size(), 1);
         QVERIFY(!peer.hasPendingConnections());
     }
+    void pinMismatchBlocksInsteadOfSilentlyRetrying()
+    {
+        TlsFixture peer(true);
+        QVERIFY(peer.listen(QHostAddress::LocalHost));
+        Transport transport;
+        QSignalSpy warnings(&transport, &Transport::warning);
+        transport.configure(peer.url(), "offline-blocked-secret-at-least-24", QString(64, '0'));
+        QVERIFY(!transport.isBlocked());
+        transport.connectEvents();
+        QTRY_VERIFY_WITH_TIMEOUT(transport.isBlocked(), 8000);
+        QVERIFY(!warnings.isEmpty());
+        // A configuration error must surface as a refused link, not an endless spinner.
+        QVERIFY2(peer.requests.isEmpty(), "No credentials may reach a peer that failed the pin");
+        transport.disconnectService();
+    }
+
+    void unreachableHostReportsACauseInsteadOfStayingSilent()
+    {
+        // Bound to a closed loopback port: the transport must report an error quickly.
+        QTcpServer closed;
+        QVERIFY(closed.listen(QHostAddress::LocalHost));
+        const auto port = closed.serverPort();
+        closed.close();
+        Transport transport;
+        QSignalSpy warnings(&transport, &Transport::warning);
+        transport.configure(QString("https://127.0.0.1:%1").arg(port),
+                            "offline-unreachable-secret-at-least-24");
+        transport.connectEvents();
+        QTRY_VERIFY_WITH_TIMEOUT(!warnings.isEmpty(), 20000);
+        QVERIFY(!transport.isBlocked());
+        transport.disconnectService();
+    }
+
     void ownedSelfSignedServerStopsWithItsOwnCredentials()
     {
         TlsFixture owned(true), other;

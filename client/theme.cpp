@@ -15,8 +15,12 @@ const char lightStyle[] = R"(
         QMainWindow, QDialog { background:#fafafa; }
         QLabel { background:transparent; }
         #titleBar { background:#e0e0e0; }
-        #sidebar, #groups { background:#eeeef0; border:0; outline:0; }
-        #main, #messages, #composeArea { background:#fafafa; border:0; }
+        #sidebar { background:#eeeef0; border:0; outline:0; }
+        #groups { background:#eeeef0; border:2px solid transparent; outline:0; }
+        #groups:focus { border-color:#9adcc2; }
+        #main, #composeArea { background:#fafafa; border:0; }
+        #messages { background:#fafafa; border:2px solid transparent; outline:0; }
+        #messages:focus { border-color:#9adcc2; }
         #composeFrame { background:#fafafa; border:1px solid #e3e3e3; border-radius:9px; }
         #chatTitle { font-size:14px; font-weight:400; color:#19191a; }
         #muted { color:#9f9fa6; font-size:12px; }
@@ -45,18 +49,28 @@ const char lightStyle[] = R"(
         #mentionPopup { font-size:14px; background:#ededed; border:1px solid #d3d3d3; border-radius:6px; padding:3px; }
         #mentionPopup::item { border-radius:3px; color:#19191a; padding-left:1px; }
         #mentionPopup::item:selected { background:#d4d4d4; color:#19191a; }
-        QScrollBar:vertical { background:transparent; width:6px; margin:2px 0; }
-        QScrollBar::handle:vertical { background:#d2d2d2; border-radius:3px; min-height:24px; }
+        QScrollBar:vertical { background:transparent; width:11px; margin:2px 0; }
+        QScrollBar::handle:vertical { background:#c9c9c9; border-radius:6px; min-height:40px; }
+        QScrollBar::handle:vertical:hover { background:#ababab; }
         QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height:0; }
         QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background:transparent; }
-        QScrollBar:horizontal { height:6px; background:transparent; }
-        QScrollBar::handle:horizontal { background:#d2d2d2; border-radius:3px; min-width:24px; }
+        QScrollBar:horizontal { height:11px; background:transparent; }
+        QScrollBar::handle:horizontal { background:#c9c9c9; border-radius:6px; min-width:40px; }
+        QScrollBar::handle:horizontal:hover { background:#ababab; }
         QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width:0; }
         QSplitter::handle { background:#dedede; }
         #announcementDialog { background:#fafafa; }
         #announcementBody { background:transparent; border:0; padding:0; color:#19191a; }
         #announcementUpdated, #announcementState, #announcementReadOnly { color:#9f9fa6; font-size:12px; }
         #announcementRetry { background:transparent; color:#334e88; border:0; padding:3px; }
+        #statusBanner { background:#fdf3e3; border:1px solid #ecd4ac; border-radius:8px; }
+        #statusBanner[error="true"] { background:#fdecea; border:1px solid #f0c2bb; }
+        #statusBannerText { color:#6b4d20; font-size:12px; }
+        #statusBanner[error="true"] #statusBannerText { color:#8f3428; }
+        #statusBannerAction { background:transparent; border:0; color:#334e88; font-size:12px; padding:2px 6px; }
+        #statusBannerAction:hover { background:#efe0c8; }
+        #statusBannerClose { background:transparent; border:0; color:#a08a68; font-size:14px; padding:0; }
+        #statusBannerClose:hover { background:#efe0c8; }
     )";
 
 const char darkStyle[] = R"(
@@ -76,8 +90,12 @@ const char darkStyle[] = R"(
         QMenu::item:selected { color:#ffffff; background:#335d79; }
         QMenu::item:disabled { color:#777c81; }
         #titleBar { background:#181818; }
-        #sidebar, #groups { background:#262626; border:0; outline:0; }
-        #main, #messages, #composeArea { background:#202020; border:0; }
+        #sidebar { background:#262626; border:0; outline:0; }
+        #groups { background:#262626; border:2px solid transparent; outline:0; }
+        #groups:focus { border-color:#2f6f55; }
+        #main, #composeArea { background:#202020; border:0; }
+        #messages { background:#202020; border:2px solid transparent; outline:0; }
+        #messages:focus { border-color:#2f6f55; }
         #composeFrame { background:#202020; border:1px solid #3a3d40; border-radius:9px; }
         #chatTitle { font-size:14px; font-weight:400; color:#ededed; }
         #muted { color:#999ca3; font-size:12px; }
@@ -106,18 +124,28 @@ const char darkStyle[] = R"(
         #mentionPopup { font-size:14px; background:#303030; border:1px solid #4b4f53; border-radius:6px; padding:3px; }
         #mentionPopup::item { border-radius:3px; color:#ededed; padding-left:1px; }
         #mentionPopup::item:selected { background:#464b50; color:#ffffff; }
-        QScrollBar:vertical { background:transparent; width:6px; margin:2px 0; }
-        QScrollBar::handle:vertical { background:#555b60; border-radius:3px; min-height:24px; }
+        QScrollBar:vertical { background:transparent; width:11px; margin:2px 0; }
+        QScrollBar::handle:vertical { background:#5f666b; border-radius:6px; min-height:40px; }
+        QScrollBar::handle:vertical:hover { background:#7b838a; }
         QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height:0; }
         QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background:transparent; }
-        QScrollBar:horizontal { height:6px; background:transparent; }
-        QScrollBar::handle:horizontal { background:#555b60; border-radius:3px; min-width:24px; }
+        QScrollBar:horizontal { height:11px; background:transparent; }
+        QScrollBar::handle:horizontal { background:#5f666b; border-radius:6px; min-width:40px; }
+        QScrollBar::handle:horizontal:hover { background:#7b838a; }
         QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width:0; }
         QSplitter::handle { background:#44474b; }
         #announcementDialog { background:#202020; }
         #announcementBody { background:transparent; border:0; padding:0; color:#ededed; }
         #announcementUpdated, #announcementState, #announcementReadOnly { color:#999ca3; font-size:12px; }
         #announcementRetry { background:transparent; color:#75bfff; border:0; padding:3px; }
+        #statusBanner { background:#33291a; border:1px solid #5a4726; border-radius:8px; }
+        #statusBanner[error="true"] { background:#3a2323; border:1px solid #6b3330; }
+        #statusBannerText { color:#e2c894; font-size:12px; }
+        #statusBanner[error="true"] #statusBannerText { color:#f0b4aa; }
+        #statusBannerAction { background:transparent; border:0; color:#8fb6ff; font-size:12px; padding:2px 6px; }
+        #statusBannerAction:hover { background:#463726; }
+        #statusBannerClose { background:transparent; border:0; color:#a08a68; font-size:14px; padding:0; }
+        #statusBannerClose:hover { background:#463726; }
     )";
 
 QString normalized(const QString &mode)

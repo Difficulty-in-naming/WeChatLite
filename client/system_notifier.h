@@ -13,6 +13,9 @@ class SystemNotifier final : public QObject
     explicit SystemNotifier(QObject *parent = nullptr);
     ~SystemNotifier() override;
     void showMessage(const QString &groupId, const QString &title, const QString &body);
+    // A notice about the client itself (for example "cannot reach the server").
+    // It must be visible but must never open or activate a conversation.
+    void showStatus(const QString &title, const QString &body);
     // Total unread across conversations. Drives the Dock tile badge; zero clears it.
     void setUnreadTotal(int count);
     static bool soundEnabled();
@@ -45,6 +48,7 @@ class SystemNotifier final : public QObject
     static bool activationLaunch();
     static bool disabled();
     static bool validGroup(const QString &groupId);
+    void showValidated(const QString &groupId, const QString &title, const QString &body);
     static QString limitedText(const QString &text, qsizetype limit);
     std::unique_ptr<Native> native;
     int unreadTotal = 0;

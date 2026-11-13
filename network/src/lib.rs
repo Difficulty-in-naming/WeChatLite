@@ -622,5 +622,9 @@ async fn client_with_address(
     Ok(())
 }
 
+/// JNI-facing exports used by the Android client. Desktop builds keep using `main.rs`.
+#[cfg(target_os = "android")]
+pub mod jni;
+
 #[cfg(test)]
 mod tests;

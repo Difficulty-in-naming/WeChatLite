@@ -16,6 +16,9 @@ class Transport : public QObject
     explicit Transport(QObject *parent = nullptr);
     void configure(const QString &url, const QString &token, const QString &certificatePin = {});
     void connectEvents();
+    // Abandons any pending backoff and re-opens the event socket immediately, so the
+    // "重试" affordance never waits out a 30 s retry timer.
+    void reconnectNow();
     void disconnectService();
     void setOwnedServer(const QString &url, const QString &secret, const QString &certificatePin = {});
     void shutdownLocalServer(class QProcess *process);
@@ -29,6 +32,10 @@ class Transport : public QObject
                         std::function<void(const QString &, const QString &)> callback);
     QUrl baseUrl() const { return base; }
     bool hasActiveDownloads() const { return !partialDownloads.isEmpty(); }
+    // True when retrying cannot help (for example a certificate pin mismatch). The
+    // client must show the reason and ask for a corrected configuration instead of
+    // spinning forever on a connection that will never be accepted.
+    bool isBlocked() const { return blocked; }
   signals:
     void event(const QJsonObject &event);
     void connectionChanged(bool connected);
@@ -37,6 +44,9 @@ class Transport : public QObject
 
   private:
     QNetworkRequest request(const QString &path) const;
+    void failConnection(const QString &message, bool fatal);
+    void stopLinkTimers();
+    void scheduleReconnect();
     void finishJson(class QNetworkReply *reply, JsonCallback callback);
     void setupTls(class QNetworkReply *reply, const QByteArray &expectedPin);
     void trackSend(class QNetworkReply *reply);
@@ -47,6 +57,14 @@ class Transport : public QObject
     QUrl base;
     QByteArray token, pin, eventPin;
     QTimer reconnect;
+    // Guards the two silent failure modes a TCP socket alone does not report: a
+    // handshake that never completes, and a link that stays open while the peer or
+    // an intermediate network has silently stopped forwarding data.
+    QTimer connectGuard;
+    QTimer lastSeen;
+    qint64 lastActivity = 0;
+    bool awaitingConnect = false;
+    bool blocked = false;
     bool stopping = false;
     int delay = 1000;
     qint64 cursor = 0;

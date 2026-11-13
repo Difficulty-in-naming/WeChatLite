@@ -2,6 +2,7 @@
 #include "attachment.h"
 #include <QCryptographicHash>
 #include <QDate>
+#include <QDateTime>
 #include <QDir>
 #include <QEventLoop>
 #include <QFile>
@@ -46,40 +47,112 @@ QSslConfiguration tlsConfiguration(const QByteArray &expectedPin)
 
 QString pinError()
 {
-    return QStringLiteral("服务器证书指纹不匹配，已拒绝连接");
+    return QStringLiteral("服务器证书指纹不匹配，已停止连接。请向服务端管理员核对证书 SHA-256 指纹，"
+                          "在“连接与下载设置”中重新保存后再连接。");
 }
+
+// A TCP connect to an unreachable host can sit in SYN retries for minutes without
+// ever surfacing an error, which is exactly the "no reaction at all" case. Bound the
+// handshake, and separately prove the link still works after it opens.
+// Qt reports socket failures in English. Translate the cases a user can act on so the
+// banner is readable; anything unknown keeps the original text rather than being hidden.
+QString socketReason(QAbstractSocket::SocketError error, const QString &raw)
+{
+    switch (error)
+    {
+    case QAbstractSocket::ConnectionRefusedError:
+        return QStringLiteral("服务器拒绝连接，请确认服务端已启动且端口正确");
+    case QAbstractSocket::HostNotFoundError:
+        return QStringLiteral("找不到服务器地址，请检查地址是否写错或网络是否可用");
+    case QAbstractSocket::RemoteHostClosedError:
+        return QStringLiteral("服务器中断了连接");
+    case QAbstractSocket::SocketTimeoutError:
+        return QStringLiteral("连接服务器超时");
+    case QAbstractSocket::NetworkError:
+        return QStringLiteral("网络不可用，请检查网络连接");
+    case QAbstractSocket::SslHandshakeFailedError:
+        return QStringLiteral("TLS 握手失败，请核对证书与指纹");
+    default:
+        return raw.trimmed().isEmpty() ? QStringLiteral("无法连接服务器") : raw.trimmed();
+    }
+}
+
+constexpr int handshakeTimeoutMs = 15000;
+constexpr int heartbeatIntervalMs = 20000;
+constexpr int heartbeatSilenceMs = 70000;
 } // namespace
 
 Transport::Transport(QObject *parent) : QObject(parent)
 {
     reconnect.setSingleShot(true);
     connect(&reconnect, &QTimer::timeout, this, &Transport::connectEvents);
+    connectGuard.setSingleShot(true);
+    connectGuard.setInterval(handshakeTimeoutMs);
+    connect(&connectGuard, &QTimer::timeout, this,
+            [this]
+            {
+                if (!awaitingConnect || stopping || blocked)
+                    return;
+                awaitingConnect = false;
+                const auto host = base.host();
+                socket.abort();
+                emit warning(QStringLiteral("连接服务器超时：%1 秒内没有响应（%2）。"
+                                            "请检查网络、地址和端口，客户端会继续重试。")
+                                 .arg(handshakeTimeoutMs / 1000)
+                                 .arg(host.isEmpty() ? QStringLiteral("地址未填写") : host));
+                emit connectionChanged(false);
+                scheduleReconnect();
+            });
+    // The server already pings every 30 seconds, but a silently dropped Wi-Fi or VPN
+    // route can leave a socket "connected" while nothing arrives. Ping on our own and
+    // treat prolonged silence as a dropped link, so the UI shows reconnecting instead
+    // of appearing healthy forever.
+    lastSeen.setInterval(heartbeatIntervalMs);
+    connect(&lastSeen, &QTimer::timeout, this,
+            [this]
+            {
+                if (socket.state() != QAbstractSocket::ConnectedState)
+                    return;
+                const auto now = QDateTime::currentMSecsSinceEpoch();
+                if (lastActivity > 0 && now - lastActivity > heartbeatSilenceMs)
+                {
+                    lastActivity = 0;
+                    emit warning("与服务器的连接已失去响应，正在重新连接。");
+                    socket.abort();
+                    return;
+                }
+                socket.ping();
+            });
     connect(&socket, &QWebSocket::connected, this,
             [this]
             {
                 if (!eventPin.isEmpty() &&
                     !matchesPin(socket.sslConfiguration().peerCertificate(), eventPin))
                 {
-                    socket.abort();
-                    emit warning(pinError());
+                    failConnection(pinError(), true);
                     return;
                 }
+                awaitingConnect = false;
+                connectGuard.stop();
+                blocked = false;
+                lastActivity = QDateTime::currentMSecsSinceEpoch();
+                lastSeen.start();
                 delay = 1000;
                 emit connectionChanged(true);
             });
     connect(&socket, &QWebSocket::disconnected, this,
             [this]
             {
+                stopLinkTimers();
                 emit connectionChanged(false);
-                if (!stopping)
-                {
-                    reconnect.start(delay);
-                    delay = qMin(delay * 2, 30000);
-                }
+                scheduleReconnect();
             });
+    connect(&socket, &QWebSocket::pong, this,
+            [this] { lastActivity = QDateTime::currentMSecsSinceEpoch(); });
     connect(&socket, &QWebSocket::textMessageReceived, this,
             [this](const QString &text)
             {
+                lastActivity = QDateTime::currentMSecsSinceEpoch();
                 QJsonParseError error;
                 auto object = QJsonDocument::fromJson(text.toUtf8(), &error).object();
                 if (error.error != QJsonParseError::NoError)
@@ -108,18 +181,67 @@ Transport::Transport(QObject *parent) : QObject(parent)
                     matchesPin(socket.sslConfiguration().peerCertificate(), eventPin))
                     socket.ignoreSslErrors(errors);
                 else
-                {
-                    socket.abort();
-                    emit warning("服务器证书校验失败，请检查服务端证书或配置证书 SHA-256 指纹");
-                }
+                    failConnection("服务器证书校验失败，请检查服务端证书或重新填写证书 SHA-256 指纹。", true);
             }, Qt::DirectConnection);
     connect(&socket, &QWebSocket::errorOccurred, this,
-            [this](QAbstractSocket::SocketError)
+            [this](QAbstractSocket::SocketError error)
             {
-                emit warning(socket.errorString());
-                if (!stopping && !reconnect.isActive())
-                    reconnect.start(delay);
+                if (blocked || stopping)
+                    return;
+                // A wrong pin is a configuration problem: retrying it forever hides the
+                // real reason behind an endless "connecting" state.
+                if (socket.error() == QAbstractSocket::SslHandshakeFailedError)
+                {
+                    failConnection("服务器证书校验失败，请检查服务端证书或重新填写证书 SHA-256 指纹。", true);
+                    return;
+                }
+                emit warning(QStringLiteral("无法连接服务器：%1。客户端会继续重试。")
+                                 .arg(socketReason(error, socket.errorString())));
+                scheduleReconnect();
             });
+}
+
+void Transport::scheduleReconnect()
+{
+    if (stopping || blocked || reconnect.isActive())
+        return;
+    reconnect.start(delay);
+    delay = qMin(delay * 2, 30000);
+}
+
+void Transport::stopLinkTimers()
+{
+    awaitingConnect = false;
+    connectGuard.stop();
+    lastSeen.stop();
+    lastActivity = 0;
+}
+
+void Transport::failConnection(const QString &message, bool fatal)
+{
+    // Set the state before abort(): aborting emits disconnected() and errorOccurred(),
+    // and both must already see the link as stopped so they cannot schedule a retry
+    // that would hide a configuration problem behind an endless reconnect loop.
+    if (fatal)
+        blocked = true;
+    stopLinkTimers();
+    reconnect.stop();
+    socket.abort();
+    emit warning(message);
+    emit connectionChanged(false);
+}
+
+void Transport::reconnectNow()
+{
+    if (stopping || base.scheme().isEmpty() || token.isEmpty())
+        return;
+    // An explicit request clears both the backoff and a pin/HTTPS block: the user may
+    // have just corrected the settings, and only a fresh attempt can prove otherwise.
+    blocked = false;
+    delay = 1000;
+    reconnect.stop();
+    socket.abort();
+    connectEvents();
 }
 void Transport::configure(const QString &url, const QString &secret, const QString &certificatePin)
 {
@@ -143,10 +265,13 @@ void Transport::configure(const QString &url, const QString &secret, const QStri
     identity = QString::fromLatin1(QCryptographicHash::hash(token, QCryptographicHash::Sha256).toHex());
     cursor = QSettings().value("cursors/" + identity, -1).toLongLong();
     stopping = false;
+    blocked = false;
+    delay = 1000;
 }
 void Transport::disconnectService()
 {
     stopping = true;
+    stopLinkTimers();
     reconnect.stop();
     socket.abort();
 }
@@ -214,11 +339,11 @@ QNetworkRequest Transport::request(const QString &path) const
 }
 void Transport::connectEvents()
 {
-    if (stopping || !base.isValid() || token.isEmpty())
+    if (stopping || blocked || !base.isValid() || token.isEmpty())
         return;
     if (!pin.isEmpty() && base.scheme() != "https")
     {
-        emit warning("配置证书指纹的服务器必须使用 HTTPS");
+        failConnection("配置了证书指纹的服务器必须使用 HTTPS，请在“连接与下载设置”中改用 https:// 地址。", true);
         return;
     }
     auto req = request("/api/events?after=" + QString::number(cursor));
@@ -228,6 +353,8 @@ void Transport::connectEvents()
     eventPin = pin;
     socket.ignoreSslErrors(QList<QSslError>{});
     socket.setSslConfiguration(tlsConfiguration(eventPin));
+    awaitingConnect = true;
+    connectGuard.start();
     socket.open(req);
 }
 void Transport::setupTls(QNetworkReply *reply, const QByteArray &expectedPin)
