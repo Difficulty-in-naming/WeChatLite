@@ -519,6 +519,71 @@ class DesktopTests : public QObject
         auto *process = window->findChild<QProcess *>();
         QVERIFY(process && process->arguments().contains("--demo"));
     }
+    void keyboardFocusDrivesTheConversationWithoutAMouse()
+    {
+        Window probe;
+        probe.resize(980, 640);
+        probe.show();
+        probe.activateWindow();
+        auto *composer = probe.findChild<Composer *>("composer");
+        auto *view = probe.findChild<MessageView *>();
+        auto *groups = probe.findChild<QListWidget *>("groups");
+        auto *model = probe.findChild<MessageModel *>();
+        QVERIFY(composer && view && groups && model);
+        // Window(false) has no connection yet, so its compose area starts disabled.
+        probe.findChild<QWidget *>("composeArea")->setEnabled(true);
+        composer->setReadOnly(false);
+        QJsonArray rows;
+        for (int i = 0; i < 120; ++i)
+            rows.append(QJsonObject{{"id", QString::number(i)}, {"seq", i + 1}, {"text", "history"}});
+        model->replace(rows);
+        view->doItemsLayout();
+        auto *bar = view->verticalScrollBar();
+        QTRY_VERIFY(bar->maximum() > 500);
+        composer->setFocus();
+        QTRY_VERIFY(composer->hasFocus());
+        // Tab walks editor -> conversation -> group list -> editor.
+        QTest::keyClick(composer, Qt::Key_Tab);
+        QTRY_VERIFY(view->hasFocus());
+        QTest::keyClick(view, Qt::Key_Tab);
+        QTRY_VERIFY(groups->hasFocus());
+        QTest::keyClick(groups, Qt::Key_Tab);
+        QTRY_VERIFY(composer->hasFocus());
+        // With the conversation focused, the arrows scroll it even though NoSelection
+        // leaves the list without a current row.
+        QTest::keyClick(composer, Qt::Key_Tab);
+        QTRY_VERIFY(view->hasFocus());
+        bar->setValue(bar->maximum() / 2);
+        const auto middle = bar->value();
+        QTest::keyClick(view, Qt::Key_Up);
+        QVERIFY(bar->value() < middle);
+        QTest::keyClick(view, Qt::Key_Down);
+        QVERIFY(bar->value() > middle - 1);
+        // Escape returns to the editor, so typing needs no click.
+        QTest::keyClick(view, Qt::Key_Escape);
+        QTRY_VERIFY(composer->hasFocus());
+        // With the editor focused and its draft empty there is no caret to move, so the
+        // arrows scroll the conversation there too.
+        composer->clear();
+        QVERIFY(composer->toPlainText().isEmpty());
+        QTest::keyClick(composer, Qt::Key_Up);
+        QVERIFY(bar->value() < middle);
+        // A click in the group list focuses it; its arrows switch conversations and must
+        // keep the list focused instead of bouncing back to the editor.
+        QTest::mouseClick(groups->viewport(), Qt::LeftButton, {}, QPoint(6, groups->viewport()->height() - 4));
+        QTRY_VERIFY(groups->hasFocus());
+        if (groups->count() > 1)
+        {
+            groups->setCurrentRow(0);
+            QTRY_VERIFY(groups->hasFocus());
+            const auto first = groups->currentRow();
+            QTest::keyClick(groups, Qt::Key_Down);
+            QTRY_VERIFY(groups->currentRow() != first);
+            QTRY_VERIFY(groups->hasFocus());
+        }
+        QTest::keyClick(groups, Qt::Key_Tab);
+        QTRY_VERIFY(composer->hasFocus());
+    }
     void headerSettingsSaveStorageThemeAndSoundWithoutChangingConnection()
     {
         const auto before = QSettings().value("downloads").toString();
@@ -1716,19 +1781,20 @@ class DesktopTests : public QObject
         bool pasteOnly = false;
         QTimer::singleShot(0, &isolated, [&]
         {
-            auto *dialog = isolated.findChild<QDialog *>("connectionSettings");
+            auto *dialog = isolated.findChild<QDialog *>("preferencesDialog");
             if (!dialog)
                 return;
             QApplication::clipboard()->setText(QString::fromUtf8(QJsonDocument(credential).toJson()));
-            QTest::mouseClick(dialog->findChild<QPushButton *>("pasteConnectionInfo"), Qt::LeftButton);
-            auto *url = dialog->findChild<QLineEdit *>("connectionServerUrl");
+            QTest::mouseClick(dialog->findChild<QPushButton *>("preferencesPasteConnection"), Qt::LeftButton);
+            auto *url = dialog->findChild<QLineEdit *>("preferencesServerUrl");
             pasteOnly = helperReady.isEmpty() && tunnel->findChildren<QProcess *>().isEmpty() &&
-                dialog->findChild<QComboBox *>("connectionMode")->currentData().toString() == "p2p" &&
+                dialog->findChild<QComboBox *>("preferencesConnectionMode")->currentData().toString() == "p2p" &&
                 url->text() == stable && url->isReadOnly();
-            QTest::mouseClick(dialog->findChild<QPushButton *>("connectionSave"), Qt::LeftButton);
+            // Pasting only fills the fields; the connection starts when the user confirms.
+            QTest::mouseClick(dialog->findChild<QPushButton *>("preferencesConnect"), Qt::LeftButton);
         });
         isolated.showSettings();
-        QVERIFY(pasteOnly);
+        QTRY_VERIFY_WITH_TIMEOUT(pasteOnly, 5000);
         QTRY_COMPARE_WITH_TIMEOUT(helperReady.size(), 1, 5000);
         auto *transport = isolated.findChild<Transport *>();
         QCOMPARE(transport->baseUrl().scheme(), QString("https"));
@@ -1830,14 +1896,14 @@ class DesktopTests : public QObject
             0, &isolated,
             [&]
             {
-                auto *dialog = isolated.findChild<QDialog *>("connectionSettings");
+                auto *dialog = isolated.findChild<QDialog *>("preferencesDialog");
                 if (!dialog)
                     return;
                 const auto fields = dialog->findChildren<QLineEdit *>();
-                auto *url = dialog->findChild<QLineEdit *>("connectionServerUrl");
-                auto *token = dialog->findChild<QLineEdit *>("connectionAccessKey");
-                auto *paste = dialog->findChild<QPushButton *>("pasteConnectionInfo");
-                auto *save = dialog->findChild<QPushButton *>("connectionSave");
+                auto *url = dialog->findChild<QLineEdit *>("preferencesServerUrl");
+                auto *token = dialog->findChild<QLineEdit *>("preferencesAccessKey");
+                auto *paste = dialog->findChild<QPushButton *>("preferencesPasteConnection");
+                auto *save = dialog->findChild<QPushButton *>("preferencesConnect");
                 settingsOnly = fields.size() == 5 && url && token && paste && save;
                 for (auto *button : dialog->findChildren<QPushButton *>())
                     settingsOnly &= !button->text().contains("启动") && !button->text().contains("转发群") &&
@@ -1862,11 +1928,11 @@ class DesktopTests : public QObject
                 QTest::mouseClick(paste, Qt::LeftButton);
                 oversizeRejected =
                     url->text() == base && token->text() == accessKey &&
-                    dialog->findChild<QLabel *>("connectionPasteResult")->text().contains("8 KiB");
+                    dialog->findChild<QLabel *>("preferencesPasteResult")->text().contains("8 KiB");
                 QTest::mouseClick(save, Qt::LeftButton);
             });
         isolated.showSettings();
-        QVERIFY(settingsOnly && pastedWithoutConnecting && oversizeRejected);
+        QTRY_VERIFY_WITH_TIMEOUT(settingsOnly && pastedWithoutConnecting && oversizeRejected, 5000);
         auto *transport = isolated.findChild<Transport *>();
         transport->connectionChanged(true);
         auto *list = isolated.findChild<QListWidget *>("groups");

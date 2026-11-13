@@ -1,5 +1,6 @@
 #pragma once
 #include <QDialog>
+#include <QJsonObject>
 #include <QString>
 
 class QCheckBox;
@@ -7,6 +8,8 @@ class QComboBox;
 class QLabel;
 class QLineEdit;
 class QPushButton;
+class QToolButton;
+class QListWidget;
 
 class PreferencesDialog : public QDialog
 {
@@ -21,8 +24,31 @@ class PreferencesDialog : public QDialog
         // Wheel damping: 1.0 is raw speed, lower is slower. See SmoothScroll.
         qreal wheelDamping = 0.35;
     };
-    explicit PreferencesDialog(const Values &initial, QWidget *parent = nullptr);
+    // Connection state lives outside Values because it is applied live — connect,
+    // disconnect and retry act on the spot instead of waiting for dialog save — so
+    // the storage and appearance pages stay usable while the client is offline.
+    struct Connection
+    {
+        QString serverUrl;
+        QString token;
+        QString nickname;
+        QString certificatePin;
+        QString mode = "direct";
+        QJsonObject p2p;
+        bool connected = false;
+        bool reconnecting = false;
+        QString status;
+    };
+    explicit PreferencesDialog(const Values &initial, const Connection &connection,
+                               QWidget *parent = nullptr);
     Values values() const;
+    Connection connection() const;
+
+    // Driven by the window as the transport changes, so an open dialog shows the
+    // same connection state as the chat banner instead of a stale snapshot.
+    void setConnectionState(bool connected, bool reconnecting, const QString &status);
+    // Selects a page by its row, so entry points can land on the relevant one.
+    void selectPage(int row);
 
   public slots:
     void refreshUsage();
@@ -38,17 +64,31 @@ class PreferencesDialog : public QDialog
     void clearCacheRequested(const QString &downloads, quint64 requestId);
     void previewSoundRequested();
     void applied();
+    // Emitted when the user asks to apply the connection fields right away.
+    void connectRequested();
+    // Emitted when the user asks to stop using the current connection. The dialog
+    // keeps the saved address and key so reconnecting does not need retyping.
+    void disconnectRequested();
 
   private:
     void chooseDirectory();
     void clearCache();
     void updateUsageState();
+    void updateConnectionButtons();
+    void pasteConnectionInfo();
+    QListWidget *navigation;
     QLineEdit *directory;
     QComboBox *theme, *cacheLimit, *wheelSpeed;
-    QCheckBox *sound;
+    QComboBox *connectionMode;
+    QLineEdit *serverUrl, *accessKey, *nickname, *certificatePin;
+    QLabel *connectionStatus, *connectionInfo, *pasteResult;
     QLabel *downloadsUsage, *cacheUsage, *usageStatus, *validation;
     QPushButton *choose, *refresh, *clear, *preview;
+    QPushButton *connectButton, *disconnectButton, *pasteButton;
+    QToolButton *showKey;
+    QCheckBox *sound;
     quint64 sequence = 0, usageRequest = 0, clearRequest = 0;
-    bool scanning = false, clearing = false;
+    bool scanning = false, clearing = false, connected = false, reconnecting = false;
+    QJsonObject p2p;
     QString actionFeedback;
 };

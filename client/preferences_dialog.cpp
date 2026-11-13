@@ -1,14 +1,19 @@
 #include "preferences_dialog.h"
+#include "connection_info.h"
 #include "media_storage.h"
 #include "update_widget.h"
+#include <QApplication>
 #include <QCheckBox>
+#include <QClipboard>
 #include <QComboBox>
 #include <QDialogButtonBox>
 #include <QDir>
 #include <QFileDialog>
 #include <QFileInfo>
+#include <QFormLayout>
 #include <QFrame>
 #include <QHBoxLayout>
+#include <QJsonDocument>
 #include <QLabel>
 #include <QLineEdit>
 #include <QListWidget>
@@ -17,6 +22,7 @@
 #include <QPushButton>
 #include <QStackedWidget>
 #include <QTimer>
+#include <QToolButton>
 #include <QVBoxLayout>
 
 namespace
@@ -61,8 +67,10 @@ QString cleanError(QString error)
 }
 }
 
-PreferencesDialog::PreferencesDialog(const Values &initial, QWidget *parent)
-    : QDialog(parent, Qt::Window)
+PreferencesDialog::PreferencesDialog(const Values &initial, const Connection &connection,
+                                     QWidget *parent)
+    : QDialog(parent, Qt::Window), p2p(connection.p2p), connected(connection.connected),
+      reconnecting(connection.reconnecting)
 {
     setObjectName("preferencesDialog");
     setWindowTitle("设置");
@@ -78,13 +86,13 @@ PreferencesDialog::PreferencesDialog(const Values &initial, QWidget *parent)
     outer->setContentsMargins(0, 0, 0, 0);
     outer->setSpacing(0);
     // Inherit the item stylesheet before the first layout caches row heights.
-    auto *navigation = new QListWidget(this);
+    navigation = new QListWidget(this);
     navigation->setObjectName("preferencesNavigation");
     navigation->setFixedWidth(128);
     navigation->setFrameShape(QFrame::NoFrame);
     navigation->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
     navigation->setContentsMargins(0, 16, 0, 0);
-    navigation->addItems({"存储", "外观", "通知", "更新"});
+    navigation->addItems({"连接", "存储", "外观", "通知", "更新"});
     outer->addWidget(navigation);
     auto *divider = new QFrame;
     divider->setFrameShape(QFrame::VLine);
@@ -97,6 +105,101 @@ PreferencesDialog::PreferencesDialog(const Values &initial, QWidget *parent)
     pages->setObjectName("preferencesPages");
     right->addWidget(pages, 1);
     outer->addLayout(right, 1);
+
+    // ---- 连接 -------------------------------------------------------------
+    auto *connectionPage = new QWidget;
+    connectionPage->setObjectName("preferencesConnectionPage");
+    auto *link = pageLayout(connectionPage, "连接");
+
+    connectionStatus = new QLabel;
+    connectionStatus->setObjectName("preferencesConnectionStatus");
+    connectionStatus->setTextFormat(Qt::PlainText);
+    connectionStatus->setWordWrap(true);
+    link->addWidget(connectionStatus);
+
+    connectionMode = new QComboBox;
+    connectionMode->setObjectName("preferencesConnectionMode");
+    connectionMode->addItem("直接地址", "direct");
+    connectionMode->addItem("自动连接（直连优先）", "p2p");
+    connectionMode->setCurrentIndex(connection.mode == "p2p" ? 1 : 0);
+
+    serverUrl = new QLineEdit(connection.serverUrl);
+    serverUrl->setObjectName("preferencesServerUrl");
+    serverUrl->setPlaceholderText("https://服务器地址:8765");
+    accessKey = new QLineEdit(connection.token);
+    accessKey->setObjectName("preferencesAccessKey");
+    accessKey->setEchoMode(QLineEdit::Password);
+    accessKey->setPlaceholderText("服务端管理员创建的客户端接入密钥");
+    showKey = new QToolButton;
+    showKey->setObjectName("preferencesShowKey");
+    showKey->setText("显示");
+    showKey->setCheckable(true);
+    showKey->setCursor(Qt::PointingHandCursor);
+    connect(showKey, &QToolButton::toggled, this, [this](bool shown)
+    {
+        accessKey->setEchoMode(shown ? QLineEdit::Normal : QLineEdit::Password);
+        showKey->setText(shown ? "隐藏" : "显示");
+    });
+    nickname = new QLineEdit(connection.nickname);
+    nickname->setObjectName("preferencesNickname");
+    nickname->setMaxLength(64);
+    certificatePin = new QLineEdit(connection.certificatePin);
+    certificatePin->setObjectName("preferencesCertificatePin");
+    certificatePin->setPlaceholderText("自签名证书填写服务端提供的 SHA-256 指纹");
+
+    auto *fields = new QFormLayout;
+    fields->setSpacing(12);
+    fields->addRow("连接方式", connectionMode);
+    fields->addRow("服务器地址", serverUrl);
+    auto *keyRow = new QHBoxLayout;
+    keyRow->setSpacing(8);
+    keyRow->addWidget(accessKey, 1);
+    keyRow->addWidget(showKey);
+    fields->addRow("客户端接入密钥", keyRow);
+    fields->addRow("我的显示名", nickname);
+    fields->addRow("证书指纹", certificatePin);
+    connectionInfo = new QLabel;
+    connectionInfo->setObjectName("preferencesConnectionInfo");
+    connectionInfo->setTextFormat(Qt::PlainText);
+    connectionInfo->setWordWrap(true);
+    fields->addRow(connectionInfo);
+    link->addLayout(fields);
+
+    const auto updateMode = [this]
+    {
+        const bool automatic = connectionMode->currentData() == "p2p";
+        connectionInfo->setVisible(automatic);
+        connectionInfo->setText(p2p.isEmpty() ? "请粘贴服务端提供的自动连接信息。" :
+            "服务器设备：" + p2p.value("server_id").toString() +
+            "\n公网入口：" + p2p.value("relay_url").toString());
+        serverUrl->setReadOnly(automatic);
+        serverUrl->setPlaceholderText(automatic ? "p2p://服务器设备 ID" : "https://服务器地址:8765");
+    };
+    connect(connectionMode, &QComboBox::currentIndexChanged, this, updateMode);
+    updateMode();
+
+    auto *connectionActions = new QHBoxLayout;
+    connectionActions->setSpacing(8);
+    pasteButton = new QPushButton("粘贴连接信息");
+    pasteButton->setObjectName("preferencesPasteConnection");
+    connectButton = new QPushButton("连接");
+    connectButton->setObjectName("preferencesConnect");
+    disconnectButton = new QPushButton("断开连接");
+    disconnectButton->setObjectName("preferencesDisconnect");
+    connectionActions->addWidget(pasteButton);
+    connectionActions->addStretch();
+    connectionActions->addWidget(disconnectButton);
+    connectionActions->addWidget(connectButton);
+    link->addLayout(connectionActions);
+
+    pasteResult = description({});
+    pasteResult->setObjectName("preferencesPasteResult");
+    link->addWidget(pasteResult);
+    link->addWidget(description(
+        "地址和密钥由服务端管理员提供。其他电脑上的服务端请使用 HTTPS。"
+        "断开连接会停止重连并保留这里填写的信息；连接会立即使用当前这些值。"));
+    link->addStretch();
+    pages->addWidget(connectionPage);
 
     auto *storagePage = new QWidget;
     storagePage->setObjectName("preferencesStoragePage");
@@ -242,6 +345,11 @@ PreferencesDialog::PreferencesDialog(const Values &initial, QWidget *parent)
     connect(preview, &QPushButton::clicked, this, &PreferencesDialog::previewSoundRequested);
     connect(buttons, &QDialogButtonBox::accepted, this, &PreferencesDialog::accept);
     connect(buttons, &QDialogButtonBox::rejected, this, &QDialog::reject);
+    connect(serverUrl, &QLineEdit::textChanged, this, [this] { updateConnectionButtons(); });
+    connect(pasteButton, &QPushButton::clicked, this, &PreferencesDialog::pasteConnectionInfo);
+    connect(connectButton, &QPushButton::clicked, this, &PreferencesDialog::connectRequested);
+    connect(disconnectButton, &QPushButton::clicked, this, &PreferencesDialog::disconnectRequested);
+    updateConnectionButtons();
     QTimer::singleShot(0, this, &PreferencesDialog::refreshUsage);
 }
 
@@ -250,6 +358,75 @@ PreferencesDialog::Values PreferencesDialog::values() const
     return {QDir::fromNativeSeparators(directory->text()), theme->currentData().toString(),
             sound->isChecked(), cacheLimit->currentData().toLongLong(),
             wheelSpeed->currentData().toReal()};
+}
+
+PreferencesDialog::Connection PreferencesDialog::connection() const
+{
+    return {serverUrl->text().trimmed(), accessKey->text().trimmed(), nickname->text().trimmed(),
+            certificatePin->text().trimmed(), connectionMode->currentData().toString(), p2p,
+            connected, reconnecting, connectionStatus->text()};
+}
+
+void PreferencesDialog::setConnectionState(bool isConnected, bool isReconnecting,
+                                           const QString &status)
+{
+    connected = isConnected;
+    reconnecting = isReconnecting;
+    connectionStatus->setText(status);
+    // The window owns the transport, so it reports the same three states the chat
+    // banner uses: connected, retrying, and hard-blocked.
+    const auto palette = connectionStatus->palette();
+    connectionStatus->setStyleSheet(connected
+        ? QStringLiteral("color:%1;").arg(palette.color(QPalette::Text).name())
+        : QStringLiteral("color:%1;").arg(palette.color(QPalette::PlaceholderText).name()));
+    updateConnectionButtons();
+}
+
+void PreferencesDialog::selectPage(int row)
+{
+    if (navigation && row >= 0 && row < navigation->count())
+        navigation->setCurrentRow(row);
+}
+
+void PreferencesDialog::updateConnectionButtons()
+{
+    // Only a live session locks the fields. A retrying client still has to let the
+    // user correct a wrong address, otherwise the retry loop becomes a dead end.
+    const bool live = connected;
+    const bool automatic = connectionMode->currentData() == "p2p";
+    serverUrl->setReadOnly(live || automatic);
+    accessKey->setReadOnly(live);
+    certificatePin->setReadOnly(live);
+    nickname->setReadOnly(live);
+    connectionMode->setEnabled(!live);
+    pasteButton->setEnabled(!live);
+    connectButton->setText(live ? "重新连接" : "连接");
+    connectButton->setEnabled(!serverUrl->text().trimmed().isEmpty());
+    // Offered whenever a connection is active or being retried, so the user can stop
+    // an endless reconnect instead of only quitting the application.
+    disconnectButton->setEnabled(connected || reconnecting);
+    disconnectButton->setVisible(connected || reconnecting);
+}
+
+void PreferencesDialog::pasteConnectionInfo()
+{
+    QJsonObject info;
+    QString error;
+    const auto text = QApplication::clipboard()->text();
+    if (!ConnectionInfo::parse(text.toUtf8(), info, error))
+    {
+        pasteResult->setStyleSheet("color:#b54c3e;");
+        pasteResult->setText(error.isEmpty() ? "剪贴板不是有效的连接信息。" : error);
+        return;
+    }
+    p2p = info.value("p2p").toObject();
+    connectionMode->setCurrentIndex(info.value("mode") == "p2p" ? 1 : 0);
+    serverUrl->setText(info["serverUrl"].toString().trimmed());
+    accessKey->setText(info["token"].toString().trimmed());
+    certificatePin->setText(info["certificatePin"].toString().trimmed());
+    pasteResult->setStyleSheet({});
+    pasteResult->setText("已填入，请核对后点“连接”。");
+    updateConnectionButtons();
 }
 
 void PreferencesDialog::chooseDirectory()
