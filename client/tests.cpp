@@ -1061,6 +1061,53 @@ class ClientTests : public QObject
         // Godot's page/8 * 0.3 keeps a notch well under a full page.
         QVERIFY(notchTravel < bar->pageStep() * 0.5);
     }
+    void keyboardScrollsTheConversationWithoutACurrentItem()
+    {
+        MessageModel model;
+        QJsonArray history;
+        for (int i = 0; i < 200; ++i)
+            history.append(QJsonObject{{"id", QString::number(i)}, {"seq", i + 1}, {"text", "history"}});
+        model.replace(history);
+        MessageView view;
+        view.resize(500, 300);
+        view.setModel(&model);
+        view.show();
+        auto *bar = view.verticalScrollBar();
+        QTRY_VERIFY(bar->maximum() > 2000);
+        // NoSelection means QListView has no current index; the keys must still scroll.
+        QVERIFY(!view.currentIndex().isValid());
+        bar->setValue(1000);
+        QSignalSpy older(&view, &MessageView::olderRequested);
+        QTest::keyClick(&view, Qt::Key_Down);
+        QVERIFY(bar->value() > 1000);
+        const auto afterDown = bar->value();
+        QTest::keyClick(&view, Qt::Key_Up);
+        QVERIFY(bar->value() < afterDown);
+        const auto afterUp = bar->value();
+        QTest::keyClick(&view, Qt::Key_PageDown);
+        QVERIFY(bar->value() - afterUp > bar->singleStep());
+        QVERIFY(bar->value() - afterUp >= view.viewport()->height() / 2);
+        QTest::keyClick(&view, Qt::Key_End);
+        QCOMPARE(bar->value(), bar->maximum());
+        QTest::keyClick(&view, Qt::Key_Home);
+        QCOMPARE(bar->value(), bar->minimum());
+        QVERIFY(older.count() > 0); // Reaching the top asks for the next older page.
+    }
+    void tabLeavesTheComposerForTheConversationAndBacktabReversesIt()
+    {
+        Composer composer;
+        QSignalSpy moved(&composer, &Composer::focusMoveRequested);
+        composer.show();
+        composer.resize(320, 120);
+        composer.setFocus();
+        QTest::keyClick(&composer, Qt::Key_Tab);
+        QCOMPARE(moved.count(), 1);
+        QCOMPARE(moved.at(0).at(0).toBool(), false);
+        QTest::keyClick(&composer, Qt::Key_Backtab);
+        QCOMPARE(moved.count(), 2);
+        QCOMPARE(moved.at(1).at(0).toBool(), true);
+        QCOMPARE(composer.toPlainText(), QString());
+    }
     void quoteLabelsHideLegacyNativeMetadata()
     {
         QJsonObject quote{{"sender", "成员"}, {"text", "<?xml version=\"1.0\"?><msg><img md5=\"0123456789abcdef0123456789abcdef\" cdnmidimgurl=\"private-media\"/></msg>"}};

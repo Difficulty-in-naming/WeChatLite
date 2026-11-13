@@ -125,11 +125,44 @@ void Composer::keyPressEvent(QKeyEvent *event)
             return;
         }
     }
+    if (event->key() == Qt::Key_Tab || event->key() == Qt::Key_Backtab)
+    {
+        emit focusMoveRequested(event->key() == Qt::Key_Backtab ||
+                                event->modifiers().testFlag(Qt::ShiftModifier));
+        return;
+    }
     if ((event->key() == Qt::Key_Return || event->key() == Qt::Key_Enter) &&
         !event->modifiers().testFlag(Qt::ShiftModifier) && !isComposing())
     {
         emit sendRequested();
         return;
+    }
+    {
+        int direction = 0;
+        bool page = false;
+        if (event->key() == Qt::Key_Up)
+            direction = -1;
+        else if (event->key() == Qt::Key_Down)
+            direction = 1;
+        else if (event->key() == Qt::Key_PageUp)
+        {
+            direction = -1;
+            page = true;
+        }
+        else if (event->key() == Qt::Key_PageDown)
+        {
+            direction = 1;
+            page = true;
+        }
+        const bool alt = event->modifiers().testFlag(Qt::AltModifier);
+        // While the draft is empty there is no caret to move, so these keys scroll the
+        // conversation instead of looking broken; Alt does the same with any draft. A real
+        // draft is never disturbed: its arrows, Shift+arrows and IME composition keep working.
+        if (direction != 0 && !isComposing() && (alt || toPlainText().isEmpty()))
+        {
+            emit scrollRequested(direction, page);
+            return;
+        }
     }
     if (event->key() == Qt::Key_Backspace && !textCursor().hasSelection())
     {

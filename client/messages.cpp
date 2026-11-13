@@ -1353,8 +1353,16 @@ void StableListView::doItemsLayout()
     // Measure the user's intervening movement here, before our own range clamping begins.
     if (previous != saved.scrollValue)
     {
-        saved.offset -= previous - saved.scrollValue;
-        saved.bottom = false;
+        // An explicit jump to an edge (Home, End, scrollToTop) must land exactly there.
+        // Restoring the reading anchor on top of it left the view a few dozen pixels
+        // short of the top, so "request older history" never triggered again.
+        if (previous <= bar->minimum() || previous >= bar->maximum())
+            saved = {};
+        else
+        {
+            saved.offset -= previous - saved.scrollValue;
+            saved.bottom = false;
+        }
     }
     {
         // Qt still needs scrollbar signals to update its pixel offset and scrollbar visibility.
@@ -1439,6 +1447,35 @@ void MessageView::stopScrollAnimation()
 bool MessageView::scrollAnimationActive() const
 {
     return smoothScroll && smoothScroll->isRunning();
+}
+bool MessageView::scrollByKeyboard(int direction, bool page)
+{
+    if (!model() || model()->rowCount() == 0 || direction == 0)
+        return false;
+    auto *bar = verticalScrollBar();
+    if (bar->maximum() <= bar->minimum())
+    {
+        // Nothing to move, but the request may still mean "go past the loaded page":
+        // with an older window on screen, reaching the end means asking for the latest.
+        if (direction < 0)
+            requestOlder();
+        else if (property("locatedHistory").toBool())
+            emit latestRequested();
+        return true;
+    }
+    // Keyboard input is deliberate and precise, so it takes over from a wheel animation
+    // instead of fighting it.
+    stopScrollAnimation();
+    const int line = qMax(24, fontMetrics().height() * 2);
+    const int distance = page ? qMax(line, viewport()->height() * 9 / 10) : line;
+    const int target = qBound(bar->minimum(), bar->value() + direction * distance, bar->maximum());
+    if (target != bar->value())
+        bar->setValue(target);
+    if (direction < 0)
+        requestOlder();
+    else if (property("locatedHistory").toBool() && bar->value() >= bar->maximum())
+        emit latestRequested();
+    return true;
 }
 bool MessageView::locateMessage(const QString &id)
 {
@@ -1563,9 +1600,17 @@ void MessageView::keyPressEvent(QKeyEvent *event)
             return;
         }
     }
-    if (event->key() == Qt::Key_Escape && selectedTextIndex.isValid())
+    if (event->key() == Qt::Key_Escape)
     {
-        clearTextSelection();
+        if (selectedTextIndex.isValid())
+        {
+            clearTextSelection();
+            event->accept();
+            return;
+        }
+        // Nothing selected here: Escape is the way back to the editor for a keyboard-only
+        // reader, mirroring Tab from the editor into this list.
+        emit editorFocusRequested();
         event->accept();
         return;
     }
@@ -1574,6 +1619,44 @@ void MessageView::keyPressEvent(QKeyEvent *event)
         emit latestRequested();
         event->accept();
         return;
+    }
+    if (!event->modifiers().testFlag(Qt::ControlModifier) &&
+        !event->modifiers().testFlag(Qt::MetaModifier))
+    {
+        // SelectionMode::NoSelection leaves no current index, so QListView's own cursor
+        // actions have nothing to move. These keys are the conversation's scroll controls.
+        switch (event->key())
+        {
+        case Qt::Key_Up:
+            scrollByKeyboard(-1);
+            event->accept();
+            return;
+        case Qt::Key_Down:
+            scrollByKeyboard(1);
+            event->accept();
+            return;
+        case Qt::Key_PageUp:
+            scrollByKeyboard(-1, true);
+            event->accept();
+            return;
+        case Qt::Key_PageDown:
+            scrollByKeyboard(1, true);
+            event->accept();
+            return;
+        case Qt::Key_Home:
+            stopScrollAnimation();
+            verticalScrollBar()->setValue(verticalScrollBar()->minimum());
+            requestOlder();
+            event->accept();
+            return;
+        case Qt::Key_End:
+            stopScrollAnimation();
+            verticalScrollBar()->setValue(verticalScrollBar()->maximum());
+            event->accept();
+            return;
+        default:
+            break;
+        }
     }
     QListView::keyPressEvent(event);
     if (event->key() == Qt::Key_Up || event->key() == Qt::Key_PageUp || event->key() == Qt::Key_Home)
@@ -1775,6 +1858,9 @@ void MessageView::mousePressEvent(QMouseEvent *event)
     const auto index = indexAt(event->pos());
     if (event->button() == Qt::LeftButton)
     {
+        // Clicking the conversation makes it the keyboard target too; otherwise the arrows
+        // would keep editing a draft the user is no longer looking at.
+        setFocus(Qt::MouseFocusReason);
         selectingText = false;
         clearTextSelection();
         const auto position = textPositionAt(index, event->pos(), false);

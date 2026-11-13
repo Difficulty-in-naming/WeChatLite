@@ -16,6 +16,12 @@ class Composer : public QTextEdit
     void filesAttached(const QStringList &paths);
     void imageAttached(const QMimeData *mime);
     void sendRequested();
+    // Tab/Shift+Tab leave the editor for the conversation or the group list. Without this
+    // a QTextEdit would keep inserting tabs and no keyboard-only user could reach them.
+    void focusMoveRequested(bool backward);
+    // Up/Down in an empty draft (and Alt+Up/Down of any draft) scroll the conversation:
+    // with nothing to move the caret over, those keys otherwise look broken.
+    void scrollRequested(int direction, bool page);
 
   protected:
     bool canInsertFromMimeData(const QMimeData *source) const override;
