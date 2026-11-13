@@ -26,7 +26,8 @@ use tokio_tungstenite::{
 };
 
 pub type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
-pub const WAIT: Duration = Duration::from_secs(6);
+// Windows CI needs time to durably seed 800 demo rows and import history pages.
+pub const WAIT: Duration = Duration::from_secs(15);
 
 pub fn binary() -> PathBuf {
     std::env::var_os("WECHAT_RELAY_BINARY")
