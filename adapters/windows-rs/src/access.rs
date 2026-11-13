@@ -613,6 +613,9 @@ impl Backend for Local {
     fn release(&mut self) {
         self.db.release();
     }
+    fn release_changed(&mut self) -> Result<()> {
+        self.db.release_changed()
+    }
 }
 
 fn message_identity(

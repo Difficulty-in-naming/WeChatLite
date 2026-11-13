@@ -8,6 +8,8 @@
 #include <array>
 #include <atomic>
 #include <cassert>
+#include <cstdarg>
+#include <cstdio>
 #include <cstdint>
 #include <cstring>
 #include <ctime>
@@ -32,6 +34,21 @@
 #endif
 
 namespace {
+
+// A DLL injected into WeChat has no console, so route diagnostics to the debug
+// output and to stderr when one happens to exist.
+void logDiagnostic(const char* format, ...) {
+    char buffer[1024];
+    va_list arguments;
+    va_start(arguments, format);
+    const int length = std::vsnprintf(buffer, sizeof(buffer), format, arguments);
+    va_end(arguments);
+    if (length <= 0) return;
+    OutputDebugStringA(buffer);
+    OutputDebugStringA("\n");
+    std::fprintf(stderr, "%s\n", buffer);
+    std::fflush(stderr);
+}
 using json = nlohmann::json;
 using RecordKey = std::pair<std::string, uint64_t>;
 constexpr size_t kRecordSize = 0x440;
@@ -707,8 +724,14 @@ void initializeQuoteProfile() {
     if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew < 0 || dos->e_lfanew > 4096 ||
         !readable(reinterpret_cast<void*>(base + dos->e_lfanew), sizeof(IMAGE_NT_HEADERS64))) throw Rejected("Weixin PE header invalid");
     const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
-    if (nt->Signature != IMAGE_NT_SIGNATURE || nt->FileHeader.TimeDateStamp != 1789961080 ||
-        nt->OptionalHeader.SizeOfImage != 202039296) throw Rejected("unsupported native quote module");
+    if (nt->Signature != IMAGE_NT_SIGNATURE) throw Rejected("unsupported native quote module (bad PE signature)");
+    // A patch-level rebuild can move the pinned header while every function we
+    // call stays byte-identical. Report it and let the fingerprint checks below
+    // decide, since those prove the RVAs actually point at the right code.
+    if (nt->FileHeader.TimeDateStamp != 1789961080 || nt->OptionalHeader.SizeOfImage != 202039296)
+        logDiagnostic("quote module header differs: TimeDateStamp=%lu SizeOfImage=%lu (expected 1789961080 / 202039296)",
+            static_cast<unsigned long>(nt->FileHeader.TimeDateStamp),
+            static_cast<unsigned long>(nt->OptionalHeader.SizeOfImage));
     auto check = [](uintptr_t rva, std::initializer_list<unsigned char> bytes) {
         if (!executableReadable(base + rva, bytes.size()) ||
             !std::equal(bytes.begin(), bytes.end(), reinterpret_cast<const unsigned char*>(base + rva)))
@@ -811,8 +834,11 @@ void initializeHooks() {
     const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
     if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew < 0 || dos->e_lfanew > 4096) throw Rejected("Weixin PE header invalid");
     const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
-    if (nt->Signature != IMAGE_NT_SIGNATURE || nt->FileHeader.TimeDateStamp != 1789961080 ||
-        nt->OptionalHeader.SizeOfImage != 202039296) throw Rejected("unsupported WeChat native module");
+    if (nt->Signature != IMAGE_NT_SIGNATURE) throw Rejected("unsupported WeChat native module (bad PE signature)");
+    if (nt->FileHeader.TimeDateStamp != 1789961080 || nt->OptionalHeader.SizeOfImage != 202039296)
+        logDiagnostic("weixin header differs: TimeDateStamp=%lu SizeOfImage=%lu (expected 1789961080 / 202039296)",
+            static_cast<unsigned long>(nt->FileHeader.TimeDateStamp),
+            static_cast<unsigned long>(nt->OptionalHeader.SizeOfImage));
     constexpr unsigned char quoteCopyCall[] = {0x48,0x89,0xF1,0xE8,0x58,0xA4,0xCB,0xFD,
         0xC6,0x87,0x98,0x04,0,0,0x01};
     if (!executableReadable(base + 0x24EB6F0, sizeof(quoteCopyCall)) ||

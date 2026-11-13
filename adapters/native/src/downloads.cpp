@@ -5,6 +5,8 @@
 #include <algorithm>
 #include <array>
 #include <cassert>
+#include <cstdarg>
+#include <cstdio>
 #include <chrono>
 #include <climits>
 #include <cstdint>
@@ -36,6 +38,22 @@ HMODULE module = nullptr;
 std::filesystem::path configPath, mediaRoot;
 std::string authToken, failure;
 bool enabled = true;
+
+// A DLL injected into WeChat has no console, so route diagnostics to the debug
+// output and to stderr when one happens to exist. Used to explain why a
+// version/fingerprint gate rejected the host process.
+void logDiagnostic(const char* format, ...) {
+    char buffer[1024];
+    va_list arguments;
+    va_start(arguments, format);
+    const int length = std::vsnprintf(buffer, sizeof(buffer), format, arguments);
+    va_end(arguments);
+    if (length <= 0) return;
+    OutputDebugStringA(buffer);
+    OutputDebugStringA("\n");
+    std::fprintf(stderr, "%s\n", buffer);
+    std::fflush(stderr);
+}
 bool hooksReady = false;
 std::mutex mutex, attemptsMutex;
 struct Attempt {
@@ -248,8 +266,17 @@ void initialize() {
     const auto dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
     if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew < 0 || dos->e_lfanew > 4096) throw std::runtime_error("invalid Weixin PE");
     const auto nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
-    if (nt->Signature != IMAGE_NT_SIGNATURE || nt->FileHeader.TimeDateStamp != 1789961080 || nt->OptionalHeader.SizeOfImage != 202039296)
-        throw std::runtime_error("unsupported WeChat native module");
+    if (nt->Signature != IMAGE_NT_SIGNATURE) throw std::runtime_error("unsupported WeChat native module (bad PE signature)");
+    // The pinned header identifies the exact build these RVAs were derived from,
+    // but a patch-level rebuild can shift it while every function we call stays
+    // byte-identical. Report the mismatch and let the per-function fingerprint
+    // checks below decide: those are what actually prove the offsets are right.
+    const bool pinned_header = nt->FileHeader.TimeDateStamp == 1789961080 &&
+        nt->OptionalHeader.SizeOfImage == 202039296;
+    if (!pinned_header)
+        logDiagnostic("weixin header differs: TimeDateStamp=%lu SizeOfImage=%lu (expected 1789961080 / 202039296)",
+            static_cast<unsigned long>(nt->FileHeader.TimeDateStamp),
+            static_cast<unsigned long>(nt->OptionalHeader.SizeOfImage));
     auto check = [](uintptr_t rva, std::initializer_list<unsigned char> bytes) {
         if (!readable(reinterpret_cast<void*>(base + rva), bytes.size()) ||
             !std::equal(bytes.begin(), bytes.end(), reinterpret_cast<const unsigned char*>(base + rva)))

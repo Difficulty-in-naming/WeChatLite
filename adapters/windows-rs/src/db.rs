@@ -190,6 +190,40 @@ impl Db {
         self.names.clear();
     }
 
+    /// Drops only the shards whose on-disk signature actually moved.
+    ///
+    /// `release()` throws away every decrypted snapshot, and rebuilding a real
+    /// WeChat shard means decrypting the whole file in memory plus a
+    /// `PRAGMA quick_check` — measured at ~0.8 s for a 125 MB shard versus ~2 ms
+    /// to query the snapshot we already hold. The engine used to call
+    /// `release()` once per poll cycle, so a single message waiting for native
+    /// confirmation made every cycle pay that rebuild and the send queue starved.
+    /// Comparing the signature first keeps unchanged shards warm while still
+    /// surfacing new messages within the same cycle.
+    pub fn release_changed(&mut self) -> Result<()> {
+        self.refresh_catalog(false)?;
+        let mut stale = Vec::new();
+        for (rel, path) in &self.files {
+            if !self.connections.contains_key(rel) {
+                continue;
+            }
+            // A shard that cannot be signed is left alone: `open()` re-checks it
+            // anyway, and an error here must not abort the whole cycle.
+            let current = match crypto::version(path) {
+                Ok(current) => current,
+                Err(_) => continue,
+            };
+            if current.is_some() && self.snapshot_versions.get(rel) != current.as_ref() {
+                stale.push(rel.clone());
+            }
+        }
+        for rel in stale {
+            self.connections.remove(&rel);
+            self.snapshot_versions.remove(&rel);
+        }
+        Ok(())
+    }
+
     pub fn signatures(&mut self) -> Result<Vec<(String, u64, u64)>> {
         self.refresh_catalog(true)?;
         let mut result = Vec::new();

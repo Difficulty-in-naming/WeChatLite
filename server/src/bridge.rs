@@ -462,6 +462,16 @@ async fn run_stream<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                     }
                     message.status = "sending".into();
                     payload["status"]=json!("sending");
+                    let queued_at = message.timestamp;
+                    let dispatched_at = chrono::Utc::now().timestamp_millis();
+                    // Diagnostics only: how long this message sat behind others, and
+                    // the message's own age when it finally reached the adapter.
+                    eprintln!(
+                        "[timing] dispatch id={} group={} queued_for={}ms",
+                        message.id,
+                        message.group,
+                        dispatched_at.saturating_sub(queued_at)
+                    );
                     app.publish(app.db({let message=message.clone();move |s| s.update_message(&message)}).await?);
                     let command = json!({"op":"send","message":payload});
                     inflight = Some(message);
@@ -544,6 +554,15 @@ async fn run_stream<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                         "ack"=>{
                             if inflight.as_ref().is_some_and(|m|Some(m.id.as_str())==value["id"].as_str()) {
                                 let mut message=inflight.take().unwrap();
+                                // Diagnostics only: total time the queue slot was held
+                                // by this message, from dispatch to native confirmation.
+                                eprintln!(
+                                    "[timing] ack id={} status={} slot_held={}ms",
+                                    message.id,
+                                    value["status"].as_str().unwrap_or("?"),
+                                    chrono::Utc::now().timestamp_millis()
+                                        .saturating_sub(message.timestamp)
+                                );
                                 apply_ack(&mut message,&value,chrono::Utc::now().timestamp_millis());
                                 app.publish(app.db(move|s|s.update_message(&message)).await?);
                                 pending=true;
@@ -668,10 +687,46 @@ async fn demo_seed(app: &Arc<App>) -> Result<()> {
             ("welcome-2","陈序","收到。文件直接拖进输入框就可以附加，确认后再发送。",false),
             ("welcome-3","我","好，我把视频和 GIF 一起整理过来。",true),
             ("welcome-4","周可","输入 @ 就能选择成员，方向键切换，回车确认。",false)];
+        let now=chrono::Utc::now().timestamp_millis();
         for (index,(id,sender,text,outgoing)) in messages.into_iter().enumerate(){
             let mut message:ChatMessage=serde_json::from_value(json!({"id":id,"group":"demo-design","sender":sender,"sender_id":if outgoing{"me"}else{"lin"},"text":text,
-                "timestamp":chrono::Utc::now().timestamp_millis()-((4-index)as i64)*90_000,"status":"received","source_id":id,"outgoing":outgoing}))?;
+                "timestamp":now-((4-index)as i64)*90_000,"status":"received","source_id":id,"outgoing":outgoing}))?;
             s.insert_message(&mut message)?;
+        }
+        // Keyboard scrolling needs a conversation that is actually taller than the window,
+        // otherwise the arrows have nothing to move. These filler rows only exist in
+        // `--demo`; they keep the four welcome messages above as the newest page.
+        let people=[("林小满","lin"),("陈序","chen"),("周可","zhou"),("Nick","nick"),("我","me")];
+        let lines=["这版把输入区上沿做成了可拖动，拖到最低只剩一行也不会挡住发送按钮。",
+            "收到。图片和 GIF 现在共用一个预览缓存，翻回去不会重复下载。",
+            "我试了用 Tab 从输入框切到会话区，方向键能直接滚，不用碰鼠标。",
+            "群公告和聊天记录都放在右上角，切换群的时候会一起关掉，避免看到上一个群的内容。",
+            "语音在会话里直接播放，再点一次停止，切换群也会停。",
+            "今天的稿子我看过了，左边留白再收 4 个像素会更接近参考图。",
+            "合并转发的卡片点开可以看明细，附件下载完会自动补上。",
+            "引用一段文字再回复，点引用可以跳回原文位置。",
+            "撤回之后原稿还留在本地，可以从“重新编辑”里找回来。",
+            "夜里把通知调成“仅被 @ 时通知”，角标也跟着只算提到的消息。",
+            "这条是长一点的消息，用来确认一行放不下时会自动换行而不是被截断，滚动的时候每一行的高度都必须算对。",
+            "短句。",
+            "第二行\n第三行\n多行文本也要能在气泡里正常显示。",
+            "带标点、数字 1234567890、英文 mixed content，还有零宽字符前后面\u{200b}的排版。"];
+        // Enough rows that Up/PageUp keep scrolling for a long while and every page of
+        // history from the server is reachable, not just the first one.
+        const DEMO_HISTORY: usize = 800;
+        for index in 0..DEMO_HISTORY{
+            let (sender,sender_id)=people[index%people.len()];
+            let text=lines[index%lines.len()];
+            let message_id=format!("demo-history-{}",index+1);
+            let mut message:ChatMessage=serde_json::from_value(json!({
+                "id":message_id.clone(),"group":"demo-design","sender":sender,"sender_id":sender_id,
+                "text":format!("{}（第 {} 条历史消息，用于测试上下键滚动）",text,index+1),
+                "timestamp":now-180_000-(DEMO_HISTORY-index)as i64*45_000,"status":"received","source_id":message_id,
+                "outgoing":sender_id=="me"}))?;
+            // Seed history is imported, not received live: it must be readable in the
+            // conversation without becoming replayable realtime events, otherwise every
+            // new connection would first replay all of it before reaching "synced".
+            s.insert_silent_history(&mut message)?;
         }
         Ok(())
     }).await

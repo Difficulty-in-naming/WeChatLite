@@ -6,6 +6,7 @@
 #include <QApplication>
 #include <QCloseEvent>
 #include <QCryptographicHash>
+#include <QDateTime>
 #include <QDesktopServices>
 #include <QDialog>
 #include <QDialogButtonBox>
@@ -67,6 +68,7 @@ ServerWindow::ServerWindow(const QString &path, bool demonstration, QWidget *par
     setMinimumSize(760, 580);
     QString error;
     ensureConfiguration(error);
+    openLogFile();
     auto *root = new QWidget;
     auto *layout = new QVBoxLayout(root);
     layout->setContentsMargins(22, 18, 22, 18);
@@ -529,6 +531,29 @@ void ServerWindow::pollStatus()
     }, 2500);
 }
 
+void ServerWindow::openLogFile()
+{
+    // Keep the log next to the config so it travels with the deployment and is
+    // easy for a user to find. Rotate once past a few megabytes: this file is for
+    // diagnosing slow sends, not an unbounded audit trail.
+    const auto directory = QFileInfo(configPath).absolutePath();
+    const auto path = directory + "/server.log";
+    constexpr qint64 limit = 4 * 1024 * 1024;
+    if (QFileInfo(path).size() > limit)
+    {
+        const auto previous = path + ".1";
+        QFile::remove(previous);
+        QFile::rename(path, previous);
+    }
+    logFile.setFileName(path);
+    if (!logFile.open(QIODevice::WriteOnly | QIODevice::Append | QIODevice::Text))
+        return;
+    logFile.write(QString("\n===== %1 =====\n")
+                      .arg(QDateTime::currentDateTime().toString(Qt::ISODate))
+                      .toUtf8());
+    logFile.flush();
+}
+
 void ServerWindow::appendLog(const QString &text)
 {
     auto safe = text;
@@ -539,8 +564,19 @@ void ServerWindow::appendLog(const QString &text)
     if (!relayToken.isEmpty())
         safe.replace(relayToken, "[入口凭据已隐藏]");
     safe = safe.left(8192);
-    if (!safe.trimmed().isEmpty())
-        log->appendPlainText(safe.trimmed());
+    if (safe.trimmed().isEmpty())
+        return;
+    const auto line = safe.trimmed();
+    log->appendPlainText(line);
+    // The pane is cleared when the process ends, so timing diagnostics have to
+    // survive on disk to be readable after the fact. Same redaction as above:
+    // credentials never reach this file.
+    if (logFile.isOpen())
+    {
+        logFile.write(line.toUtf8());
+        logFile.write("\n");
+        logFile.flush();
+    }
 }
 
 void ServerWindow::closeEvent(QCloseEvent *event)

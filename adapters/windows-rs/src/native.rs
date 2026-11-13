@@ -232,9 +232,10 @@ impl NativeClient {
                 Ok(health) => {
                     ensure!(
                         health["pid"].as_u64() == Some(pid as u64)
-                            && health["version"] == VERSION
+                            && version_matches(&health["version"])
                             && !health_has_error(&health["error"]),
-                        "本机微信组件进程或版本校验未通过"
+                        "本机微信组件进程或版本校验未通过：pid或版本不匹配（检测到 {}）",
+                        health["version"]
                     );
                     break health;
                 }
@@ -345,9 +346,10 @@ impl NativeClient {
         let health = self.request("/health", None)?;
         ensure!(
             health["pid"] == pid
-                && health["version"] == VERSION
+                && version_matches(&health["version"])
                 && !health_has_error(&health["error"]),
-            "已加载组件身份校验失败"
+            "已加载组件身份校验失败（检测到版本 {}）",
+            health["version"]
         );
         Ok(true)
     }
@@ -579,15 +581,41 @@ struct Module {
     path: PathBuf,
 }
 
+// The install directory name is only a label; the real gate is the native
+// module's own PE fingerprint, checked when the DLL loads. Accept a 4.1.15.x
+// directory so a user is not forced onto one exact patch release, but keep
+// rejecting unrelated layouts outright.
+fn acceptable_version(name: &str) -> bool {
+    name == VERSION || name.starts_with("4.1.15.")
+}
+
+// The bundled native components report their own build string. Treat any
+// 4.1.15.x as compatible so a patch bump does not block startup; the native
+// side still verifies the actual function fingerprints before use.
+fn version_matches(value: &Value) -> bool {
+    let version = value.as_str().unwrap_or("");
+    version == VERSION || version.starts_with("4.1.15.")
+}
+
 fn validate_client(path: &Path, digest: &str) -> Result<()> {
+    let directory = path
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
     ensure!(
-        path.parent()
-            .and_then(Path::file_name)
-            .and_then(|name| name.to_str())
-            == Some(VERSION)
-            && digest == CLIENT_HASH,
-        "微信版本或 DLL 指纹不匹配，只适配未经修改的 4.1.15.13"
+        acceptable_version(directory),
+        "微信安装目录不是 4.1.15.x（实际为「{directory}」），未加载组件"
     );
+    ensure!(
+        digest == CLIENT_HASH,
+        "weixin.dll 指纹不匹配：该文件不是未经修改的 4.1.15，未加载组件"
+    );
+    if directory != VERSION {
+        eprintln!(
+            "[version] 安装目录为 {directory}，适配器基准为 {VERSION}；已按 4.1.15.x 放行"
+        );
+    }
     Ok(())
 }
 
@@ -1036,10 +1064,15 @@ mod tests {
     }
 
     #[test]
-    fn bundled_binary_and_wechat_version_are_pinned() {
+    fn bundled_binary_is_pinned_and_patch_releases_are_accepted() {
         assert_eq!(hex::encode(Sha256::digest(BRIDGE)), BRIDGE_HASH);
+        // Any 4.1.15.x install directory is accepted; the DLL digest still gates.
         assert!(validate_client(Path::new("fixture/4.1.15.13/Weixin.dll"), CLIENT_HASH).is_ok());
-        assert!(validate_client(Path::new("fixture/4.1.15.14/Weixin.dll"), CLIENT_HASH).is_err());
+        assert!(validate_client(Path::new("fixture/4.1.15.14/Weixin.dll"), CLIENT_HASH).is_ok());
+        assert!(validate_client(Path::new("fixture/4.1.15.9/Weixin.dll"), CLIENT_HASH).is_ok());
+        // A different minor line, or a modified DLL, is still rejected.
+        assert!(validate_client(Path::new("fixture/4.2.0.1/Weixin.dll"), CLIENT_HASH).is_err());
+        assert!(validate_client(Path::new("fixture/4.1.16.1/Weixin.dll"), CLIENT_HASH).is_err());
         assert!(
             validate_client(Path::new("fixture/4.1.15.13/Weixin.dll"), &"0".repeat(64)).is_err()
         );
