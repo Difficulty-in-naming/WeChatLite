@@ -2977,15 +2977,21 @@ bool Window::locateQuoteLocally(const QJsonObject &quote)
     // the same short label the row itself displays, so both sides compare equal.
     const auto label = messageQuoteLabel(QJsonObject{{"sender", QString()}, {"text", text}});
     const auto wanted = label.startsWith(": ") ? label.mid(2) : label;
-    // A media reference carries only a placeholder like "[图片]". Comparing that against
-    // the rows would pick an arbitrary older image, which is worse than not locating at
-    // all, so media is left to the adapter: it has the real message number.
-    static const QStringList mediaLabels{"[图片]", "[视频]", "[GIF]", "[语音]", "[文件]"};
-    if (mediaLabels.contains(wanted.trimmed()))
-    {
-        quoteLog(QString("local: media reference, deferring to adapter (wanted=%1)").arg(wanted));
-        return false;
-    }
+    // A media reference never identifies one row: it reads "[图片]", or "[图片] <filename>",
+    // or "[视频] <name>". Matching that text against the conversation would jump to an
+    // arbitrary older image, which is worse than not locating at all, so media is left to
+    // the adapter, which has the real message number. The check is a prefix test because the
+    // label is followed by a filename in every real card.
+    static const QStringList mediaLabels{"[图片]", "[视频]", "[GIF]", "[语音]", "[文件]",
+                                         "[动画表情]", "[位置]", "[链接]", "[聊天记录]",
+                                         "[名片]", "[小程序]", "[转账]", "[红包]", "[视频号]"};
+    const auto trimmed = wanted.trimmed();
+    for (const auto &label : mediaLabels)
+        if (trimmed.startsWith(label))
+        {
+            quoteLog(QString("local: media reference, deferring to adapter (wanted=%1)").arg(trimmed));
+            return false;
+        }
     if (wanted.trimmed().isEmpty() || groupId.isEmpty())
     {
         quoteLog(QString("local: abort wanted=%1 group=%2")

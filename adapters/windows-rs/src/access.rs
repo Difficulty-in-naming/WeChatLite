@@ -390,7 +390,12 @@ impl Backend for Local {
                 .as_ref()
                 .map(|source| Uuid::new_v5(&Uuid::NAMESPACE_URL, source.as_bytes()).to_string())
                 .unwrap_or_else(|| format!("unavailable-{}", text(&reference, "server_id")));
-            let preview = crate::quotes::reference_preview(&reference);
+            // Prefer the resolved original's own media list: WeChat's reference body is
+            // sometimes a packed identifier that names no type at all.
+            let preview = original
+                .as_ref()
+                .and_then(crate::quotes::original_media_label)
+                .unwrap_or_else(|| crate::quotes::reference_preview(&reference));
             message["quote"] = json!({"id":id,"sender":if caption.is_empty(){"群成员"}else{&caption},"text":preview,"unavailable":false});
             // Internal proof for repairing legacy unresolved IDs; it is not part of the public Quote model.
             message["_quote_server_id"] = reference["server_id"].clone();
