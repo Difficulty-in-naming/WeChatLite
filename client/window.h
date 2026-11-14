@@ -109,6 +109,17 @@ class Window : public QMainWindow
     void refreshReeditLinks();
     void locateQuote(const QJsonObject &quote);
     void refreshQuoteSource(const QJsonObject &quote);
+    // Finds the quoted original among the messages this client already holds, using the
+    // sender and preview text carried by the reference. Needed because the adapter can only
+    // resolve references that still exist in its WeChat database.
+    bool locateQuoteLocally(const QJsonObject &quote);
+    // Appends one diagnostic line to quote-locate.log next to the app's data. Read-only
+    // about WeChat: it records what the client already holds, never message transports.
+    static void quoteLog(const QString &line);
+    // Pages backwards through history until the quoted original turns up or history ends.
+    void searchOlderForQuote(const QJsonObject &quote, int attempt = 0);
+    // Rows the current conversation has seen, newest first, for the local search.
+    QList<QJsonObject> conversationSnapshot() const;
     void updateNativeFrame();
     void refreshThemeIcons();
     void pruneMediaCache(qint64 limit, std::function<void(const QString &)> callback = {});

@@ -2862,6 +2862,9 @@ void Window::refreshQuoteSource(const QJsonObject &quote)
             if (group != groupId || conversation != conversationGeneration || generation != locateGeneration)
                 return;
             locatingId.clear();
+            quoteLog(QString("adapter: quote-source err=[%1] body=%2")
+                         .arg(error.left(120), QString::fromUtf8(
+                             QJsonDocument(value.toObject()).toJson(QJsonDocument::Compact)).left(400)));
             const auto response = value.toObject();
             const auto updated = response["message"].toObject();
             const auto original = response["original"].toObject();
@@ -2881,6 +2884,160 @@ void Window::refreshQuoteSource(const QJsonObject &quote)
             locateQuote(source);
         }, 18000);
 }
+void Window::searchOlderForQuote(const QJsonObject &quote, int attempt)
+{
+    if (groupId.isEmpty() || attempt > 8)
+    {
+        // Give up quietly here; the caller still has the adapter path to try.
+        notify("已加载的消息里没有找到这条引用的原文", true);
+        return;
+    }
+    const auto group = groupId;
+    const auto conversation = conversationGeneration;
+    // A page of history is the oldest row currently held; ask for everything before it.
+    const auto rows = conversationSnapshot();
+    if (rows.isEmpty())
+        return;
+    qint64 oldest = 0;
+    for (const auto &row : rows)
+    {
+        const auto seq = row["seq"].toInteger();
+        if (seq > 0 && (oldest == 0 || seq < oldest))
+            oldest = seq;
+    }
+    if (oldest <= 0)
+        return;
+    QUrlQuery query;
+    query.addQueryItem("group", group);
+    query.addQueryItem("before", QString::number(oldest));
+    transport.get(
+        "/api/messages?" + query.toString(QUrl::FullyEncoded),
+        [this, quote, group, conversation, attempt](const QJsonValue &value, const QString &error)
+        {
+            if (group != groupId || conversation != conversationGeneration)
+                return;
+            if (!error.isEmpty())
+            {
+                notify(error, true);
+                return;
+            }
+            auto page = value.toArray();
+            QJsonArray older;
+            for (const auto &entry : page)
+            {
+                const auto row = entry.toObject();
+                if (row["group"].toString() == group)
+                    older.append(localFiles->hydrate(row, group));
+            }
+            if (older.isEmpty())
+            {
+                notify("已到达这个群的最早记录，仍未找到引用的原文", true);
+                return;
+            }
+            model->prepend(older);
+            if (locateQuoteLocally(quote))
+                return;
+            searchOlderForQuote(quote, attempt + 1);
+        },
+        12000);
+}
+
+QList<QJsonObject> Window::conversationSnapshot() const
+{
+    QList<QJsonObject> rows;
+    if (!model)
+        return rows;
+    for (const auto &row : model->rows)
+        if (row["group"].toString() == groupId)
+            rows.append(row);
+    return rows;
+}
+
+void Window::quoteLog(const QString &line)
+{
+    const auto root = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
+    if (root.isEmpty())
+        return;
+    QDir().mkpath(root);
+    QFile file(root + "/quote-locate.log");
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Append | QIODevice::Text))
+        return;
+    QTextStream stream(&file);
+    stream.setEncoding(QStringConverter::Utf8);
+    stream << QDateTime::currentDateTime().toString("yyyy-MM-dd HH:mm:ss.zzz")
+           << " " << line << "\n";
+}
+
+bool Window::locateQuoteLocally(const QJsonObject &quote)
+{
+    // The sender on a reference is WeChat's display name for that member at quote time, which
+    // rarely equals this client's local name for them, so it is not a usable filter.
+    auto text = quote["text"].toString();
+    // Older references may still hold the native payload; messageQuoteLabel turns it into
+    // the same short label the row itself displays, so both sides compare equal.
+    const auto label = messageQuoteLabel(QJsonObject{{"sender", QString()}, {"text", text}});
+    const auto wanted = label.startsWith(": ") ? label.mid(2) : label;
+    // A media reference carries only a placeholder like "[图片]". Comparing that against
+    // the rows would pick an arbitrary older image, which is worse than not locating at
+    // all, so media is left to the adapter: it has the real message number.
+    static const QStringList mediaLabels{"[图片]", "[视频]", "[GIF]", "[语音]", "[文件]"};
+    if (mediaLabels.contains(wanted.trimmed()))
+    {
+        quoteLog(QString("local: media reference, deferring to adapter (wanted=%1)").arg(wanted));
+        return false;
+    }
+    if (wanted.trimmed().isEmpty() || groupId.isEmpty())
+    {
+        quoteLog(QString("local: abort wanted=%1 group=%2")
+                     .arg(wanted.left(60), groupId));
+        return false;
+    }
+    const auto conversation = conversationGeneration;
+    const auto rows = conversationSnapshot();
+    quoteLog(QString("local: quote text=[%1] wanted=[%2] rows=%3")
+                 .arg(text.left(120).replace('\n', ' '), wanted.left(80),
+                      QString::number(rows.size())));
+    if (rows.isEmpty())
+    {
+        quoteLog("local: no loaded rows for this conversation");
+        return false;
+    }
+    // Prefer the newest match: a repeated short message is far more likely to be quoted
+    // from the recent part of the conversation.
+    for (auto it = rows.crbegin(); it != rows.crend(); ++it)
+    {
+        const auto row = *it;
+        if (row["status"] == "recalled")
+            continue;
+        const auto rowLabel = messageQuoteText(row);
+        if (rowLabel != wanted)
+        {
+            if (rowLabel.startsWith(wanted.left(2)) || wanted.startsWith(rowLabel.left(2)))
+                quoteLog(QString("local: near miss row=[%1] id=%2")
+                             .arg(rowLabel.left(120).replace('\n', ' '),
+                                  row["id"].toString()));
+            continue;
+        }
+        const auto id = row["id"].toString();
+        if (id.isEmpty())
+            continue;
+        if (conversation != conversationGeneration || groupId != row["group"].toString())
+            return false;
+        quoteLog(QString("local: matched id=%1").arg(id));
+        if (!messages->locateMessage(id))
+        {
+            quoteLog(QString("local: locateMessage refused id=%1").arg(id));
+            return false;
+        }
+        // Rewrite the stale placeholder so later clicks take the fast path.
+        localFiles->hydrate(row, groupId);
+        notify("已定位到原文（按发送者和内容匹配）");
+        return true;
+    }
+    quoteLog("local: no row matched");
+    return false;
+}
+
 void Window::locateQuote(const QJsonObject &quote)
 {
     const auto id = quote["id"].toString();
@@ -2905,9 +3062,26 @@ void Window::locateQuote(const QJsonObject &quote)
                 messages->locateMessage(id);
             return;
         }
-    if (id.startsWith("unavailable-") && !quote["_reply_id"].toString().isEmpty())
+    // The adapter could not map this reference to a stored id (it only sees the WeChat
+    // database). Resolve it against the messages already loaded here instead: the quote
+    // carries the sender and the preview text, which is enough to find the original.
+    quoteLog(QString("locate: clicked id=[%1] sender=[%2] text=[%3] reply=%4")
+                 .arg(id.left(60), quote["sender"].toString().left(40),
+                      quote["text"].toString().left(120).replace('\n', ' '),
+                      quote["_reply_id"].toString()));
+    if (id.startsWith("unavailable-"))
     {
-        refreshQuoteSource(quote);
+        if (locateQuoteLocally(quote))
+            return;
+        // Not loaded here. The adapter can often fix the placeholder from the WeChat
+        // database, so try that first; it is one request and it also repairs the stored
+        // reference. searchOlderForQuote runs only when that path cannot be attempted.
+        if (!quote["_reply_id"].toString().isEmpty())
+        {
+            refreshQuoteSource(quote);
+            return;
+        }
+        searchOlderForQuote(quote);
         return;
     }
     const auto group = groupId;

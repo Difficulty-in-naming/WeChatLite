@@ -419,6 +419,69 @@ pub fn matches_reference(
     }
 }
 
+/// Names the first failing condition of `matches_reference`, for diagnostics only.
+/// It never decides anything: the caller has already rejected the row, and a value this
+/// function cannot classify is reported as `unknown` rather than guessed.
+pub fn reference_mismatch(
+    group: &str,
+    row: &Value,
+    raw: &Value,
+    wxid: &str,
+    reference: &Value,
+) -> &'static str {
+    let Some(kind) = reference["type"].as_u64() else {
+        return "reference-type";
+    };
+    let Some((label, local_types)) = reference_shape(kind) else {
+        return "unsupported-reference-type";
+    };
+    let local_type = raw["local_type"].as_i64();
+    if row["type"] != label {
+        return "row-kind";
+    }
+    if !local_type.is_some_and(|value| local_types.contains(&value)) {
+        return "raw-local-type";
+    }
+    let Ok(source) = source_fields(group, row, raw, wxid) else {
+        return "source-fields";
+    };
+    if source["server_id"] != reference["server_id"] {
+        return "server-id";
+    }
+    if reference["fromusr"] != source["chatusr"] && reference["fromusr"] != group {
+        return "fromusr";
+    }
+    if source["chatusr"] != reference["chatusr"] {
+        return "chatusr";
+    }
+    let actor = text(&source, "chatusr");
+    let source_body = remove_envelope(text(&source, "content"), actor);
+    let reference_body = remove_envelope(text(reference, "text"), actor);
+    match kind {
+        1 => if xml_newlines(source_body) == xml_newlines(reference_body) {
+            "unknown"
+        } else {
+            "text-body"
+        },
+        3 => {
+            if image_digest(source_body).is_some_and(|digest| {
+                image_digest(reference_body).as_deref() == Some(digest.as_str())
+            }) {
+                "unknown"
+            } else {
+                "image-digest"
+            }
+        }
+        _ => {
+            if same_native_shape(source_body, reference_body, kind) {
+                "unknown"
+            } else {
+                "native-shape"
+            }
+        }
+    }
+}
+
 fn image_digest(content: &str) -> Option<String> {
     if content.len() > 2 * 1024 * 1024
         || content.contains("<!DOCTYPE")

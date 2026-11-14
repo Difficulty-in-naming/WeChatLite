@@ -137,6 +137,11 @@ pub trait Backend {
     fn is_record(&mut self, _group: &str, row: &Value) -> bool {
         crate::records::is_record(text(row, "content"))
     }
+    /// Specific reason the last quoted-source lookup failed, when the backend can say.
+    /// Defaults to empty so a backend without database access still compiles.
+    fn quote_failure(&self) -> String {
+        String::new()
+    }
     fn prepare_media(&mut self, data: &Path, id: &str, index: usize, media: &Value)
     -> Result<Step>;
     fn prepare_quote(
@@ -509,6 +514,35 @@ fn history_page<A: Backend>(
     Ok(())
 }
 
+/// Keeps a failure stage to something a client may display: short, single-line and free
+/// of the message bodies a database error can quote back at us.
+fn sanitize_stage(message: &str) -> String {
+    let mut stage = String::new();
+    let mut space = false;
+    for character in message.chars() {
+        if character.is_whitespace() {
+            space = !stage.is_empty();
+            continue;
+        }
+        if character.is_control() || "<>".contains(character) {
+            continue;
+        }
+        if space {
+            stage.push(' ');
+            space = false;
+        }
+        if stage.chars().count() >= 120 {
+            break;
+        }
+        stage.push(character);
+    }
+    if stage.is_empty() {
+        "未知阶段".into()
+    } else {
+        stage
+    }
+}
+
 fn quote_refresh<A: Backend>(
     access: &mut A,
     command: &Value,
@@ -529,7 +563,14 @@ fn quote_refresh<A: Backend>(
     events.push(json!({"type":"message","historical":true,"message":message}));
     let mut done = json!({"type":"quote_refresh_done","request_id":request,"group":group,"source_id":key,"ok":resolved});
     if !resolved {
-        done["error"] = json!("未找到可验证的引用原消息");
+        // The stage name is diagnostic metadata about our own database lookup; it carries
+        // no message content, so it is safe to return where the generic text was not.
+        let stage = access.quote_failure();
+        done["error"] = json!(if stage.is_empty() {
+            "未找到可验证的引用原消息".to_owned()
+        } else {
+            format!("未找到可验证的引用原消息（{stage}）")
+        });
     }
     events.push(done);
     Ok(())
@@ -1201,13 +1242,16 @@ impl<A: Backend> Engine<A> {
                 } else if operation == "history" {
                     events.push(json!({"type":"history_done","group":command["group"],"request_id":command["request_id"],"error":error.to_string()}));
                 } else if operation == "quote_refresh" {
-                    // Keep DB parse errors and original content out of the public completion event.
+                    // Keep DB parse errors and original content out of the public completion
+                    // event, but do not throw away the stage: the generic sentence made every
+                    // failure look identical and impossible to diagnose.
                     let request = text(command, "request_id");
                     let request = uuid::Uuid::parse_str(request)
                         .ok()
                         .map(|id| id.to_string())
                         .unwrap_or_default();
-                    events.push(json!({"type":"quote_refresh_done","group":command["group"],"source_id":command["source_id"],"request_id":request,"ok":false,"error":"引用原消息暂时无法读取"}));
+                    let stage = sanitize_stage(&error.to_string());
+                    events.push(json!({"type":"quote_refresh_done","group":command["group"],"source_id":command["source_id"],"request_id":request,"ok":false,"error":format!("引用原消息暂时无法读取（{stage}）")}));
                 } else if operation == "announcement" {
                     let request = text(command, "request_id");
                     let request = if request.len() <= 128 && !request.chars().any(char::is_control)

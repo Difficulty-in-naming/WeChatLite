@@ -30,6 +30,10 @@ pub struct Local {
     // A quoted reply can itself quote another message; expand at most one extra
     // row so a long chain never recurses through the whole database.
     quote_depth: usize,
+    // Why the most recent quoted source could not be resolved. A failed lookup used to
+    // collapse into one misleading "not synced" message, which is impossible to act on;
+    // this keeps the specific stage so the relay can report it.
+    quote_failure: String,
 }
 impl Local {
     pub fn connect(directory: PathBuf) -> Result<Self> {
@@ -58,6 +62,7 @@ impl Local {
             quotes,
             quotes_error,
             quote_depth: 0,
+            quote_failure: String::new(),
         })
     }
     fn avatar(&mut self, id: &str) -> String {
@@ -88,16 +93,26 @@ impl Local {
             self.db.display_name(group, prefix)
         })
     }
+    /// Finds the row a received quote points at.
+    ///
+    /// `svrid` is WeChat's own message number and the card already carries it, so a single
+    /// unique hit in this group's table is the answer. The earlier version also required the
+    /// quoted body, actor and card shape to match byte for byte, which rejected perfectly
+    /// good references whenever WeChat rewrote the preview. Hopping to another group is
+    /// already impossible: the table name is derived from the group.
     fn referenced_original(&mut self, group: &str, reference: &Value) -> Result<Option<Value>> {
         use md5::{Digest, Md5};
-        if crate::quotes::reference_shape(reference["type"].as_u64().unwrap_or(0)).is_none() {
-            return Ok(None);
-        }
-        let server = text(reference, "server_id")
-            .parse::<u64>()
-            .context("引用来源编号无效")?;
+        self.quote_failure.clear();
+        let server = match text(reference, "server_id").parse::<u64>() {
+            Ok(server) if server > 0 => server,
+            _ => {
+                self.quote_failure = "reference has no usable server_id".into();
+                return Ok(None);
+            }
+        };
         let table = format!("Msg_{:x}", Md5::digest(group.as_bytes()));
-        let mut original = None;
+        let mut hit: Option<(String, i64, i64)> = None;
+        let mut duplicates = Vec::new();
         for rel in self.db.rels().into_iter().filter(|rel| {
             rel.strip_prefix("message/message_")
                 .and_then(|v| v.strip_suffix(".db"))
@@ -119,21 +134,30 @@ impl Local {
                     Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
-            if found.len() > 1 || (!found.is_empty() && original.is_some()) {
-                return Ok(None); // A duplicate server ID must never select whichever shard was visited first.
-            }
-            if let Some((id, sequence)) = found.first().copied() {
-                let locator =
-                    json!({"local_id":id,"sort_seq":sequence,"shard":rel.replace('/',"__")});
-                let row = self.db.reload(group, &locator)?;
-                let raw = self.db.raw_message(group, id, text(&locator, "shard"))?;
-                if !crate::quotes::matches_reference(group, &row, &raw, &self.db.wxid, reference) {
-                    return Ok(None);
+            for (id, sequence) in found {
+                if hit.is_some() {
+                    // Two rows claiming one message number: refuse rather than guess.
+                    duplicates.push(rel.clone());
+                    continue;
                 }
-                original = Some(row);
+                hit = Some((rel.replace('/', "__"), id, sequence));
             }
         }
-        Ok(original)
+        if !duplicates.is_empty() {
+            self.quote_failure = format!("server_id {server} is not unique in this group");
+            return Ok(None);
+        }
+        let Some((shard, id, sequence)) = hit else {
+            self.quote_failure = format!("no stored row has server_id {server}");
+            return Ok(None);
+        };
+        let locator = json!({"local_id":id,"sort_seq":sequence,"shard":shard});
+        let row = self.db.reload(group, &locator)?;
+        if row["status"] == "recalled" {
+            self.quote_failure = format!("server_id {server} was recalled");
+            return Ok(None);
+        }
+        Ok(Some(row))
     }
 }
 impl Drop for Local {
@@ -224,6 +248,9 @@ impl Backend for Local {
     }
     fn select_downloads(&mut self, groups: &BTreeSet<String>) -> Result<()> {
         self.media.select(groups)
+    }
+    fn quote_failure(&self) -> String {
+        self.quote_failure.clone()
     }
     fn is_quote(&mut self, group: &str, row: &Value) -> bool {
         self.identity(group, row)
