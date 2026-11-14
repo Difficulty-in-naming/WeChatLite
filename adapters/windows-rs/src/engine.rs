@@ -3,7 +3,7 @@ use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     path::{Path, PathBuf},
 };
 
@@ -576,6 +576,16 @@ fn quote_refresh<A: Backend>(
     Ok(())
 }
 
+/// Which step an inbound item failed at, for the diagnostic line.
+fn inbox_stage(raw_locator: &str) -> &'static str {
+    match serde_json::from_str::<Value>(raw_locator) {
+        Ok(locator) if locator["_record_refresh"] == true => "record-refresh",
+        Ok(locator) if locator["historical"] == true => "historical",
+        Ok(_) => "live",
+        Err(_) => "locator-parse",
+    }
+}
+
 fn journal_page<A: Backend>(
     access: &mut A,
     store: &Receipts,
@@ -1008,6 +1018,10 @@ pub struct Engine<A: Backend> {
     pages: HashMap<String, Value>,
     signatures: Option<Value>,
     warned: BTreeSet<String>,
+    // Consecutive failures per inbound item. An item that can never succeed (its row was
+    // deleted, or its locator no longer matches) must be dropped instead of retried
+    // forever, because it sits at the head of the queue and blocks every later message.
+    inbox_failures: BTreeMap<String, u32>,
     data: PathBuf,
     directory: PathBuf,
     last_poll: f64,
@@ -1039,6 +1053,7 @@ impl<A: Backend> Engine<A> {
             pages: HashMap::new(),
             signatures: None,
             warned: BTreeSet::new(),
+            inbox_failures: BTreeMap::new(),
             data,
             directory,
             last_poll: 0.0,
@@ -1413,12 +1428,41 @@ impl<A: Backend> Engine<A> {
                     }
                     Ok(true)
                 })();
+                if result.is_ok() {
+                    self.inbox_failures.remove(&key);
+                }
                 let delay = match result {
                     Ok(false) => 2.0,
                     Ok(true) => retry_locator.as_mut().map_or(30.0, |locator| {
                         media_retry_delay(locator, now, waiting.as_ref())
                     }),
                     Err(error) => {
+                        // "Still downloading" is not a failure: a WXGF picture is written
+                        // to disk in pieces and can take minutes on a slow transfer. Only
+                        // an error that can never resolve is capped, otherwise a large
+                        // photo would be dropped while it was still arriving.
+                        let waiting = error.downcast_ref::<crate::media::MediaPending>().is_some();
+                        if waiting {
+                            self.inbox_failures.remove(&key);
+                        } else {
+                            let failures = self.inbox_failures.entry(key.clone()).or_insert(0);
+                            *failures += 1;
+                            if *failures >= 5 {
+                                self.inbox_failures.remove(&key);
+                                self.store
+                                    .db
+                                    .execute("DELETE FROM pending WHERE source=?", [&key])?;
+                                events.push(json!({"type":"warning","group":group,"text":format!("有一条消息无法读取，已跳过以免阻塞后续消息：{error}")}));
+                                continue;
+                            }
+                        }
+                        // Report the stage every time, not once per key: a single warning
+                        // followed by silent retries is how a permanently failing item hid
+                        // itself while every later message stayed blocked behind it.
+                        eprintln!(
+                            "[timing] inbox error group={group} source={key} stage={} error={error}",
+                            inbox_stage(&raw_locator),
+                        );
                         if self.warned.insert(key.clone()) {
                             events.push(json!({"type":"warning","group":group,"text":format!("微信附件暂未就绪，将保留并重试：{error}")}));
                         }

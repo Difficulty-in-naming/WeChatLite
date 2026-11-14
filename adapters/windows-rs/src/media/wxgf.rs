@@ -132,40 +132,72 @@ fn chroma(stream: &[u8]) -> Result<u32> {
     );
     Ok(chroma)
 }
+/// Splits the WXGF payload into its colour (and optional alpha) HEVC streams.
+///
+/// The container writes one record per partition:
+///
+/// ```text
+/// 00 00 01     start code
+/// 3a           NAL header, type 29
+/// 31 | 32      ASCII '1' or '2', the partition number
+/// nn nn nn nn  payload length, big endian
+/// ...          HEVC bytes
+/// ```
+///
+/// Verified against a real picture: `00 00 01 3a 31 00 01 3a 24` declares 0x00013a24 =
+/// 80420 bytes, and 80420 + 9 reaches the next record exactly. An earlier version looked
+/// for `00 00 01 40 01` and read the length *before* it, which matched a byte sequence near
+/// the end of the file and reported an absurd size.
 fn partitions(data: &[u8]) -> Result<Vec<(u32, &[u8])>> {
-    let start = (0..data.len().saturating_sub(5))
-        .find(|i| {
-            data.get(*i..*i + 6) == Some(&[0, 0, 0, 1, 0x40, 1])
-                || data.get(*i..*i + 5) == Some(&[0, 0, 1, 0x40, 1])
-        })
-        .context("缺少 WXGF 图像码流")?;
-    ensure!(start >= 4, "WXGF 分片头无效");
-    let mut pos = start - 4;
+    const HEADER: usize = 9;
+    // Skip the fixed `wxgf` preamble before the records begin: the header carries size and
+    // format fields and could in principle contain the start code, so scanning from zero
+    // would be a coincidence rather than a rule.
+    let mut pos = 4usize;
+    while pos + 3 <= data.len() && data[pos..pos + 3] != [0, 0, 1] {
+        pos += 1;
+    }
     let mut out = Vec::new();
-    while pos < data.len() {
-        let size = u32::from_be_bytes(
-            data.get(pos..pos + 4)
-                .context("WXGF 分片尚未完整写入")?
-                .try_into()
-                .unwrap(),
-        ) as usize;
-        pos += 4;
+    while pos + HEADER <= data.len() {
+        let rest = &data[pos..];
+        if rest.len() < 4 || rest[..3] != [0, 0, 1] || rest[3] != 0x3a {
+            // The stream ends when the next record does not start; trailing padding is
+            // allowed, a record in the middle of the file is not.
+            if out.is_empty() {
+                anyhow::bail!("WXGF 缺少图像码流（偏移 {pos}）");
+            }
+            break;
+        }
+        let index = rest[4];
         ensure!(
-            size > 0 && size <= data.len() - pos && out.len() < 2,
-            "WXGF 分片不完整或暂不支持"
+            index == b'1' || index == b'2',
+            "WXGF 分片编号无效（偏移 {pos}，值 {index:#04x}）"
         );
-        let stream = &data[pos..pos + size];
+        let size = u32::from_be_bytes(rest[5..9].try_into().unwrap()) as usize;
+        let body = pos + HEADER;
+        ensure!(size > 0, "WXGF 分片长度为零（偏移 {pos}）");
+        ensure!(
+            size <= data.len() - body,
+            "WXGF 分片超出数据范围（声明 {size} 字节，剩余 {} 字节，偏移 {body}）",
+            data.len() - body
+        );
+        ensure!(
+            out.len() < 2,
+            "WXGF 图像包含超过两个分片，暂不支持"
+        );
+        let stream = &data[body..body + size];
         let count = nals(stream)
             .iter()
             .filter(|(kind, unit)| *kind < 32 && unit.len() > 2 && unit[2] & 128 != 0)
             .count();
-        ensure!(count == 1, "WXGF 多帧图像暂不支持，原消息已保留");
+        ensure!(count <= 1, "WXGF 多帧图像暂不支持，原消息已保留");
         out.push((chroma(stream)?, stream));
-        pos += size;
+        pos = body + size;
     }
     ensure!(!out.is_empty(), "WXGF 图像码流缺失");
     Ok(out)
 }
+
 fn ffmpeg() -> Result<PathBuf> {
     let exe = std::env::current_exe()?;
     let parent = exe.parent().context("程序目录不可用")?;
@@ -223,7 +255,9 @@ fn run_frame(exe: &Path, stream: &[u8], directory: &Path, name: &str) -> Result<
         .arg(&output)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        // Capture diagnostics instead of discarding them: an FFmpeg rejection is the only
+        // way to tell a corrupt stream from an unsupported profile.
+        .stderr(Stdio::piped());
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -233,7 +267,22 @@ fn run_frame(exe: &Path, stream: &[u8], directory: &Path, name: &str) -> Result<
     let start = Instant::now();
     loop {
         if let Some(status) = child.try_wait()? {
-            ensure!(status.success(), "WXGF 图像未完整解码");
+            if !status.success()
+                && let Some(mut errors) = child.stderr.take()
+            {
+                let mut detail = String::new();
+                use std::io::Read as _;
+                let _ = errors.by_ref().take(512).read_to_string(&mut detail);
+                let detail = detail.trim();
+                anyhow::bail!(
+                    "WXGF 图像未完整解码：{}",
+                    if detail.is_empty() {
+                        format!("解码器返回 {status}")
+                    } else {
+                        detail.to_owned()
+                    }
+                );
+            }
             break;
         }
         if start.elapsed() > Duration::from_secs(30)
@@ -296,12 +345,59 @@ pub(super) fn decode(data: &[u8], directory: &Path) -> Result<Vec<u8>> {
         let _ = fs::remove_dir(&temporary);
         decoded
     })();
-    result.map_err(|_| super::pending("微信 WXGF 图片尚未完整解码，原消息已保留，会自动重试"))
+    // Keep the underlying cause. "尚未完整解码" used to cover a missing decoder binary, an
+    // FFmpeg rejection and a truncated stream alike, which made the failure impossible to
+    // tell apart from a transfer that was simply still in progress.
+    result.map_err(|error| {
+        let detail = format!("{error:#}");
+        super::pending_text(format!(
+            "微信 WXGF 图片尚未完整解码，原消息已保留，会自动重试（{detail}）"
+        ))
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The exact first 48 bytes reported by a failing real picture. The record layout is
+    /// `00 00 01 3a <ascii index> <u32 length>`; this guards the offsets.
+    const REAL_HEADER: &[u8] = &[
+        0x77, 0x78, 0x67, 0x66, 0x13, 0x00, 0x02, 0x04, 0x38, 0x09, 0x60, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x40, 0x01, 0xa2, 0x03, 0x02, 0x02, 0x00, 0x01, 0x06, 0x02, 0x02, 0x00,
+        0x64, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x3a, 0x31, 0x00, 0x01, 0x3a, 0x24,
+        0x00, 0x00, 0x00, 0x01, 0x40, 0x01,
+    ];
+
+    #[test]
+    fn the_partition_record_layout_matches_real_wechat_data() {
+        // Offset 33 begins `00 00 01 3a 31`, and the four bytes after the index declare
+        // 0x00013a24 = 80420 bytes for partition '1'.
+        assert_eq!(&REAL_HEADER[33..38], &[0x00, 0x00, 0x01, 0x3a, b'1']);
+        let declared = u32::from_be_bytes(REAL_HEADER[38..42].try_into().unwrap());
+        assert_eq!(declared, 80420, "the length lives right after the partition index");
+
+        // Partition parsing starts after the `wxgf` preamble, so a record fragment on its
+        // own is not a valid payload. Rebuilding it from the preamble keeps the offsets real.
+        let mut broken = REAL_HEADER.to_vec();
+        broken.extend_from_slice(&[0u8; 32]);
+        // The record begins at 33; its length field sits at record+5.
+        broken[33 + 5..33 + 9].copy_from_slice(&999_999u32.to_be_bytes());
+        let error = format!("{:#}", partitions(&broken).unwrap_err());
+        assert!(error.contains("WXGF 分片超出数据范围"), "{error}");
+        assert!(error.contains("999999"), "{error}");
+
+        // A record whose marker is not the type-29 header must not be parsed.
+        let mut wrong = REAL_HEADER.to_vec();
+        wrong[33 + 3] = 0x40;
+        wrong.extend_from_slice(&[0u8; 32]);
+        assert!(partitions(&wrong).is_err(), "a wrong marker must not parse");
+
+        // The declared length decides the payload slice; 0x00013a24 is what WeChat wrote.
+        let declared = u32::from_be_bytes(REAL_HEADER[38..42].try_into().unwrap());
+        assert_eq!(declared as usize, 80420);
+    }
+
     fn synthetic_hevc(exe: &Path, folder: &Path, name: &str, color: &str, gray: bool) -> Vec<u8> {
         let output = folder.join(format!("{name}.hevc"));
         let mut command = Command::new(exe);
