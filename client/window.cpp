@@ -349,8 +349,12 @@ Window::Window(bool demo, const QString &tunnelExecutable)
                 notificationSyncSeq = 0;
                 connected = value;
                 connection->setText(value ? "● 已连接服务器" : "○ 正在连接服务器…");
+                setLinkState(value, value ? QStringLiteral("服务器已连接，等待微信就绪")
+                                          : QStringLiteral("未连接"));
                 if (value)
                 {
+                    // Recovered: arm the next outage's notice again.
+                    linkLossNotified = false;
                     startupWatchdog.stop();
                     hideBanner();
                     lastError.clear();
@@ -375,17 +379,42 @@ Window::Window(bool demo, const QString &tunnelExecutable)
                     canSend = canDownload = false;
                     messages->setProperty("canDownload", false);
                     sendButton->setEnabled(false);
+                    // The relay's readiness is stale the moment the socket drops.
                     ready = false;
                     subtitle->setText("服务器连接已断开，正在自动重连");
                     // Visible in the window list and Mission Control too, so a backgrounded
                     // window still shows that it is not connected.
                     setWindowTitle("微信轻聊 · 未连接");
+                    // The dot turns red here; without a tooltip the reason would still be
+                    // hidden, so carry the short cause on the indicator itself.
+                    setLinkState(false, lastError.isEmpty()
+                                           ? QStringLiteral("未连接，正在重连")
+                                           : lastError.left(120));
+                    // The window banner only exists while the window is on screen. When the
+                    // client sits in the background, the user otherwise learns about a dead
+                    // link only by attempting a send, so announce the first loss and stay
+                    // quiet on every subsequent retry.
+                    // SystemNotifier already suppresses display in test/offscreen runs and
+                    // honours the user's notification switch; deciding here as well would make
+                    // this path untestable and silently drop real outages in odd setups.
+                    if (linkWasUp && !linkLossNotified && !quitting && !demoMode)
+                    {
+                        linkLossNotified = true;
+                        emit statusNotificationRequested(
+                            QStringLiteral("微信轻聊 · 与服务器断开"),
+                            lastError.isEmpty()
+                                ? QStringLiteral("正在自动重连。")
+                                : lastError.left(160));
+                    }
                     // A transport that cannot succeed (wrong pin, plain http with a pin) stays
                     // disconnected on purpose; do not promise a retry that will not happen.
                     if (transport.isBlocked())
                     {
                         if (lastError.isEmpty())
                             setConnectionState("无法连接服务器，请检查连接设置后重试。", false);
+                        setLinkState(false, lastError.isEmpty()
+                                               ? QStringLiteral("无法连接，请检查设置")
+                                               : lastError.left(120));
                     }
                     else if (!quitting)
                     {
@@ -664,6 +693,15 @@ void Window::makeUi()
     title->setObjectName("chatTitle");
     title->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
     headerLayout->addWidget(title, 1);
+    // Link indicator: a filled dot that is always in the header, so the state is
+    // readable at a glance instead of only after a send fails. Grey until the first
+    // attempt settles, then green while connected and red once the link is lost.
+    linkDot = new QLabel(header);
+    linkDot->setObjectName("linkDot");
+    linkDot->setFixedSize(10, 10);
+    linkDot->setAccessibleName("连接状态");
+    headerLayout->addWidget(linkDot);
+    setLinkState(false, QStringLiteral("尚未连接"));
     historyButton = button({}, "historyButton");
     historyButton->setAccessibleName("聊天记录");
     historyButton->setIcon(svgIcon(":/client/icons/history.svg"));
@@ -2428,6 +2466,8 @@ void Window::handleEvent(const QJsonObject &event)
             loadMembers();
         }
         subtitle->setText(event["text"].toString());
+        // The relay's WeChat may become ready (or drop) with the socket unaffected.
+        refreshLinkState();
         updateSendButton();
         if (event["demo"].toBool())
             notify("演示模式 · 此处发送的消息不会进入真实微信");
@@ -3147,6 +3187,32 @@ void Window::notify(const QString &text, bool error)
     showBanner(text, error);
 }
 
+void Window::setLinkState(bool up, const QString &detail)
+{
+    socketUp = up;
+    linkDetail = detail;
+    refreshLinkState();
+}
+void Window::refreshLinkState()
+{
+    if (!linkDot)
+        return;
+    // Green only when both halves hold: the event stream is up AND the relay says its
+    // local WeChat is ready. A connected socket with WeChat still starting looks healthy
+    // but can neither send nor receive, which is exactly the confusion to avoid.
+    const bool up = socketUp && ready;
+    // Amber while the socket is fine but the relay's WeChat is not ready yet, red once the
+    // link has been up and then dropped, grey before the first attempt settles.
+    const auto colour = up ? QStringLiteral("#2e986b")
+                           : socketUp ? QStringLiteral("#e0a33a")
+                                      : linkWasUp ? QStringLiteral("#d8534b")
+                                                  : QStringLiteral("#b8b8bd");
+    linkDot->setStyleSheet(
+        QStringLiteral("QLabel#linkDot { background:%1; border-radius:5px; }").arg(colour));
+    linkDot->setAccessibleName(QStringLiteral("连接状态：%1").arg(linkDetail));
+    if (up)
+        linkWasUp = true;
+}
 void Window::setConnectionState(const QString &text, bool reconnecting)
 {
     // Both "retrying" and "blocked" need a way out: a failing address must be
