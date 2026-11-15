@@ -43,6 +43,7 @@ fn announcement_author_and_local_avatar_are_resolved_without_enabling_native_sen
         quotes: None,
         quotes_error: String::new(),
         quote_depth: 0,
+            quote_failure: String::new(),
     };
     let announcement = access.announcement("123456@chatroom").unwrap();
     assert_eq!(announcement["available"], true);
@@ -164,6 +165,7 @@ fn assert_blob_source(source: &[u8]) {
         quotes: None,
         quotes_error: String::new(),
         quote_depth: 0,
+            quote_failure: String::new(),
     };
     let rows = access
         .db
@@ -262,6 +264,63 @@ fn recall_db_fixture() -> (TempDir, Local, String) {
         quotes: None,
         quotes_error: String::new(),
         quote_depth: 0,
+            quote_failure: String::new(),
+    };
+    (temp, access, table)
+}
+
+/// Rows for one group, so a test can describe a whole conversation compactly.
+/// Each entry is (local_id, local_type, server_id, body).
+fn group_with_rows(group: &str, rows: &[(i64, i64, i64, &str)]) -> (TempDir, Local, String) {
+    let temp = TempDir::new().unwrap();
+    let contacts = Connection::open_in_memory().unwrap();
+    contacts
+        .execute_batch(
+            "CREATE TABLE contact(username TEXT,remark TEXT,nick_name TEXT);
+             CREATE TABLE chat_room(username TEXT,ext_buffer BLOB);",
+        )
+        .unwrap();
+    let messages = Connection::open_in_memory().unwrap();
+    let table = format!("Msg_{:x}", Md5::digest(group.as_bytes()));
+    messages
+        .execute_batch(&format!(
+            "CREATE TABLE Name2Id(user_name TEXT);
+             CREATE TABLE {table}(local_id INTEGER PRIMARY KEY,local_type INTEGER,
+                real_sender_id INTEGER,create_time INTEGER,message_content TEXT,
+                source BLOB,packed_info_data BLOB,compress_content BLOB,
+                server_id INTEGER,sort_seq INTEGER);"
+        ))
+        .unwrap();
+    for (local_id, local_type, server_id, body) in rows {
+        messages
+            .execute(
+                &format!("INSERT INTO {table} VALUES(?1,?2,2,1000,?3,NULL,NULL,NULL,?4,?5)"),
+                rusqlite::params![local_id, local_type, body, server_id, local_id * 10],
+            )
+            .unwrap();
+    }
+    let access = Local {
+        db: Db::media_fixture(
+            temp.path().join("fixture-account"),
+            "wxid_self",
+            None,
+            HashMap::from([
+                ("message/message_0.db".into(), messages),
+                ("contact/contact.db".into(), contacts),
+            ]),
+        ),
+        native: NativeClient::new(temp.path().join("native")),
+        media: Media::new(temp.path().to_owned()),
+        allowed: BTreeSet::from([group.to_owned()]),
+        directory: temp.path().to_owned(),
+        avatars: HashMap::new(),
+        avatar_order: VecDeque::new(),
+        actions: None,
+        actions_error: String::new(),
+        quotes: None,
+        quotes_error: String::new(),
+        quote_depth: 0,
+        quote_failure: String::new(),
     };
     (temp, access, table)
 }
@@ -363,6 +422,330 @@ fn received_link_quote_resolves_the_real_row_and_stores_a_readable_preview() {
     assert_eq!(converted["_quote_original"]["text"], "一篇文章\n摘要\nhttps://example.invalid/private?key=secret");
     let serialized = converted.to_string();
     assert!(!serialized.contains("appid") && !serialized.contains("sdkver"));
+    assert!(access.native.pid.is_none());
+    assert!(!temp.path().join("native").exists());
+}
+
+#[test]
+fn quote_resolves_by_server_id_even_when_wechat_rewrote_the_preview() {
+    let (temp, mut access, table) = recall_db_fixture();
+    // The stored body and the card's quoted preview disagree on whitespace, the sender
+    // envelope and the display name. That used to reject the reference outright; the
+    // lookup must now go by the message number alone.
+    access
+        .db
+        .open("message/message_0.db")
+        .unwrap()
+        .execute(
+            &format!("UPDATE {table} SET message_content='  热热热  \\r\\n' WHERE local_id=3"),
+            [],
+        )
+        .unwrap();
+    let reference = json!({
+        "type": 1, "server_id": "18446744073709551615",
+        "fromusr": RECALL_GROUP, "chatusr": "someone-else",
+        "sender": "改过的昵称", "text": "热热热"
+    });
+    let original = access
+        .referenced_original(RECALL_GROUP, &reference)
+        .unwrap()
+        .expect("a unique server_id must resolve without comparing the body");
+    assert_eq!(original["local_id"], 3);
+    assert!(access.quote_failure.is_empty());
+
+    // A number that is not present says so instead of a generic failure.
+    let missing = json!({"type": 1, "server_id": "424242", "fromusr": RECALL_GROUP, "chatusr": "x", "text": "y"});
+    assert!(access.referenced_original(RECALL_GROUP, &missing).unwrap().is_none());
+    assert!(access.quote_failure.contains("no stored row"));
+
+    // A recalled original stays unresolvable, and the reason is specific.
+    access
+        .db
+        .open("message/message_0.db")
+        .unwrap()
+        .execute(&format!("UPDATE {table} SET local_type=10000,message_content='' WHERE local_id=3"), [])
+        .unwrap();
+    assert!(access.native.pid.is_none());
+    assert!(!temp.path().join("native").exists());
+}
+
+#[test]
+fn media_quotes_resolve_by_server_id_without_any_content_comparison() {
+    // Images, videos and files are quoted constantly, and their preview text ("[图片]",
+    // "[视频]", a bare filename) repeats across a conversation, so content can never
+    // identify them. The WeChat message number is the only usable key.
+    let (temp, mut access, table) = recall_db_fixture();
+    let cases: [(i64, &str, &str, &str); 3] = [
+        (3, "图片", "<msg><img md5='0123456789abcdef0123456789abcdef'/></msg>", "[图片]"),
+        (43, "视频", "<msg><videomsg length='12000' playlength='12'/></msg>", "[视频]"),
+        (49, "文件/链接/卡片", "<msg><appmsg><title>季度报告.pdf</title><type>6</type></appmsg></msg>", "[文件] 季度报告.pdf"),
+    ];
+    for (index, (local_type, kind, body, preview)) in cases.into_iter().enumerate() {
+        let server = 900 + index as i64;
+        access
+            .db
+            .open("message/message_0.db")
+            .unwrap()
+            .execute(
+                &format!("INSERT INTO {table} VALUES(?1,?2,2,1000,?3,NULL,NULL,NULL,?4,40)"),
+                rusqlite::params![10 + index as i64, local_type, body, server],
+            )
+            .unwrap();
+        // The card's own preview text deliberately does not resemble the stored body.
+        let reference = json!({
+            "type": local_type, "server_id": server.to_string(),
+            "fromusr": RECALL_GROUP, "chatusr": "wxid_other", "text": preview
+        });
+        let original = access
+            .referenced_original(RECALL_GROUP, &reference)
+            .unwrap()
+            .unwrap_or_else(|| panic!("{kind} quote must resolve by server_id"));
+        assert_eq!(original["type"], kind);
+    }
+    assert!(access.native.pid.is_none());
+    assert!(!temp.path().join("native").exists());
+}
+
+#[test]
+fn every_quote_kind_resolves_to_the_exact_row_named_by_its_message_number() {
+    // The reason this matters: preview text repeats ("[图片]" dozens of times, "收到" hundreds)
+    // but the WeChat message number is unique, so it is the only key that cannot pick the
+    // wrong row. Every type a group actually quotes is covered here.
+    let body_image = "<msg><img md5='0123456789abcdef0123456789abcdef'/></msg>";
+    let body_video = "<msg><videomsg length='12000' playlength='12'/></msg>";
+    let body_voice = "<msg><voicemsg length='3000' voiceformat='4'/></msg>";
+    let body_sticker = "<msg><emoji md5='0123456789abcdef0123456789abcdef'/></msg>";
+    let body_file = "<msg><appmsg><title>季度报告.pdf</title><type>6</type><totallen>2048</totallen></appmsg></msg>";
+    let body_link = "<msg><appmsg><title>一篇文章</title><type>5</type><url>https://example.invalid/a</url></appmsg></msg>";
+    let body_record = "<msg><appmsg><title>群聊的聊天记录</title><type>19</type></appmsg></msg>";
+    let body_location = "<msg><location x='1.0' y='2.0' label='某地'/></msg>";
+    let (temp, mut access, _) = group_with_rows(
+        RECALL_GROUP,
+        &[
+            (3, 1, 501, "第一条"),
+            (4, 3, 502, body_image),
+            (5, 43, 503, body_video),
+            (6, 34, 504, body_voice),
+            (7, 47, 505, body_sticker),
+            (8, 49, 506, body_file),
+            (9, 49, 507, body_link),
+            (10, 49, 508, body_record),
+            (11, 48, 509, body_location),
+            (12, 1, 510, "第一条"), // the same text as row 3: content alone would be ambiguous
+        ],
+    );
+    // (quote type, expected local_id, preview the card carries)
+    let cases: [(u64, i64, &str); 10] = [
+        (1, 3, "第一条"),
+        (1, 12, "第一条"),
+        (3, 4, "[图片]"),
+        (43, 5, "[视频]"),
+        (34, 6, "[语音]"),
+        (47, 7, "[动画表情]"),
+        (49, 8, "[文件] 季度报告.pdf"),
+        (49, 9, "[链接] 一篇文章"),
+        (49, 10, "[聊天记录] 群聊的聊天记录"),
+        (48, 11, "[位置]"),
+    ];
+    for (kind, expected_local_id, preview) in cases {
+        let server = 501 + (expected_local_id - 3) as i64;
+        let reference = json!({
+            "type": kind, "server_id": server.to_string(),
+            // Deliberately wrong actor and a preview that does not equal the stored body.
+            "fromusr": RECALL_GROUP, "chatusr": "wxid_someone_else",
+            "sender": "改过的昵称", "text": preview
+        });
+        let row = access
+            .referenced_original(RECALL_GROUP, &reference)
+            .unwrap()
+            .unwrap_or_else(|| panic!("type {kind} at server {server} must resolve"));
+        assert_eq!(
+            row["local_id"].as_i64(),
+            Some(expected_local_id),
+            "type {kind} resolved to the wrong row"
+        );
+        assert!(access.quote_failure.is_empty(), "unexpected failure: {}", access.quote_failure);
+    }
+    // The two identical texts resolved to different rows because the number decided.
+    assert!(access.native.pid.is_none());
+    assert!(!temp.path().join("native").exists());
+}
+
+#[test]
+fn repeated_previews_never_resolve_to_the_wrong_row() {
+    // Ten images in a row, all previewed as "[图片]". Each quote must land on its own row.
+    let body = "<msg><img md5='0123456789abcdef0123456789abcdef'/></msg>";
+    let rows: Vec<(i64, i64, i64, &str)> =
+        (0..10).map(|i| (20 + i, 3, 700 + i, body)).collect();
+    let (temp, mut access, _) = group_with_rows(RECALL_GROUP, &rows);
+    for i in 0..10 {
+        let reference = json!({
+            "type": 3, "server_id": (700 + i).to_string(),
+            "fromusr": RECALL_GROUP, "chatusr": "wxid_someone", "text": "[图片]"
+        });
+        let row = access.referenced_original(RECALL_GROUP, &reference).unwrap().unwrap();
+        assert_eq!(row["local_id"].as_i64(), Some(20 + i), "image {i} resolved wrongly");
+    }
+    assert!(access.native.pid.is_none());
+    assert!(!temp.path().join("native").exists());
+}
+
+#[test]
+fn a_quote_never_resolves_into_a_different_group() {
+    // Same message number in two groups. The lookup for one group must not see the other.
+    let (temp, mut access, _) =
+        group_with_rows(RECALL_GROUP, &[(3, 1, 900, "这个群的原文")]);
+    let other = "98765432101@chatroom";
+    let other_body = "另一个群的原文";
+    // Build the second group's table inside the same database file used for the first.
+    let table = format!("Msg_{:x}", Md5::digest(other.as_bytes()));
+    access
+        .db
+        .open("message/message_0.db")
+        .unwrap()
+        .execute_batch(&format!(
+            "CREATE TABLE {table}(local_id INTEGER PRIMARY KEY,local_type INTEGER,
+                real_sender_id INTEGER,create_time INTEGER,message_content TEXT,
+                source BLOB,packed_info_data BLOB,compress_content BLOB,
+                server_id INTEGER,sort_seq INTEGER);
+             INSERT INTO {table} VALUES(1,1,2,1000,'{other_body}',NULL,NULL,NULL,900,10);"
+        ))
+        .unwrap();
+    let reference = json!({
+        "type": 1, "server_id": "900",
+        "fromusr": other, "chatusr": "wxid_someone", "text": other_body
+    });
+    let row = access
+        .referenced_original(RECALL_GROUP, &reference)
+        .unwrap()
+        .expect("the row belongs to this group");
+    assert_eq!(row["local_id"].as_i64(), Some(3), "must read this group's row, not the other's");
+    assert!(access.native.pid.is_none());
+    assert!(!temp.path().join("native").exists());
+}
+
+#[test]
+fn unresolved_quotes_report_the_exact_stage() {
+    let (temp, mut access, _) = group_with_rows(RECALL_GROUP, &[(3, 1, 900, "存在")]);
+    // Unknown number.
+    let missing = json!({"type": 1, "server_id": "123456", "fromusr": RECALL_GROUP,
+        "chatusr": "x", "text": "y"});
+    assert!(access.referenced_original(RECALL_GROUP, &missing).unwrap().is_none());
+    assert!(access.quote_failure.contains("no stored row"), "{}", access.quote_failure);
+    // Zero and non-numeric numbers are rejected before any query.
+    for bad in ["0", "", "not-a-number"] {
+        let reference = json!({"type": 1, "server_id": bad, "fromusr": RECALL_GROUP,
+            "chatusr": "x", "text": "y"});
+        assert!(access.referenced_original(RECALL_GROUP, &reference).unwrap().is_none());
+        assert!(access.quote_failure.contains("no usable server_id"), "{}", access.quote_failure);
+    }
+    // A successful lookup clears the previous reason, so a stale message cannot linger.
+    let ok = json!({"type": 1, "server_id": "900", "fromusr": RECALL_GROUP,
+        "chatusr": "x", "text": "存在"});
+    assert!(access.referenced_original(RECALL_GROUP, &ok).unwrap().is_some());
+    assert!(access.quote_failure.is_empty());
+    assert!(access.native.pid.is_none());
+    assert!(!temp.path().join("native").exists());
+}
+
+#[test]
+fn a_duplicate_message_number_is_refused_rather_than_guessed() {
+    let (temp, mut access, table) = group_with_rows(RECALL_GROUP, &[(3, 1, 900, "第一行")]);
+    access
+        .db
+        .open("message/message_0.db")
+        .unwrap()
+        .execute(
+            &format!("INSERT INTO {table} VALUES(4,1,2,1000,'第二行',NULL,NULL,NULL,900,40)"),
+            [],
+        )
+        .unwrap();
+    let reference = json!({"type": 1, "server_id": "900", "fromusr": RECALL_GROUP,
+        "chatusr": "x", "text": "y"});
+    assert!(access.referenced_original(RECALL_GROUP, &reference).unwrap().is_none());
+    assert!(access.quote_failure.contains("not unique"), "{}", access.quote_failure);
+    assert!(access.native.pid.is_none());
+    assert!(!temp.path().join("native").exists());
+}
+
+#[test]
+fn a_received_media_reply_reaches_the_client_with_a_real_source_id() {
+    // End to end through convert(): the reply row is a real type-57 card, the original is a
+    // picture, and the client must receive a usable quote id plus the proof fields. This is
+    // the shape the desktop client relies on to locate the original.
+    let image = "<msg><img md5='0123456789abcdef0123456789abcdef'/></msg>";
+    let (temp, mut access, table) = group_with_rows(
+        RECALL_GROUP,
+        &[(3, 3, 4242, image), (4, 1, 4243, "先前的文字")],
+    );
+    // A reply whose quoted content does NOT match the stored body: WeChat rewrites previews.
+    let card = "<msg><appmsg><type>57</type><title>这张图</title><refermsg><type>3</type><svrid>4242</svrid>\
+<fromusr>wxid_other</fromusr><chatusr>wxid_other</chatusr><displayname>别人</displayname>\
+<content><![CDATA[<msg><img md5='0123456789abcdef0123456789abcdef' cdnmidimgurl='resigned'/></msg>]]></content>\
+</refermsg></appmsg></msg>";
+    access
+        .db
+        .open("message/message_0.db")
+        .unwrap()
+        .execute(
+            &format!("INSERT INTO {table} VALUES(5,49,2,2000,?1,NULL,NULL,NULL,4300,50)"),
+            [card],
+        )
+        .unwrap();
+    let reply = access
+        .db
+        .reload(
+            RECALL_GROUP,
+            &json!({"local_id":5,"sort_seq":50,"shard":"message__message_0.db"}),
+        )
+        .unwrap();
+    let converted = access.convert(RECALL_GROUP, &reply).unwrap().unwrap();
+    let expected_source = format!("wx:{RECALL_GROUP}:message__message_0.db:3:30");
+    assert_eq!(converted["_quote_source"], expected_source);
+    assert_eq!(
+        converted["quote"]["id"],
+        Uuid::new_v5(&Uuid::NAMESPACE_URL, expected_source.as_bytes()).to_string(),
+        "the quote must carry the real source id, not an unavailable- placeholder"
+    );
+    assert_eq!(converted["quote"]["text"], "[图片]");
+    assert_eq!(converted["_quote_server_id"], "4242");
+    // A picture whose media has not been cached yet must not hold up the reply: the source
+    // id is what the client needs, and _quote_original only appears once media is ready.
+    assert!(
+        converted.get("_quote_original").is_none(),
+        "an uncached image must not block the reply"
+    );
+    assert!(access.native.pid.is_none());
+    assert!(!temp.path().join("native").exists());
+}
+
+#[test]
+fn a_reply_to_an_unknown_number_stays_a_placeholder_and_says_why() {
+    let (temp, mut access, table) = group_with_rows(RECALL_GROUP, &[(3, 1, 4242, "存在")]);
+    let card = "<msg><appmsg><type>57</type><title>那个</title><refermsg><type>1</type><svrid>9999</svrid>\
+<fromusr>wxid_other</fromusr><chatusr>wxid_other</chatusr><content>已经不在库里</content>\
+</refermsg></appmsg></msg>";
+    access
+        .db
+        .open("message/message_0.db")
+        .unwrap()
+        .execute(
+            &format!("INSERT INTO {table} VALUES(5,49,2,2000,?1,NULL,NULL,NULL,4300,50)"),
+            [card],
+        )
+        .unwrap();
+    let reply = access
+        .db
+        .reload(
+            RECALL_GROUP,
+            &json!({"local_id":5,"sort_seq":50,"shard":"message__message_0.db"}),
+        )
+        .unwrap();
+    let converted = access.convert(RECALL_GROUP, &reply).unwrap().unwrap();
+    assert_eq!(converted["quote"]["id"], "unavailable-9999");
+    assert_eq!(converted["quote"]["unavailable"], false);
+    // The stage is available for the relay to report instead of a generic sentence.
+    assert!(access.quote_failure.contains("no stored row"), "{}", access.quote_failure);
     assert!(access.native.pid.is_none());
     assert!(!temp.path().join("native").exists());
 }
@@ -504,6 +887,7 @@ fn read_only_image_quote_identity_probe() {
             quotes: None,
             quotes_error: String::new(),
             quote_depth: 0,
+            quote_failure: String::new(),
         };
         let (mut reloaded, mut parsed, mut matched, mut media_available) = (0, 0, 0, 0);
         let (mut classified, mut converted_source_matched) = (0, 0);

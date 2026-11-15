@@ -3,7 +3,7 @@ use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     path::{Path, PathBuf},
 };
 
@@ -136,6 +136,11 @@ pub trait Backend {
     }
     fn is_record(&mut self, _group: &str, row: &Value) -> bool {
         crate::records::is_record(text(row, "content"))
+    }
+    /// Specific reason the last quoted-source lookup failed, when the backend can say.
+    /// Defaults to empty so a backend without database access still compiles.
+    fn quote_failure(&self) -> String {
+        String::new()
     }
     fn prepare_media(&mut self, data: &Path, id: &str, index: usize, media: &Value)
     -> Result<Step>;
@@ -509,6 +514,35 @@ fn history_page<A: Backend>(
     Ok(())
 }
 
+/// Keeps a failure stage to something a client may display: short, single-line and free
+/// of the message bodies a database error can quote back at us.
+fn sanitize_stage(message: &str) -> String {
+    let mut stage = String::new();
+    let mut space = false;
+    for character in message.chars() {
+        if character.is_whitespace() {
+            space = !stage.is_empty();
+            continue;
+        }
+        if character.is_control() || "<>".contains(character) {
+            continue;
+        }
+        if space {
+            stage.push(' ');
+            space = false;
+        }
+        if stage.chars().count() >= 120 {
+            break;
+        }
+        stage.push(character);
+    }
+    if stage.is_empty() {
+        "未知阶段".into()
+    } else {
+        stage
+    }
+}
+
 fn quote_refresh<A: Backend>(
     access: &mut A,
     command: &Value,
@@ -529,10 +563,27 @@ fn quote_refresh<A: Backend>(
     events.push(json!({"type":"message","historical":true,"message":message}));
     let mut done = json!({"type":"quote_refresh_done","request_id":request,"group":group,"source_id":key,"ok":resolved});
     if !resolved {
-        done["error"] = json!("未找到可验证的引用原消息");
+        // The stage name is diagnostic metadata about our own database lookup; it carries
+        // no message content, so it is safe to return where the generic text was not.
+        let stage = access.quote_failure();
+        done["error"] = json!(if stage.is_empty() {
+            "未找到可验证的引用原消息".to_owned()
+        } else {
+            format!("未找到可验证的引用原消息（{stage}）")
+        });
     }
     events.push(done);
     Ok(())
+}
+
+/// Which step an inbound item failed at, for the diagnostic line.
+fn inbox_stage(raw_locator: &str) -> &'static str {
+    match serde_json::from_str::<Value>(raw_locator) {
+        Ok(locator) if locator["_record_refresh"] == true => "record-refresh",
+        Ok(locator) if locator["historical"] == true => "historical",
+        Ok(_) => "live",
+        Err(_) => "locator-parse",
+    }
 }
 
 fn journal_page<A: Backend>(
@@ -967,6 +1018,10 @@ pub struct Engine<A: Backend> {
     pages: HashMap<String, Value>,
     signatures: Option<Value>,
     warned: BTreeSet<String>,
+    // Consecutive failures per inbound item. An item that can never succeed (its row was
+    // deleted, or its locator no longer matches) must be dropped instead of retried
+    // forever, because it sits at the head of the queue and blocks every later message.
+    inbox_failures: BTreeMap<String, u32>,
     data: PathBuf,
     directory: PathBuf,
     last_poll: f64,
@@ -998,6 +1053,7 @@ impl<A: Backend> Engine<A> {
             pages: HashMap::new(),
             signatures: None,
             warned: BTreeSet::new(),
+            inbox_failures: BTreeMap::new(),
             data,
             directory,
             last_poll: 0.0,
@@ -1201,13 +1257,16 @@ impl<A: Backend> Engine<A> {
                 } else if operation == "history" {
                     events.push(json!({"type":"history_done","group":command["group"],"request_id":command["request_id"],"error":error.to_string()}));
                 } else if operation == "quote_refresh" {
-                    // Keep DB parse errors and original content out of the public completion event.
+                    // Keep DB parse errors and original content out of the public completion
+                    // event, but do not throw away the stage: the generic sentence made every
+                    // failure look identical and impossible to diagnose.
                     let request = text(command, "request_id");
                     let request = uuid::Uuid::parse_str(request)
                         .ok()
                         .map(|id| id.to_string())
                         .unwrap_or_default();
-                    events.push(json!({"type":"quote_refresh_done","group":command["group"],"source_id":command["source_id"],"request_id":request,"ok":false,"error":"引用原消息暂时无法读取"}));
+                    let stage = sanitize_stage(&error.to_string());
+                    events.push(json!({"type":"quote_refresh_done","group":command["group"],"source_id":command["source_id"],"request_id":request,"ok":false,"error":format!("引用原消息暂时无法读取（{stage}）")}));
                 } else if operation == "announcement" {
                     let request = text(command, "request_id");
                     let request = if request.len() <= 128 && !request.chars().any(char::is_control)
@@ -1369,12 +1428,41 @@ impl<A: Backend> Engine<A> {
                     }
                     Ok(true)
                 })();
+                if result.is_ok() {
+                    self.inbox_failures.remove(&key);
+                }
                 let delay = match result {
                     Ok(false) => 2.0,
                     Ok(true) => retry_locator.as_mut().map_or(30.0, |locator| {
                         media_retry_delay(locator, now, waiting.as_ref())
                     }),
                     Err(error) => {
+                        // "Still downloading" is not a failure: a WXGF picture is written
+                        // to disk in pieces and can take minutes on a slow transfer. Only
+                        // an error that can never resolve is capped, otherwise a large
+                        // photo would be dropped while it was still arriving.
+                        let waiting = error.downcast_ref::<crate::media::MediaPending>().is_some();
+                        if waiting {
+                            self.inbox_failures.remove(&key);
+                        } else {
+                            let failures = self.inbox_failures.entry(key.clone()).or_insert(0);
+                            *failures += 1;
+                            if *failures >= 5 {
+                                self.inbox_failures.remove(&key);
+                                self.store
+                                    .db
+                                    .execute("DELETE FROM pending WHERE source=?", [&key])?;
+                                events.push(json!({"type":"warning","group":group,"text":format!("有一条消息无法读取，已跳过以免阻塞后续消息：{error}")}));
+                                continue;
+                            }
+                        }
+                        // Report the stage every time, not once per key: a single warning
+                        // followed by silent retries is how a permanently failing item hid
+                        // itself while every later message stayed blocked behind it.
+                        eprintln!(
+                            "[timing] inbox error group={group} source={key} stage={} error={error}",
+                            inbox_stage(&raw_locator),
+                        );
                         if self.warned.insert(key.clone()) {
                             events.push(json!({"type":"warning","group":group,"text":format!("微信附件暂未就绪，将保留并重试：{error}")}));
                         }

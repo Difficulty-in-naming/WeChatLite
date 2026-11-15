@@ -1143,10 +1143,13 @@ class DesktopTests : public QObject
         menu->actions().first()->trigger();
         menu->actions().first()->trigger();
         delete menu;
+        // A picture reference carries only "[图片]", which repeats throughout a conversation
+        // and cannot identify one row. The client therefore defers media to the adapter,
+        // which resolves it by WeChat's message number and repairs the placeholder.
         QTRY_COMPARE(view->itemDelegate()->property("locatedId").toString(), "real-image");
         QCOMPARE(api.count("/api/messages/old-image-reply/quote-source"), 1);
         QCOMPARE(api.count("/api/messages/unavailable-42"), 0);
-        QCOMPARE(model->rows.last()["quote"].toObject()["id"].toString(), "real-image");
+        QTRY_COMPARE(model->rows.last()["quote"].toObject()["id"].toString(), QString("real-image"));
         QVERIFY(view->viewport()->rect().contains(view->visualRect(model->index(0)).center()));
         QVERIFY(api.clientCredentialOnly);
     }
@@ -1806,6 +1809,80 @@ class DesktopTests : public QObject
         transport->disconnectService();
         tunnel->stop();
         QCOMPARE(settings.value("serverUrl").toString(), stable);
+    }
+    void quoteWithUnavailableNativeIdStillLocatesAmongLoadedMessages()
+    {
+        QSettings settings;
+        const QStringList keys{"serverUrl", "token", "certificatePin", "p2p", "connectionMode"};
+        QVariantMap previous;
+        for (const auto &key : keys) previous[key] = settings.value(key);
+        auto restore = qScopeGuard([&]
+        {
+            for (auto it = previous.cbegin(); it != previous.cend(); ++it)
+                if (it.value().isValid()) settings.setValue(it.key(), it.value());
+                else settings.remove(it.key());
+        });
+        // The adapter could not map this reference to a stored id; it only sees WeChat's
+        // database. The client must still find the original in what it already received.
+        const QJsonObject original{{"id", "original-row"}, {"group", "A"}, {"seq", 5},
+            {"timestamp", 1000}, {"sender", "鸳鸯茶"}, {"status", "received"}, {"text", "热热热"}};
+        QJsonObject reply{{"id", "reply-row"}, {"group", "A"}, {"seq", 30}, {"timestamp", 2000},
+            {"sender", "我"}, {"status", "received"}, {"text", "确实"},
+            {"quote", QJsonObject{{"id", "unavailable-999"}, {"sender", "鸳鸯茶"},
+                                  {"text", "热热热"}}}};
+        QJsonArray rows{original};
+        for (int i = 6; i < 30; ++i)
+            rows.append(QJsonObject{{"id", QString("filler-%1").arg(i)}, {"group", "A"},
+                {"seq", i}, {"timestamp", 1000}, {"sender", "别人"},
+                {"status", "received"}, {"text", "无关消息"}});
+        rows.append(reply);
+        RecordsApiFixture api;
+        QVERIFY(api.server.listen(QHostAddress::LocalHost, 0));
+        api.handler = [&](QTcpSocket *socket, const QUrl &url)
+        {
+            const auto path = url.path();
+            QJsonValue value(QJsonObject{});
+            if (path == "/api/events") return;
+            if (path == "/api/status") value = QJsonObject{{"ready", true},
+                {"permissions", QJsonObject{{"can_send", true}, {"can_download", true}}}};
+            else if (path == "/api/groups") value = QJsonArray{QJsonObject{{"id", "A"}, {"name", "合成群"}}};
+            else if (path.endsWith("/members")) value = QJsonArray{};
+            else if (path == "/api/history") value = QJsonObject{{"messages", rows}, {"has_more", false}};
+            else if (path == "/api/messages") value = QJsonArray{};
+            RecordsApiFixture::respond(socket, value);
+        };
+        settings.setValue("serverUrl", api.url());
+        settings.setValue("token", "offline-record-probe-secret-24");
+        settings.remove("certificatePin");
+        settings.remove("p2p");
+        settings.setValue("connectionMode", "direct");
+        Window isolated(false);
+        isolated.show();
+        auto *transport = isolated.findChild<Transport *>();
+        transport->configure(api.url(), "offline-record-probe-secret-24");
+        transport->connectionChanged(true);
+        auto *groups = isolated.findChild<QListWidget *>("groups");
+        auto *view = isolated.findChild<MessageView *>();
+        auto *model = isolated.findChild<MessageModel *>();
+        QTRY_COMPARE(groups->count(), 1);
+        groups->setCurrentRow(0);
+        QTest::mouseClick(groups->viewport(), Qt::LeftButton, {},
+                          groups->visualItemRect(groups->item(0)).center());
+        QTRY_VERIFY(model->rowCount() > 1);
+        view->scrollToBottom();
+        // The reply must be the newest row; the original has to be present too.
+        QCOMPARE(model->rows.last()["id"].toString(), QStringLiteral("reply-row"));
+        QVERIFY(std::any_of(model->rows.cbegin(), model->rows.cend(),
+            [](const QJsonObject &row) { return row["id"] == "original-row"; }));
+        auto *menu = view->quoteContextMenuFor(model->index(model->rowCount() - 1));
+        QVERIFY(menu);
+        menu->actions().first()->trigger(); // "定位到原文位置"
+        delete menu;
+        // Located by sender + text, no adapter round trip and no WeChat database read.
+        QTRY_COMPARE(view->itemDelegate()->property("locatedId").toString(), "original-row");
+        QCOMPARE(api.count("/api/messages/unavailable-999"), 0);
+        QCOMPARE(api.count("/quote-source"), 0);
+        transport->disconnectService();
     }
     void remoteClientOnlyConnectsAndNeverManagesTheServer()
     {

@@ -163,6 +163,14 @@ impl Db {
             }
             let (_, account_dir, account, wxid, keys, cfg_dword) =
                 best.context("当前登录微信的数据库密钥未通过校验，未读取任何消息")?;
+            // Which directory was actually chosen decides where pictures are looked for, and
+            // a wrong guess is invisible until an image fails to appear.
+            eprintln!(
+                "[media] account_dir={} account={account} wxid={} images={}",
+                account_dir.display(),
+                wxid,
+                account_dir.join("msg/attach").is_dir(),
+            );
             let files = collect_files(&account_dir)?;
             Ok(Self {
                 wxid,
@@ -207,13 +215,20 @@ impl Db {
             if !self.connections.contains_key(rel) {
                 continue;
             }
-            // A shard that cannot be signed is left alone: `open()` re-checks it
-            // anyway, and an error here must not abort the whole cycle.
+            // WeChat holds the database open while writing, and the version probe opens
+            // the file. A failure here therefore means "the shard is being written right
+            // now", not "nothing changed". Skipping it left the shard pinned to a stale
+            // snapshot, and every new message in it was silently dropped until restart.
             let current = match crypto::version(path) {
                 Ok(current) => current,
-                Err(_) => continue,
+                Err(_) => {
+                    stale.push(rel.clone());
+                    continue;
+                }
             };
-            if current.is_some() && self.snapshot_versions.get(rel) != current.as_ref() {
+            // `None` means the file disappeared between listing and probing, which also
+            // invalidates whatever we decoded from it.
+            if self.snapshot_versions.get(rel) != current.as_ref() {
                 stale.push(rel.clone());
             }
         }

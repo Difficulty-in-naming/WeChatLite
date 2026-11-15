@@ -419,6 +419,69 @@ pub fn matches_reference(
     }
 }
 
+/// Names the first failing condition of `matches_reference`, for diagnostics only.
+/// It never decides anything: the caller has already rejected the row, and a value this
+/// function cannot classify is reported as `unknown` rather than guessed.
+pub fn reference_mismatch(
+    group: &str,
+    row: &Value,
+    raw: &Value,
+    wxid: &str,
+    reference: &Value,
+) -> &'static str {
+    let Some(kind) = reference["type"].as_u64() else {
+        return "reference-type";
+    };
+    let Some((label, local_types)) = reference_shape(kind) else {
+        return "unsupported-reference-type";
+    };
+    let local_type = raw["local_type"].as_i64();
+    if row["type"] != label {
+        return "row-kind";
+    }
+    if !local_type.is_some_and(|value| local_types.contains(&value)) {
+        return "raw-local-type";
+    }
+    let Ok(source) = source_fields(group, row, raw, wxid) else {
+        return "source-fields";
+    };
+    if source["server_id"] != reference["server_id"] {
+        return "server-id";
+    }
+    if reference["fromusr"] != source["chatusr"] && reference["fromusr"] != group {
+        return "fromusr";
+    }
+    if source["chatusr"] != reference["chatusr"] {
+        return "chatusr";
+    }
+    let actor = text(&source, "chatusr");
+    let source_body = remove_envelope(text(&source, "content"), actor);
+    let reference_body = remove_envelope(text(reference, "text"), actor);
+    match kind {
+        1 => if xml_newlines(source_body) == xml_newlines(reference_body) {
+            "unknown"
+        } else {
+            "text-body"
+        },
+        3 => {
+            if image_digest(source_body).is_some_and(|digest| {
+                image_digest(reference_body).as_deref() == Some(digest.as_str())
+            }) {
+                "unknown"
+            } else {
+                "image-digest"
+            }
+        }
+        _ => {
+            if same_native_shape(source_body, reference_body, kind) {
+                "unknown"
+            } else {
+                "native-shape"
+            }
+        }
+    }
+}
+
 fn image_digest(content: &str) -> Option<String> {
     if content.len() > 2 * 1024 * 1024
         || content.contains("<!DOCTYPE")
@@ -876,6 +939,42 @@ fn type_label(reference: &Value) -> &'static str {
 }
 
 /// Display text for a received reference. Never returns the native card payload.
+/// Label for a quoted media message, decided by the resolved original rather than by the
+/// reference body.
+///
+/// WeChat stores different things depending on which client produced the reply: usually
+/// "[图片]", but for some locally loaded pictures it writes a packed identifier such as
+/// `wxid:timestamp:index:md5::sub`, which carries no message type at all. Showing that to
+/// the user is meaningless, and guessing a type from it would be wrong. When the original
+/// row is known, its own media list says exactly what was quoted.
+pub fn original_media_label(original: &Value) -> Option<String> {
+    let media = original.get("media")?.as_array()?;
+    let first = media.first()?.as_object()?;
+    let kind = first.get("kind")?.as_str()?;
+    let name = first.get("name").and_then(|value| value.as_str()).unwrap_or("");
+    Some(match kind {
+        "image" => "[图片]".into(),
+        "gif" => "[GIF]".into(),
+        "video" => "[视频]".into(),
+        "voice" => "[语音]".into(),
+        _ if !name.is_empty() => format!("[文件] {name}"),
+        _ => "[文件]".into(),
+    })
+}
+
+/// True when a body looks like the packed media identifier rather than user text, used to
+/// avoid showing an opaque string when the original row could not be resolved.
+pub fn looks_packed_media(body: &str) -> bool {
+    let parts: Vec<&str> = body.trim().split(':').collect();
+    parts.len() >= 4
+        && !parts[0].is_empty()
+        && (parts[0].starts_with("wxid_") || parts[0].contains('@'))
+        && !parts[1].is_empty()
+        && parts[1].bytes().all(|byte| byte.is_ascii_digit())
+        && parts[3].len() == 32
+        && parts[3].bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 pub fn reference_preview(reference: &Value) -> String {
     if reference["type"] == 3 {
         return "[图片]".into();
@@ -890,6 +989,11 @@ pub fn reference_preview(reference: &Value) -> String {
         return label;
     }
     let trimmed = body.trim();
+    // A packed identifier that could not be resolved to a row must not reach the user as a
+    // wall of internal fields; say that the original is unavailable instead.
+    if looks_packed_media(trimmed) {
+        return "[媒体消息]".into();
+    }
     if !trimmed.is_empty() && !trimmed.starts_with('<') {
         return clean_title(trimmed);
     }
@@ -1230,6 +1334,47 @@ mod tests {
         assert_eq!(reference_preview(&json!({"type":49,"text":"<msg><appmsg><type>5</type><title> 多个\n   空白\t</title></appmsg></msg>"})), "[链接] 多个 空白");
         assert_eq!(reference_preview(&json!({"type":49,"text":"<!DOCTYPE msg [<!ENTITY x 'y'>]><msg/>"})), "[卡片]");
     }
+    #[test]
+    fn the_original_row_decides_the_label_of_a_quoted_picture() {
+        // Real data: a locally loaded picture was quoted and WeChat wrote a packed
+        // identifier with no type in it, which used to reach the client verbatim.
+        let packed = "wxid_q301458gdtf322:1794642316469:0:6e7aa226ab0d5a4a7bec31cc0ee200be::0";
+        assert!(looks_packed_media(packed));
+        // Without a resolved row the user must not see the fields.
+        assert_eq!(
+            reference_preview(&json!({"type": 3, "text": packed})),
+            "[图片]",
+            "type 3 is already a picture, so the label comes from the type"
+        );
+        assert_eq!(
+            reference_preview(&json!({"type": 49, "text": packed})),
+            "[媒体消息]",
+            "an unresolved packed body must not be shown as text"
+        );
+
+        // With the original resolved, its media list is authoritative.
+        let photo = json!({"media": [{"kind": "image", "name": "6e7aa226ab0d5a4a7bec31cc0ee200be.png"}]});
+        assert_eq!(original_media_label(&photo).as_deref(), Some("[图片]"));
+        let video = json!({"media": [{"kind": "video", "name": "clip.mp4"}]});
+        assert_eq!(original_media_label(&video).as_deref(), Some("[视频]"));
+        let file = json!({"media": [{"kind": "file", "name": "报告.pdf"}]});
+        assert_eq!(original_media_label(&file).as_deref(), Some("[文件] 报告.pdf"));
+        let voice = json!({"media": [{"kind": "voice", "name": "v.silk"}]});
+        assert_eq!(original_media_label(&voice).as_deref(), Some("[语音]"));
+        // A text-only original says nothing about media.
+        assert!(original_media_label(&json!({"media": [], "text": "你好"})).is_none());
+
+        // Ordinary text that happens to contain colons stays untouched.
+        for text in [
+            "时间：10:30，地点：会议室",
+            "http://example.invalid/a:b",
+            "wxid_abc:不是时间:3:0123456789abcdef0123456789abcdef",
+        ] {
+            assert!(!looks_packed_media(text), "must not be media: {text}");
+            assert_eq!(reference_preview(&json!({"type": 1, "text": text})), text);
+        }
+    }
+
     #[test]
     fn received_reference_has_one_direct_scope_and_a_real_server_identifier() {
         let value = card(&expected(), "成员");

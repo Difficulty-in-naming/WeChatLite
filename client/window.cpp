@@ -349,8 +349,12 @@ Window::Window(bool demo, const QString &tunnelExecutable)
                 notificationSyncSeq = 0;
                 connected = value;
                 connection->setText(value ? "● 已连接服务器" : "○ 正在连接服务器…");
+                setLinkState(value, value ? QStringLiteral("服务器已连接，等待微信就绪")
+                                          : QStringLiteral("未连接"));
                 if (value)
                 {
+                    // Recovered: arm the next outage's notice again.
+                    linkLossNotified = false;
                     startupWatchdog.stop();
                     hideBanner();
                     lastError.clear();
@@ -375,17 +379,42 @@ Window::Window(bool demo, const QString &tunnelExecutable)
                     canSend = canDownload = false;
                     messages->setProperty("canDownload", false);
                     sendButton->setEnabled(false);
+                    // The relay's readiness is stale the moment the socket drops.
                     ready = false;
                     subtitle->setText("服务器连接已断开，正在自动重连");
                     // Visible in the window list and Mission Control too, so a backgrounded
                     // window still shows that it is not connected.
                     setWindowTitle("微信轻聊 · 未连接");
+                    // The dot turns red here; without a tooltip the reason would still be
+                    // hidden, so carry the short cause on the indicator itself.
+                    setLinkState(false, lastError.isEmpty()
+                                           ? QStringLiteral("未连接，正在重连")
+                                           : lastError.left(120));
+                    // The window banner only exists while the window is on screen. When the
+                    // client sits in the background, the user otherwise learns about a dead
+                    // link only by attempting a send, so announce the first loss and stay
+                    // quiet on every subsequent retry.
+                    // SystemNotifier already suppresses display in test/offscreen runs and
+                    // honours the user's notification switch; deciding here as well would make
+                    // this path untestable and silently drop real outages in odd setups.
+                    if (linkWasUp && !linkLossNotified && !quitting && !demoMode)
+                    {
+                        linkLossNotified = true;
+                        emit statusNotificationRequested(
+                            QStringLiteral("微信轻聊 · 与服务器断开"),
+                            lastError.isEmpty()
+                                ? QStringLiteral("正在自动重连。")
+                                : lastError.left(160));
+                    }
                     // A transport that cannot succeed (wrong pin, plain http with a pin) stays
                     // disconnected on purpose; do not promise a retry that will not happen.
                     if (transport.isBlocked())
                     {
                         if (lastError.isEmpty())
                             setConnectionState("无法连接服务器，请检查连接设置后重试。", false);
+                        setLinkState(false, lastError.isEmpty()
+                                               ? QStringLiteral("无法连接，请检查设置")
+                                               : lastError.left(120));
                     }
                     else if (!quitting)
                     {
@@ -664,6 +693,15 @@ void Window::makeUi()
     title->setObjectName("chatTitle");
     title->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
     headerLayout->addWidget(title, 1);
+    // Link indicator: a filled dot that is always in the header, so the state is
+    // readable at a glance instead of only after a send fails. Grey until the first
+    // attempt settles, then green while connected and red once the link is lost.
+    linkDot = new QLabel(header);
+    linkDot->setObjectName("linkDot");
+    linkDot->setFixedSize(10, 10);
+    linkDot->setAccessibleName("连接状态");
+    headerLayout->addWidget(linkDot);
+    setLinkState(false, QStringLiteral("尚未连接"));
     historyButton = button({}, "historyButton");
     historyButton->setAccessibleName("聊天记录");
     historyButton->setIcon(svgIcon(":/client/icons/history.svg"));
@@ -2428,6 +2466,8 @@ void Window::handleEvent(const QJsonObject &event)
             loadMembers();
         }
         subtitle->setText(event["text"].toString());
+        // The relay's WeChat may become ready (or drop) with the socket unaffected.
+        refreshLinkState();
         updateSendButton();
         if (event["demo"].toBool())
             notify("演示模式 · 此处发送的消息不会进入真实微信");
@@ -2822,6 +2862,9 @@ void Window::refreshQuoteSource(const QJsonObject &quote)
             if (group != groupId || conversation != conversationGeneration || generation != locateGeneration)
                 return;
             locatingId.clear();
+            quoteLog(QString("adapter: quote-source err=[%1] body=%2")
+                         .arg(error.left(120), QString::fromUtf8(
+                             QJsonDocument(value.toObject()).toJson(QJsonDocument::Compact)).left(400)));
             const auto response = value.toObject();
             const auto updated = response["message"].toObject();
             const auto original = response["original"].toObject();
@@ -2841,6 +2884,166 @@ void Window::refreshQuoteSource(const QJsonObject &quote)
             locateQuote(source);
         }, 18000);
 }
+void Window::searchOlderForQuote(const QJsonObject &quote, int attempt)
+{
+    if (groupId.isEmpty() || attempt > 8)
+    {
+        // Give up quietly here; the caller still has the adapter path to try.
+        notify("已加载的消息里没有找到这条引用的原文", true);
+        return;
+    }
+    const auto group = groupId;
+    const auto conversation = conversationGeneration;
+    // A page of history is the oldest row currently held; ask for everything before it.
+    const auto rows = conversationSnapshot();
+    if (rows.isEmpty())
+        return;
+    qint64 oldest = 0;
+    for (const auto &row : rows)
+    {
+        const auto seq = row["seq"].toInteger();
+        if (seq > 0 && (oldest == 0 || seq < oldest))
+            oldest = seq;
+    }
+    if (oldest <= 0)
+        return;
+    QUrlQuery query;
+    query.addQueryItem("group", group);
+    query.addQueryItem("before", QString::number(oldest));
+    transport.get(
+        "/api/messages?" + query.toString(QUrl::FullyEncoded),
+        [this, quote, group, conversation, attempt](const QJsonValue &value, const QString &error)
+        {
+            if (group != groupId || conversation != conversationGeneration)
+                return;
+            if (!error.isEmpty())
+            {
+                notify(error, true);
+                return;
+            }
+            auto page = value.toArray();
+            QJsonArray older;
+            for (const auto &entry : page)
+            {
+                const auto row = entry.toObject();
+                if (row["group"].toString() == group)
+                    older.append(localFiles->hydrate(row, group));
+            }
+            if (older.isEmpty())
+            {
+                notify("已到达这个群的最早记录，仍未找到引用的原文", true);
+                return;
+            }
+            model->prepend(older);
+            if (locateQuoteLocally(quote))
+                return;
+            searchOlderForQuote(quote, attempt + 1);
+        },
+        12000);
+}
+
+QList<QJsonObject> Window::conversationSnapshot() const
+{
+    QList<QJsonObject> rows;
+    if (!model)
+        return rows;
+    for (const auto &row : model->rows)
+        if (row["group"].toString() == groupId)
+            rows.append(row);
+    return rows;
+}
+
+void Window::quoteLog(const QString &line)
+{
+    const auto root = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
+    if (root.isEmpty())
+        return;
+    QDir().mkpath(root);
+    QFile file(root + "/quote-locate.log");
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Append | QIODevice::Text))
+        return;
+    QTextStream stream(&file);
+    stream.setEncoding(QStringConverter::Utf8);
+    stream << QDateTime::currentDateTime().toString("yyyy-MM-dd HH:mm:ss.zzz")
+           << " " << line << "\n";
+}
+
+bool Window::locateQuoteLocally(const QJsonObject &quote)
+{
+    // The sender on a reference is WeChat's display name for that member at quote time, which
+    // rarely equals this client's local name for them, so it is not a usable filter.
+    auto text = quote["text"].toString();
+    // Older references may still hold the native payload; messageQuoteLabel turns it into
+    // the same short label the row itself displays, so both sides compare equal.
+    const auto label = messageQuoteLabel(QJsonObject{{"sender", QString()}, {"text", text}});
+    const auto wanted = label.startsWith(": ") ? label.mid(2) : label;
+    // A media reference never identifies one row: it reads "[图片]", or "[图片] <filename>",
+    // or "[视频] <name>". Matching that text against the conversation would jump to an
+    // arbitrary older image, which is worse than not locating at all, so media is left to
+    // the adapter, which has the real message number. The check is a prefix test because the
+    // label is followed by a filename in every real card.
+    static const QStringList mediaLabels{"[图片]", "[视频]", "[GIF]", "[语音]", "[文件]",
+                                         "[动画表情]", "[位置]", "[链接]", "[聊天记录]",
+                                         "[名片]", "[小程序]", "[转账]", "[红包]", "[视频号]"};
+    const auto trimmed = wanted.trimmed();
+    for (const auto &label : mediaLabels)
+        if (trimmed.startsWith(label))
+        {
+            quoteLog(QString("local: media reference, deferring to adapter (wanted=%1)").arg(trimmed));
+            return false;
+        }
+    if (wanted.trimmed().isEmpty() || groupId.isEmpty())
+    {
+        quoteLog(QString("local: abort wanted=%1 group=%2")
+                     .arg(wanted.left(60), groupId));
+        return false;
+    }
+    const auto conversation = conversationGeneration;
+    const auto rows = conversationSnapshot();
+    quoteLog(QString("local: quote text=[%1] wanted=[%2] rows=%3")
+                 .arg(text.left(120).replace('\n', ' '), wanted.left(80),
+                      QString::number(rows.size())));
+    if (rows.isEmpty())
+    {
+        quoteLog("local: no loaded rows for this conversation");
+        return false;
+    }
+    // Prefer the newest match: a repeated short message is far more likely to be quoted
+    // from the recent part of the conversation.
+    for (auto it = rows.crbegin(); it != rows.crend(); ++it)
+    {
+        const auto row = *it;
+        if (row["status"] == "recalled")
+            continue;
+        const auto rowLabel = messageQuoteText(row);
+        if (rowLabel != wanted)
+        {
+            if (rowLabel.startsWith(wanted.left(2)) || wanted.startsWith(rowLabel.left(2)))
+                quoteLog(QString("local: near miss row=[%1] id=%2")
+                             .arg(rowLabel.left(120).replace('\n', ' '),
+                                  row["id"].toString()));
+            continue;
+        }
+        const auto id = row["id"].toString();
+        if (id.isEmpty())
+            continue;
+        if (conversation != conversationGeneration || groupId != row["group"].toString())
+            return false;
+        quoteLog(QString("local: matched id=%1").arg(id));
+        if (!messages->locateMessage(id))
+        {
+            quoteLog(QString("local: locateMessage refused id=%1").arg(id));
+            return false;
+        }
+        // Rewrite the stale placeholder so later clicks take the fast path.
+        localFiles->hydrate(row, groupId);
+        notify("已定位到原文（按发送者和内容匹配）");
+        return true;
+    }
+    quoteLog("local: no row matched");
+    return false;
+}
+
 void Window::locateQuote(const QJsonObject &quote)
 {
     const auto id = quote["id"].toString();
@@ -2865,9 +3068,26 @@ void Window::locateQuote(const QJsonObject &quote)
                 messages->locateMessage(id);
             return;
         }
-    if (id.startsWith("unavailable-") && !quote["_reply_id"].toString().isEmpty())
+    // The adapter could not map this reference to a stored id (it only sees the WeChat
+    // database). Resolve it against the messages already loaded here instead: the quote
+    // carries the sender and the preview text, which is enough to find the original.
+    quoteLog(QString("locate: clicked id=[%1] sender=[%2] text=[%3] reply=%4")
+                 .arg(id.left(60), quote["sender"].toString().left(40),
+                      quote["text"].toString().left(120).replace('\n', ' '),
+                      quote["_reply_id"].toString()));
+    if (id.startsWith("unavailable-"))
     {
-        refreshQuoteSource(quote);
+        if (locateQuoteLocally(quote))
+            return;
+        // Not loaded here. The adapter can often fix the placeholder from the WeChat
+        // database, so try that first; it is one request and it also repairs the stored
+        // reference. searchOlderForQuote runs only when that path cannot be attempted.
+        if (!quote["_reply_id"].toString().isEmpty())
+        {
+            refreshQuoteSource(quote);
+            return;
+        }
+        searchOlderForQuote(quote);
         return;
     }
     const auto group = groupId;
@@ -3147,6 +3367,32 @@ void Window::notify(const QString &text, bool error)
     showBanner(text, error);
 }
 
+void Window::setLinkState(bool up, const QString &detail)
+{
+    socketUp = up;
+    linkDetail = detail;
+    refreshLinkState();
+}
+void Window::refreshLinkState()
+{
+    if (!linkDot)
+        return;
+    // Green only when both halves hold: the event stream is up AND the relay says its
+    // local WeChat is ready. A connected socket with WeChat still starting looks healthy
+    // but can neither send nor receive, which is exactly the confusion to avoid.
+    const bool up = socketUp && ready;
+    // Amber while the socket is fine but the relay's WeChat is not ready yet, red once the
+    // link has been up and then dropped, grey before the first attempt settles.
+    const auto colour = up ? QStringLiteral("#2e986b")
+                           : socketUp ? QStringLiteral("#e0a33a")
+                                      : linkWasUp ? QStringLiteral("#d8534b")
+                                                  : QStringLiteral("#b8b8bd");
+    linkDot->setStyleSheet(
+        QStringLiteral("QLabel#linkDot { background:%1; border-radius:5px; }").arg(colour));
+    linkDot->setAccessibleName(QStringLiteral("连接状态：%1").arg(linkDetail));
+    if (up)
+        linkWasUp = true;
+}
 void Window::setConnectionState(const QString &text, bool reconnecting)
 {
     // Both "retrying" and "blocked" need a way out: a failing address must be
