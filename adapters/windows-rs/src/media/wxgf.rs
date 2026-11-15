@@ -148,31 +148,50 @@ fn chroma(stream: &[u8]) -> Result<u32> {
 /// 80420 bytes, and 80420 + 9 reaches the next record exactly. An earlier version looked
 /// for `00 00 01 40 01` and read the length *before* it, which matched a byte sequence near
 /// the end of the file and reported an absurd size.
+/// Splits the WXGF payload into its colour (and optional alpha) HEVC streams.
+///
+/// Two record layouts exist in the wild and both must be accepted:
+///
+/// ```text
+/// tagged   00 00 01 | 3a | ASCII '1' | '2' | u32 length | HEVC bytes
+/// bare     u32 length | HEVC bytes
+/// ```
+///
+/// The tagged form is what a real WeChat 4.x picture uses: a record at offset 33 declares
+/// 0x00013a24 = 80420 bytes and the next record lands exactly 9 bytes later. The bare form
+/// is what the synthetic fixtures in this file build, and older containers omit the tag.
+/// Guessing wrong is what made every real picture fail, so the tag is checked before the
+/// bare layout is tried.
 fn partitions(data: &[u8]) -> Result<Vec<(u32, &[u8])>> {
-    const HEADER: usize = 9;
-    // Skip the fixed `wxgf` preamble before the records begin: the header carries size and
-    // format fields and could in principle contain the start code, so scanning from zero
-    // would be a coincidence rather than a rule.
-    let mut pos = 4usize;
-    while pos + 3 <= data.len() && data[pos..pos + 3] != [0, 0, 1] {
-        pos += 1;
+    // The preamble differs between versions: `wxgf` plus a short header for a real picture,
+    // `wxgf` plus four zero bytes for the fixtures. Find the first record from either.
+    let mut tagged = None;
+    let mut index = 4usize;
+    while index + 3 <= data.len() {
+        if data[index..index + 3] == [0, 0, 1]
+            && data.get(index + 3) == Some(&0x3a)
+            && matches!(data.get(index + 4), Some(b'1') | Some(b'2'))
+        {
+            tagged = Some(index);
+            break;
+        }
+        index += 1;
     }
+    if let Some(start) = tagged {
+        return tagged_partitions(data, start);
+    }
+    bare_partitions(data)
+}
+
+fn tagged_partitions(data: &[u8], start: usize) -> Result<Vec<(u32, &[u8])>> {
+    const HEADER: usize = 9;
+    let mut pos = start;
     let mut out = Vec::new();
     while pos + HEADER <= data.len() {
         let rest = &data[pos..];
-        if rest.len() < 4 || rest[..3] != [0, 0, 1] || rest[3] != 0x3a {
-            // The stream ends when the next record does not start; trailing padding is
-            // allowed, a record in the middle of the file is not.
-            if out.is_empty() {
-                anyhow::bail!("WXGF 缺少图像码流（偏移 {pos}）");
-            }
+        if rest[..3] != [0, 0, 1] || rest[3] != 0x3a || !matches!(rest[4], b'1' | b'2') {
             break;
         }
-        let index = rest[4];
-        ensure!(
-            index == b'1' || index == b'2',
-            "WXGF 分片编号无效（偏移 {pos}，值 {index:#04x}）"
-        );
         let size = u32::from_be_bytes(rest[5..9].try_into().unwrap()) as usize;
         let body = pos + HEADER;
         ensure!(size > 0, "WXGF 分片长度为零（偏移 {pos}）");
@@ -181,10 +200,7 @@ fn partitions(data: &[u8]) -> Result<Vec<(u32, &[u8])>> {
             "WXGF 分片超出数据范围（声明 {size} 字节，剩余 {} 字节，偏移 {body}）",
             data.len() - body
         );
-        ensure!(
-            out.len() < 2,
-            "WXGF 图像包含超过两个分片，暂不支持"
-        );
+        ensure!(out.len() < 2, "WXGF 图像包含超过两个分片，暂不支持");
         let stream = &data[body..body + size];
         let count = nals(stream)
             .iter()
@@ -193,6 +209,38 @@ fn partitions(data: &[u8]) -> Result<Vec<(u32, &[u8])>> {
         ensure!(count <= 1, "WXGF 多帧图像暂不支持，原消息已保留");
         out.push((chroma(stream)?, stream));
         pos = body + size;
+    }
+    ensure!(!out.is_empty(), "WXGF 图像码流缺失（带标记布局）");
+    Ok(out)
+}
+
+fn bare_partitions(data: &[u8]) -> Result<Vec<(u32, &[u8])>> {
+    // `wxgf` followed by a four-byte header; records are plain length-prefixed runs.
+    let mut pos = 8usize;
+    ensure!(data.len() > pos, "WXGF 图像码流缺失");
+    let mut out = Vec::new();
+    while pos < data.len() {
+        ensure!(
+            pos + 4 <= data.len(),
+            "WXGF 分片尚未完整写入（偏移 {pos}）"
+        );
+        let size = u32::from_be_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+        pos += 4;
+        ensure!(size > 0, "WXGF 分片长度为零（偏移 {pos}）");
+        ensure!(
+            size <= data.len() - pos,
+            "WXGF 分片超出数据范围（声明 {size} 字节，剩余 {} 字节，偏移 {pos}）",
+            data.len() - pos
+        );
+        ensure!(out.len() < 2, "WXGF 图像包含超过两个分片，暂不支持");
+        let stream = &data[pos..pos + size];
+        let count = nals(stream)
+            .iter()
+            .filter(|(kind, unit)| *kind < 32 && unit.len() > 2 && unit[2] & 128 != 0)
+            .count();
+        ensure!(count <= 1, "WXGF 多帧图像暂不支持，原消息已保留");
+        out.push((chroma(stream)?, stream));
+        pos += size;
     }
     ensure!(!out.is_empty(), "WXGF 图像码流缺失");
     Ok(out)
