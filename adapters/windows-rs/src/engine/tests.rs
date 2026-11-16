@@ -238,6 +238,7 @@ impl Backend for Fake {
         for field in [
             "quote",
             "record",
+            "media_pending",
             "_quote_source",
             "_quote_server_id",
             "_quote_original",
@@ -791,6 +792,45 @@ fn retry_state(engine: &Engine<Fake>, key: &str) -> (f64, Value) {
 }
 
 #[test]
+fn thumbnail_messages_keep_short_retries_and_survive_restart_until_full_picture_receipt() {
+    let (temp, mut engine) = setup(json!(["g"]));
+    let mut picture = row(11, 2);
+    picture["type"] = json!("图片");
+    picture["media_pending"] = json!(true);
+    engine
+        .access
+        .rows
+        .get_mut("g")
+        .unwrap()
+        .push(picture.clone());
+    let key = source("g", &picture).unwrap();
+    let events = engine.cycle(&[], 1002.0);
+    assert!(
+        events
+            .iter()
+            .any(|e| e["message"]["source_id"] == key && e["message"]["media_pending"] == true)
+    );
+    assert_eq!(retry_state(&engine, &key).0, 1004.0);
+    let fake = engine.access.clone();
+    drop(engine);
+    let mut engine = Engine::new(fake, temp.path().to_owned(), &json!(["g"]), 1003.0).unwrap();
+    engine.access.rows.get_mut("g").unwrap()[1]["media_pending"] = json!(false);
+    let events = engine.cycle(&[], 1004.1);
+    assert!(
+        events
+            .iter()
+            .any(|e| e["message"]["source_id"] == key && e["message"]["media_pending"] == false)
+    );
+    assert!(engine.store.contains("pending", "source", &key).unwrap());
+    engine.cycle(
+        &[json!({"op":"receipt","group":"g","source_id":key})],
+        1004.2,
+    );
+    assert!(!engine.store.contains("pending", "source", &key).unwrap());
+    assert!(engine.access.calls.is_empty() && engine.access.allowed.is_empty());
+}
+
+#[test]
 fn newly_pending_live_and_explicit_history_media_retry_before_old_30_second_delay() {
     for historical in [false, true] {
         let (_temp, mut engine, media) = queued_media();
@@ -805,6 +845,7 @@ fn newly_pending_live_and_explicit_history_media_retry_before_old_30_second_dela
         };
         let first = engine.cycle(&commands, 1002.0);
         assert!(!first.iter().any(|event| event["type"] == "message"));
+        assert!(!first.iter().any(|event| event["type"] == "warning"));
         let key = source("g", &media).unwrap();
         let (due, locator) = retry_state(&engine, &key);
         assert_eq!(due, 1004.0);
@@ -815,6 +856,7 @@ fn newly_pending_live_and_explicit_history_media_retry_before_old_30_second_dela
 
         engine.access.media_pending = false;
         let ready = engine.cycle(&[], 1004.1);
+        assert!(!ready.iter().any(|event| event["type"] == "warning"));
         let messages: Vec<_> = ready
             .iter()
             .filter(|event| event["type"] == "message")
@@ -845,10 +887,13 @@ fn long_pending_media_backoff_survives_restart_and_history_reread() {
             .iter()
             .filter(|event| event["type"] == "warning")
             .count(),
-        1
+        0
     );
     let retry = engine.cycle(&[], 1032.1);
-    assert!(!retry.iter().any(|event| event["type"] == "warning"));
+    let warning = retry.iter().find(|event| event["type"] == "warning").unwrap();
+    assert_eq!(warning["code"], "inbound_media");
+    assert_eq!(warning["group"], "g");
+    assert_eq!(warning["source_id"], key);
     assert_eq!(retry_state(&engine, &key).0, 1037.1);
     let fake = engine.access.clone();
     drop(engine);
@@ -856,19 +901,68 @@ fn long_pending_media_backoff_survives_restart_and_history_reread() {
     assert_eq!(retry_state(&engine, &key).1["_media_wait_since"], 1002.0);
 
     // A repeated page request must not restart the rapid polling window for an old attachment.
-    engine.cycle(
+    let reread = engine.cycle(
         &[json!({"op":"history","group":"g","request_id":uuid::Uuid::new_v4().to_string(),"before_source":"","limit":60})],
         1122.1,
     );
+    assert!(!reread.iter().any(|event| event["type"] == "warning"));
     let (due, locator) = retry_state(&engine, &key);
     assert_eq!(due, 1132.1);
     assert_eq!(locator["_media_wait_since"], 1002.0);
     assert_eq!(locator["historical"], true);
+    let resumed = engine.cycle(&[], 1132.2);
+    assert_eq!(resumed.iter().filter(|event| event["type"] == "warning").count(), 1);
     engine.cycle(&[], 1302.1);
     assert_eq!(retry_state(&engine, &key).0, 1332.1);
     let conversions = engine.access.conversions;
     engine.cycle(&[], 1304.2);
     assert_eq!(engine.access.conversions, conversions);
+    assert!(engine.access.calls.is_empty());
+}
+
+#[test]
+fn delayed_media_warning_also_tracks_thumbnail_waits_until_full_delivery() {
+    let (_temp, mut engine, media) = queued_media();
+    let key = source("g", &media).unwrap();
+    engine.access.media_pending = false;
+    engine.access.rows.get_mut("g").unwrap()[1]["media_pending"] = json!(true);
+    let preview = engine.cycle(&[], 1002.0);
+    assert!(preview.iter().any(|event| event["message"]["media_pending"] == true));
+    assert!(!preview.iter().any(|event| event["type"] == "warning"));
+    let delayed = engine.cycle(&[], 1032.1);
+    let warning = delayed.iter().find(|event| event["type"] == "warning").unwrap();
+    assert_eq!(warning["code"], "inbound_media");
+    assert_eq!(warning["source_id"], key);
+    let repeated = engine.cycle(&[], 1037.2);
+    assert!(!repeated.iter().any(|event| event["type"] == "warning"));
+    engine.access.rows.get_mut("g").unwrap()[1]["media_pending"] = json!(false);
+    let complete = engine.cycle(&[], 1042.3);
+    assert!(complete.iter().any(|event| event["message"]["source_id"] == key
+        && event["message"]["media_pending"] == false));
+    assert!(!complete.iter().any(|event| event["type"] == "warning"));
+    engine.cycle(&[json!({"op":"receipt","group":"g","source_id":key})], 1042.4);
+    assert!(!engine.warned.contains(&key));
+    assert!(!engine.store.contains("pending", "source", &key).unwrap());
+    assert!(engine.access.calls.is_empty());
+}
+
+#[test]
+fn pending_media_does_not_suppress_a_later_read_failure_warning() {
+    let (_temp, mut engine, media) = queued_media();
+    let key = source("g", &media).unwrap();
+    let waiting = engine.cycle(&[], 1002.0);
+    assert!(!waiting.iter().any(|event| event["type"] == "warning"));
+    assert!(!engine.warned.contains(&key));
+    engine.access.media_pending = false;
+    engine.access.mode = "media_error";
+    let failed = engine.cycle(&[], 1004.1);
+    let warnings: Vec<_> = failed
+        .iter()
+        .filter(|event| event["type"] == "warning")
+        .collect();
+    assert_eq!(warnings.len(), 1);
+    assert_eq!(warnings[0]["group"], "g");
+    assert!(text(warnings[0], "text").contains("fixture media is invalid"));
     assert!(engine.access.calls.is_empty());
 }
 
@@ -992,6 +1086,47 @@ fn selected_groups_can_download_without_opening_a_chat_or_enabling_native_sendin
     assert_eq!(engine.access.download_groups, BTreeSet::from(["g".into()]));
     engine.shutdown().unwrap();
     assert!(engine.access.download_groups.is_empty());
+}
+
+#[test]
+fn targeted_picture_refresh_retries_a_delivered_placeholder_without_native_sending() {
+    let (_temp, mut engine) = setup(json!(["g"]));
+    engine.last_poll = 1000.0;
+    let mut picture = row(2, 2);
+    picture["type"] = json!("图片");
+    picture["media_pending"] = json!(true);
+    let key = source("g", &picture).unwrap();
+    journal(&engine.store, "g", &picture).unwrap();
+    engine.store.acknowledge("g", &key).unwrap();
+    engine.access.rows.insert("g".into(), vec![picture]);
+    let command = json!({"op":"media_refresh","group":"g","source_id":key});
+    let events = engine.cycle(&[command.clone()], 1000.1);
+    assert!(events.iter().any(|e| e["message"]["source_id"] == key
+        && e["message"]["media_pending"] == true
+        && e["historical"] == true));
+    assert!(engine.store.contains("pending", "source", &key).unwrap());
+    let retry = retry_state(&engine, &key);
+    engine.cycle(&[command], 1000.2);
+    assert_eq!(retry_state(&engine, &key), retry);
+    for command in [
+        json!({"op":"media_refresh","group":"h","source_id":key}),
+        json!({"op":"media_refresh","group":"g","source_id":"wx:h:bad:1:1"}),
+    ] {
+        assert!(
+            engine
+                .cycle(&[command], 1000.3)
+                .iter()
+                .any(|e| e["type"] == "warning")
+        );
+    }
+    engine.access.rows.get_mut("g").unwrap()[0]["media_pending"] = json!(false);
+    let events = engine.cycle(&[], 1002.2);
+    assert!(
+        events
+            .iter()
+            .any(|e| e["message"]["source_id"] == key && e["message"]["media_pending"] == false)
+    );
+    assert!(engine.access.calls.is_empty() && engine.access.allowed.is_empty());
 }
 
 #[test]

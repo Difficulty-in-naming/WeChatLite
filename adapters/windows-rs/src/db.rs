@@ -242,9 +242,28 @@ impl Db {
     pub fn signatures(&mut self) -> Result<Vec<(String, u64, u64)>> {
         self.refresh_catalog(true)?;
         let mut result = Vec::new();
-        for (_, path) in self.files.iter().filter(|(rel, _)| message_rel(rel)) {
-            for path in [path.clone(), crypto::wal_path(path)?] {
-                if let Some(signature) = crypto::signature(&path)? {
+        let files: Vec<_> = self
+            .files
+            .iter()
+            .filter(|(rel, _)| message_rel(rel))
+            .map(|(rel, path)| (rel.clone(), path.clone()))
+            .collect();
+        for (rel, path) in files {
+            // Invalidate against the exact version returned to the poller. Releasing
+            // only at cycle end lets a write between cycles be scanned through the
+            // old connection, then marked as already scanned until another write.
+            let current = crypto::version(&path)?;
+            if self.snapshot_versions.get(&rel) != current.as_ref() {
+                self.connections.remove(&rel);
+                self.snapshot_versions.remove(&rel);
+            }
+            if let Some((main, wal)) = current {
+                for (path, signature) in
+                    [(path.clone(), Some(main)), (crypto::wal_path(&path)?, wal)]
+                {
+                    let Some(signature) = signature else {
+                        continue;
+                    };
                     result.push((
                         path.file_name()
                             .context("消息分片名无效")?
@@ -315,7 +334,18 @@ impl Db {
                 .keys
                 .get(&rel)
                 .context("微信新分片密钥尚不可用，本轮未推进游标")?;
-            let (connection, version) = crypto::snapshot(&path, key)?;
+            let started = Instant::now();
+            let snapshot = crypto::snapshot(&path, key);
+            if started.elapsed() >= Duration::from_millis(250) {
+                eprintln!(
+                    "[timing] inbox snapshot at_ms={} shard={} took={}ms ok={}",
+                    chrono::Utc::now().timestamp_millis(),
+                    rel.replace('/', "__"),
+                    started.elapsed().as_millis(),
+                    snapshot.is_ok(),
+                );
+            }
+            let (connection, version) = snapshot?;
             self.snapshot_versions.insert(rel.clone(), version);
             self.connections.insert(rel.clone(), connection);
         }
@@ -1179,6 +1209,54 @@ mod tests {
     }
 
     #[test]
+    fn poll_signature_invalidates_a_warm_snapshot_before_scanning_the_last_arrival() {
+        let (_directory, mut db, connection, key) = encrypted_fixture();
+        let cursor = json!({"sort_seq":0,"shard":"","local_id":-1});
+        assert!(db.page("g@chatroom", &cursor, 200).unwrap().is_empty());
+        let before = db.signatures().unwrap();
+        // The previous cycle finished while the database was still unchanged.
+        db.release_changed().unwrap();
+        insert_row(&connection, "g@chatroom", 1, 10);
+        let table = format!("Msg_{:x}", Md5::digest(b"g@chatroom"));
+        connection
+            .execute(&format!("UPDATE {table} SET local_type=3"), [])
+            .unwrap();
+        write_wal(&db, &connection, &key);
+        let observed = db.signatures().unwrap();
+        assert_ne!(before, observed);
+        // No second message, write, release or restart may be needed to see this image.
+        let rows = db.page("g@chatroom", &cursor, 200).unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "a new poll signature must not scan the old snapshot"
+        );
+        assert_eq!(rows[0]["type"], "图片");
+        assert_eq!(db.signatures().unwrap(), observed);
+        assert_eq!(db.page("g@chatroom", &cursor, 200).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn poll_signature_preserves_unchanged_shards_while_refreshing_a_changed_shard() {
+        let (_directory, mut db, connection, key) = encrypted_fixture();
+        let path = db.files["message/message_0.db"].clone();
+        std::fs::copy(&path, path.with_file_name("message_1.db")).unwrap();
+        db.signatures().unwrap();
+        db.keys.insert("message/message_1.db".into(), key.clone());
+        let cursor = json!({"sort_seq":0,"shard":"","local_id":-1});
+        assert!(db.page("g@chatroom", &cursor, 200).unwrap().is_empty());
+        assert_eq!(db.connections.len(), 2);
+        let warm = db.snapshot_versions["message/message_1.db"].clone();
+        insert_row(&connection, "g@chatroom", 1, 10);
+        write_wal(&db, &connection, &key);
+        db.signatures().unwrap();
+        assert!(!db.connections.contains_key("message/message_0.db"));
+        assert!(db.connections.contains_key("message/message_1.db"));
+        assert_eq!(db.snapshot_versions["message/message_1.db"], warm);
+        assert_eq!(db.page("g@chatroom", &cursor, 200).unwrap().len(), 1);
+    }
+
+    #[test]
     fn wal_changes_invalidate_empty_pages_and_old_connections_cannot_cache_a_new_version() {
         let (_directory, mut db, connection, key) = encrypted_fixture();
         let cursor = json!({"sort_seq":0,"shard":"","local_id":-1});
@@ -1191,10 +1269,9 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_ne!(old, current);
-        assert_ne!(signatures, db.signatures().unwrap());
         assert!(
             db.page("g@chatroom", &cursor, 200).unwrap().is_empty(),
-            "current round still owns its original snapshot"
+            "before the next poll, the current round still owns its original snapshot"
         );
         assert!(
             db.negative_pages
@@ -1202,7 +1279,7 @@ mod tests {
                 .all(|entry| entry.version != current),
             "old snapshot must never label its result with new disk metadata"
         );
-        db.release();
+        assert_ne!(signatures, db.signatures().unwrap());
         assert_eq!(db.page("g@chatroom", &cursor, 200).unwrap().len(), 1);
         assert!(db.page("new@chatroom", &cursor, 200).unwrap().is_empty());
         db.release();

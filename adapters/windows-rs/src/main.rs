@@ -70,7 +70,9 @@ fn announce_build() {
     let exe = std::env::current_exe()
         .map(|path| path.display().to_string())
         .unwrap_or_else(|_| "<不可用>".into());
-    eprintln!("[media] adapter build={BUILD_ID} exe={exe} wxgf=start-code-v2");
+    eprintln!(
+        "[media] adapter build={BUILD_ID} exe={exe} wxgf=start-code-v2 image-download=full-and-mid-v1 image-preview=cdn-footer-v3 media-wait=delayed-clear-v1 inbox-poll=snapshot-v1"
+    );
 }
 
 fn run() -> Result<()> {

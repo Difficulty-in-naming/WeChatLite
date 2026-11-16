@@ -41,16 +41,8 @@ fn pending_text(message: String) -> anyhow::Error {
     MediaPending(message).into()
 }
 
-/// A 320x240 light-grey PNG, drawn when a picture cannot be produced at all.
-///
-/// Big enough for the client to treat it as a real picture rather than a broken
-/// thumbnail, and it keeps the message flowing: a permanently failing item sits at the
-/// head of the inbound queue and blocks every later arrival.
-///
-/// This is a real, complete PNG. The previous literal was 585 bytes with a 634-byte IDAT
-/// declared but truncated, a stale CRC and an empty zlib stream, so every placeholder was
-/// itself rejected by `picture::validate` and the client drew "图片 · 点击下载" forever.
-/// A placeholder cannot be repaired by catching more errors; it has to decode.
+/// Legacy gray placeholder bytes, retained only to recognize and reject old blank
+/// image caches. New receive failures stay pending and never deliver this image.
 const PLACEHOLDER_PNG: &[u8] = &[
     0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
     0x00, 0x00, 0x01, 0x40, 0x00, 0x00, 0x00, 0xf0, 0x08, 0x06, 0x00, 0x00, 0x00, 0x71, 0x2d, 0xbd,
@@ -169,12 +161,12 @@ impl Media {
             }
         }
         let key = message_key(group, &raw);
-        let source = match kind {
+        let (source, preview) = match kind {
             "image" => self.image(db, group, &raw, &key)?,
-            "voice" => self.voice(db, group, &raw, &key)?,
-            "video" => self.video(db, group, &raw, &key)?,
-            "gif" => self.emoji(db, &content(&raw))?,
-            "file" => self.file(db, group, &content(&raw), &key)?,
+            "voice" => (self.voice(db, group, &raw, &key)?, false),
+            "video" => (self.video(db, group, &raw, &key)?, false),
+            "gif" => (self.emoji(db, &content(&raw))?, false),
+            "file" => (self.file(db, group, &content(&raw), &key)?, false),
             _ => bail!("媒体类型暂不支持，原消息已保留"),
         };
         let size = fs::metadata(&source)?.len();
@@ -189,7 +181,7 @@ impl Media {
         }
         Ok(
             json!({"id":"","kind":actual,"name":source.file_name().unwrap_or_default().to_string_lossy(),
-            "size":size,"sha256":hash_file::<Sha256>(&source)?,"path":source.canonicalize()?.to_string_lossy()}),
+            "size":size,"sha256":hash_file::<Sha256>(&source)?,"path":source.canonicalize()?.to_string_lossy(),"preview":preview}),
         )
     }
     pub fn record_attachment(
@@ -250,13 +242,7 @@ impl Media {
         let mut destination = folder.join(&name);
         let actual;
         if item.kind == "image" {
-            let data = read_limited(&source, MAX_FILE)?;
-            let data = if data.starts_with(b"wxgf") {
-                wxgf::decode(&data, &folder)?
-            } else {
-                data
-            };
-            let (format, _, _) = picture::validate(&data, 12000)?;
+            let (data, format) = downloaded_picture(&source, &folder)?;
             destination = folder.join(format!("image.{}", picture::extension(format)));
             atomic_write(&destination, &data)?;
             actual = if destination
@@ -372,39 +358,45 @@ impl Media {
             kind: kind.to_owned(),
         })
     }
-    fn image(&mut self, db: &mut Db, group: &str, row: &Value, key: &str) -> Result<PathBuf> {
-        // Pictures are the only kind that must be decoded before they can be shown, and the
-        // decode can fail for reasons the user cannot act on. Never let that become a
-        // permanent retry: the item would sit at the head of the inbound queue and block
-        // conversations that have nothing to do with it.
+    fn image(&mut self, db: &mut Db, group: &str, row: &Value, key: &str) -> Result<(PathBuf, bool)> {
+        // Deliver real, decoded full/preview pixels. Download or decode failures
+        // must not be acknowledged as a successful gray image.
         match self.image_inner(db, group, row, key) {
-            Ok(path) => Ok(path),
-            // Still downloading is not a failure; retry so the real picture can arrive.
-            Err(error) if error.downcast_ref::<MediaPending>().is_some() => Err(error),
+            Ok(path) => Ok((path, false)),
             Err(error) => {
-                eprintln!("[media] picture unavailable, sending a placeholder: {error:#}");
-                Self::placeholder_picture(&self.cache_dir(key)?)
+                // A complete, decodable thumbnail is useful while the real picture is
+                // unavailable. Keep it outside image.* so a retry still seeks the full image.
+                if let Ok(Some(path)) = self.preview_picture(db, group, row, key) {
+                    eprintln!("[media] displaying thumbnail while full picture retries: {error}");
+                    return Ok((path, true));
+                }
+                if error.is::<MediaPending>() {
+                    return Err(error);
+                }
+                Err(pending_text(format!(
+                    "微信图片暂时无法读取，将继续重试：{error}"
+                )))
             }
         }
     }
+
     fn image_inner(&mut self, db: &mut Db, group: &str, row: &Value, key: &str) -> Result<PathBuf> {
         match self.local_image(db, group, row, key) {
             Ok(path) => Ok(path),
             Err(local_error) => {
                 let xml = content(row);
-                let Some(resource) = image_resource(&xml) else {
-                    return Err(local_error);
+                let resource = match image_resource(&xml) {
+                    Ok(resource) => resource,
+                    Err(error) if local_error.is::<MediaPending>() => {
+                        return Err(pending(&format!(
+                            "{local_error}；后台下载参数不可用：{error:#}"
+                        )));
+                    }
+                    Err(_) => return Err(local_error),
                 };
-                let source = self.download(group, key, &resource, false)?;
+                let source = self.download(group, key, &resource, true)?;
                 let folder = self.cache_dir(key)?;
-                // The CDN API writes decrypted original bytes; no foreground image-key scan is needed.
-                let data = read_limited(&source, MAX_FILE)?;
-                let plain = if data.starts_with(b"wxgf") {
-                    wxgf::decode(&data, &folder)?
-                } else {
-                    data
-                };
-                let (format, _, _) = picture::validate(&plain, 12000)?;
+                let (plain, format) = downloaded_picture(&source, &folder)?;
                 let destination = folder.join(format!("image.{}", picture::extension(format)));
                 atomic_write(&destination, &plain)?;
                 Ok(destination)
@@ -415,6 +407,7 @@ impl Media {
     ///
     /// A placeholder that does not decode is worse than an error: the client caches it as a
     /// real picture, draws an empty bubble and never asks again.
+    #[cfg(test)]
     fn placeholder_picture(folder: &Path) -> Result<PathBuf> {
         picture::validate(PLACEHOLDER_PNG, 12000).context("内置占位图无效")?;
         // Deliberately not `image.png`: `cached_picture` treats every `image.*` as a decoded
@@ -423,54 +416,68 @@ impl Media {
         atomic_write(&dest, PLACEHOLDER_PNG)?;
         Ok(dest)
     }
-    /// The already-decoded thumbnail WeChat keeps beside the original picture.
-    ///
-    /// `<md5>.dat` is what the client can display without an HEVC decoder, so it stands in
-    /// whenever the full-size WXGF cannot be produced.
-    fn thumbnail(
+    /// Read only this message's thumbnail; never mistake a nearby image for it.
+    fn preview_picture(
         &mut self,
         db: &mut Db,
-        root: &Path,
-        digest: &str,
-        source: &Path,
-    ) -> Result<Option<Vec<u8>>> {
-        let Some(entry) = WalkDir::new(root)
+        group: &str,
+        row: &Value,
+        key: &str,
+    ) -> Result<Option<PathBuf>> {
+        let Some(digest) = image_digest(row) else {
+            return Ok(None);
+        };
+        let root = db
+            .account_dir
+            .join("msg/attach")
+            .join(picture::md5(group.as_bytes()));
+        let folder = self.cache_dir(key)?;
+        if let Some(path) = cached_picture_named(&folder, "preview.", MAX_IMAGE) {
+            return Ok(Some(path));
+        }
+        for entry in WalkDir::new(&root)
             .follow_links(false)
             .into_iter()
             .filter_map(|entry| entry.ok())
-            .find(|entry| {
+            .filter(|entry| {
                 entry.file_type().is_file()
-                    && entry.file_name() == format!("{digest}.dat").as_str()
-                    // The file that just failed to decode can carry this exact name; reading
-                    // it again would only reproduce the same failure.
-                    && entry.path() != source
-                    && entry.metadata().is_ok_and(|meta| meta.len() >= 512)
+                    && (entry.file_name() == format!("{digest}_t.dat").as_str()
+                        || entry.file_name() == format!("{digest}.dat").as_str())
             })
-        else {
-            return Ok(None);
-        };
-        let path = within(root, &entry.into_path())?;
-        // A thumbnail that cannot be read yet is still being written; that is worth another
-        // attempt, unlike a thumbnail that reads fine and does not decode.
-        let data = read_limited(&path, MAX_FILE)
-            .map_err(|_| pending("微信图片缩略图正在写入，会自动重试"))?;
-        let aes = if data.starts_with(picture::V2) && data.len() >= 31 {
-            match self.resolve_image_key(db, &data[15..31]) {
-                Ok(key) => Some(key),
-                Err(_) => return Ok(None),
-            }
-        } else {
-            None
-        };
-        let xor = self.resolve_xor_key(db, &path, &data);
-        Ok(picture::decrypt(&data, aes.as_ref(), xor).ok())
+        {
+            let decoded: Result<Vec<u8>> = (|| {
+                let path = within(&root, &entry.into_path())?;
+                let data = read_limited(&path, MAX_IMAGE)?;
+                let aes = if data.starts_with(picture::V2) && data.len() >= 31 {
+                    Some(self.resolve_image_key(db, &data[15..31])?)
+                } else {
+                    None
+                };
+                let xor = self.resolve_xor_key(db, &path, &data);
+                let plain = picture::decrypt(&data, aes.as_ref(), xor)?;
+                if plain.starts_with(b"wxgf") {
+                    wxgf::decode(&plain, &folder)
+                } else {
+                    Ok(plain)
+                }
+            })();
+            let Ok(plain) = decoded else { continue };
+            let Ok((format, _, _)) = picture::validate(&plain, 12000) else {
+                continue;
+            };
+            let destination = folder.join(format!("preview.{}", picture::extension(format)));
+            atomic_write(&destination, &plain)?;
+            return Ok(Some(destination));
+        }
+        Ok(None)
     }
+
     fn local_image(&mut self, db: &mut Db, group: &str, row: &Value, key: &str) -> Result<PathBuf> {
         let folder = self.cache_dir(key)?;
         if let Some(path) = cached_picture(&folder) {
             return Ok(path);
         }
-        let digest = find_md5(row).ok_or_else(|| pending("微信图片元数据尚未就绪，会自动重试"))?;
+        let digest = image_digest(row).ok_or_else(|| pending("微信图片元数据尚未就绪，会自动重试"))?;
         let root = db
             .account_dir
             .join("msg/attach")
@@ -520,7 +527,7 @@ impl Media {
         }
         let source = original
             .or(mid)
-            .ok_or_else(|| pending("微信图片尚未完整下载，只有缩略图时不会转发"))?;
+            .ok_or_else(|| pending("微信本地完整图片缓存尚不可用"))?;
         let source = within(&root, &source)?;
         let data = read_limited(&source, MAX_FILE)
             .map_err(|_| pending("微信图片缓存正在写入，会自动重试"))?;
@@ -535,24 +542,10 @@ impl Media {
         // bytes or the key are wrong and retrying the same file cannot help.
         let plain = picture::decrypt(&data, aes.as_ref(), xor)
             .map_err(|_| anyhow::anyhow!("微信图片缓存无法解密，可能文件损坏或密钥不匹配"))?;
-        let decoded = if plain.starts_with(b"wxgf") {
-            // WeChat's HEVC wrapper. Producing the full picture needs a container layout we
-            // can parse; when that fails, the separately stored thumbnail is still usable.
-            match wxgf::decode(&plain, &folder) {
-                Ok(decoded) => Some(decoded),
-                Err(error) => {
-                    eprintln!("[media] wxgf decode failed: {error:#}");
-                    self.thumbnail(db, &root, &digest, &source)?
-                }
-            }
+        let plain = if plain.starts_with(b"wxgf") {
+            wxgf::decode(&plain, &folder).context("微信完整图片 WXGF 解码失败")?
         } else {
-            Some(plain)
-        };
-        // The thumbnail is not guaranteed to be displayable either: WeChat also stores small
-        // WXGF payloads there, so validate before deciding it worked.
-        let Some(plain) = decoded.filter(|data| picture::validate(data, 12000).is_ok()) else {
-            eprintln!("[media] no displayable picture, using a placeholder");
-            return Self::placeholder_picture(&folder);
+            plain
         };
         let (format, _, _) = picture::validate(&plain, 12000)?;
         let dest = folder.join(format!("image.{}", picture::extension(format)));
@@ -945,7 +938,19 @@ impl Media {
         let folder = owned_dir(&self.directory, &native_root.join("wechat-download"))?;
         let id = download_id(group, key, resource);
         let partial = folder.join(format!("{id}.part"));
+        let receipt = folder.join(format!("{id}.complete.json"));
         ensure!(!partial.is_symlink(), "微信下载缓存不能是链接");
+        if allow_transcoded_image && !receipt.is_symlink() {
+            if let Ok(bytes) = read_limited(&receipt, 16 * 1024) {
+                if let Ok(response) = serde_json::from_slice::<Value>(&bytes) {
+                    if let Ok(Some(source)) =
+                        completed_download(&response, &folder, &partial, &id, resource, true)
+                    {
+                        return Ok(source);
+                    }
+                }
+            }
+        }
         if let Ok(source) = within(&folder, &partial) {
             if verified(&source, resource.length, &[resource.md5.clone()]) {
                 return Ok(source);
@@ -989,6 +994,9 @@ impl Media {
             resource,
             allow_transcoded_image,
         )? {
+            if allow_transcoded_image {
+                atomic_write(&receipt, &serde_json::to_vec(&response)?)?;
+            }
             return Ok(source);
         }
         if response["status"] == "failed" {
@@ -1000,6 +1008,7 @@ impl Media {
         ensure!(response["status"] == "downloading", "微信后台下载状态无效");
         Err(pending("微信媒体正在后台下载，大小和 MD5 校验后自动转发"))
     }
+
     fn emoji(&self, db: &Db, xml: &str) -> Result<PathBuf> {
         let document = xml_document(xml)?;
         let emoji = document
@@ -1167,6 +1176,34 @@ impl DownloadResource {
         Ok(())
     }
 }
+/// Called only after `download` verifies the original bytes against the message
+/// or a successful same-request CDN receipt. Never rewrite that authenticated
+/// source: normalize the delivery copy using the same bounded footer handling
+/// as local picture decryption, then require a complete image decode.
+fn downloaded_picture(source: &Path, folder: &Path) -> Result<(Vec<u8>, image::ImageFormat)> {
+    // CDN results are already decrypted; no foreground image-key scan is needed.
+    let mut data = read_limited(source, MAX_FILE)?;
+    let received_size = data.len();
+    picture::strip_footer(&mut data);
+    let footer_size = received_size - data.len();
+    if data.starts_with(b"wxgf") {
+        data = wxgf::decode(&data, folder)?;
+    }
+    let (format, _, _) = picture::validate(&data, 12000).map_err(|error| {
+        anyhow::anyhow!(
+            "已校验的微信 CDN 图片无法完整解码（received-bytes={received_size} footer-bytes={footer_size} {}）：{error}",
+            picture::structure(&data)
+        )
+    })?;
+    if footer_size > 0 {
+        eprintln!(
+            "[media] CDN picture normalized: format={} received-bytes={received_size} footer-bytes={footer_size}",
+            picture::extension(format)
+        );
+    }
+    Ok((data, format))
+}
+
 fn completed_download(
     response: &Value,
     folder: &Path,
@@ -1196,10 +1233,11 @@ fn completed_download(
             && verified(&source, size, &[digest.clone()]),
         "微信 CDN 下载完成回执的文件校验失败"
     );
-    // Full record images can be reencoded by the CDN; only their same-request native receipt can attest replacement bytes.
+    // Ordinary/record pictures can be reencoded by the CDN. Only a successful
+    // same-request native receipt and matching actual bytes attest that result.
     ensure!(
         resource.kind == "video"
-            || (allow_transcoded_image && resource.kind == "image")
+            || (allow_transcoded_image && matches!(resource.kind, "image" | "image_mid"))
             || (size == resource.length && digest == resource.md5),
         "微信 CDN 下载内容与原消息不一致"
     );
@@ -1221,12 +1259,16 @@ fn download_id(group: &str, key: &str, resource: &DownloadResource) -> String {
         .as_bytes(),
     )
 }
-fn image_resource(xml: &str) -> Option<DownloadResource> {
-    let document = xml_document(xml).ok()?;
+fn image_resource(xml: &str) -> Result<DownloadResource> {
+    // XML parser details can contain names from the message. Diagnostics only
+    // describe the stage and field validity, never raw message or secret values.
+    let document =
+        xml_document(xml).map_err(|_| anyhow::anyhow!("微信图片消息 XML 缺失或无法解析"))?;
     let image = document
         .descendants()
-        .find(|node| node.has_tag_name("img"))?;
-    let resource = DownloadResource {
+        .find(|node| node.has_tag_name("img"))
+        .context("微信图片消息缺少 img 节点")?;
+    let original = DownloadResource {
         kind: "image",
         file_id: image.attribute("cdnbigimgurl").unwrap_or("").to_owned(),
         aes: image.attribute("aeskey").unwrap_or("").to_owned(),
@@ -1236,9 +1278,44 @@ fn image_resource(xml: &str) -> Option<DownloadResource> {
             .unwrap_or(0),
         md5: image.attribute("md5").unwrap_or("").to_ascii_lowercase(),
     };
-    resource.validate().ok()?;
-    Some(resource)
+    if original.validate().is_ok() {
+        return Ok(original);
+    }
+    // Standard pictures need their own URL, length and native CDN type (2). They
+    // are independent of original-image fields and of the thumbnail resource.
+    // Without this branch, a missing local cache could wait forever even though
+    // the message already contained everything needed for a background download.
+    let standard = DownloadResource {
+        kind: "image_mid",
+        file_id: image.attribute("cdnmidimgurl").unwrap_or("").to_owned(),
+        aes: image.attribute("aeskey").unwrap_or("").to_owned(),
+        length: image
+            .attribute("length")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
+        md5: image.attribute("md5").unwrap_or("").to_ascii_lowercase(),
+    };
+    standard.validate().with_context(|| {
+        let status = |r: &DownloadResource| {
+            format!(
+                "资源编号有效={} 大小有效={} AES有效={} MD5有效={}",
+                (32..=4096).contains(&r.file_id.len())
+                    && r.file_id.len() % 2 == 0
+                    && is_hex(&r.file_id, r.file_id.len()),
+                (1..=MAX_FILE).contains(&r.length),
+                is_hex(&r.aes, 32),
+                is_hex(&r.md5, 32)
+            )
+        };
+        format!(
+            "微信图片缺少完整的原图或标准图下载参数（原图：{}；标准图：{}）",
+            status(&original),
+            status(&standard)
+        )
+    })?;
+    Ok(standard)
 }
+
 fn video_resource(video: roxmltree::Node<'_, '_>) -> Result<DownloadResource> {
     let original = DownloadResource {
         kind: "video_original",
@@ -1344,6 +1421,22 @@ fn message_key(group: &str, row: &Value) -> String {
         number(&row["sort_seq"])
     )
 }
+fn image_digest(row: &Value) -> Option<String> {
+    let xml = content(row);
+    // CDN resource IDs and AES keys can precede md5 in XML. Their first 32 hex
+    // characters are not this picture's cache name.
+    xml_document(&xml)
+        .ok()
+        .and_then(|doc| {
+            doc.descendants()
+                .find(|node| node.has_tag_name("img"))
+                .and_then(|node| node.attribute("md5"))
+                .filter(|value| is_hex(value, 32))
+                .map(str::to_ascii_lowercase)
+        })
+        .or_else(|| find_md5(row))
+}
+
 fn find_md5(row: &Value) -> Option<String> {
     for value in [&row["packed_info"], &row["content"]] {
         let data = value
@@ -1556,17 +1649,23 @@ fn scan_image_key(data: &[u8], probe: &[u8]) -> Option<[u8; 16]> {
     None
 }
 fn cached_picture(folder: &Path) -> Option<PathBuf> {
+    cached_picture_named(folder, "image.", MAX_FILE)
+}
+fn cached_picture_named(folder: &Path, prefix: &str, limit: u64) -> Option<PathBuf> {
     for entry in fs::read_dir(folder).ok()?.filter_map(|entry| entry.ok()) {
         let path = entry.path();
         if !path.is_file()
             || path.is_symlink()
             || !path
                 .file_name()
-                .is_some_and(|name| name.to_string_lossy().starts_with("image."))
+                .is_some_and(|name| name.to_string_lossy().starts_with(prefix))
         {
             continue;
         }
-        if let Ok(data) = read_limited(&path, MAX_FILE) {
+        if let Ok(data) = read_limited(&path, limit) {
+            if prefix == "image." && data == PLACEHOLDER_PNG {
+                continue;
+            }
             if picture::validate(&data, 12000).is_ok() {
                 return Some(path);
             }
@@ -1574,6 +1673,7 @@ fn cached_picture(folder: &Path) -> Option<PathBuf> {
     }
     None
 }
+
 fn emoji_uri(url: &str) -> Result<ureq::http::Uri> {
     ensure!(!url.contains('#'), "微信表情 CDN 地址无效");
     let uri: ureq::http::Uri = url.parse().context("微信表情 CDN 地址无效")?;

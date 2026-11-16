@@ -162,9 +162,34 @@ fn complete(data: &[u8], format: ImageFormat) -> bool {
         _ => true,
     }
 }
+/// Structural diagnostics only: no paths, keys, resource IDs or image content.
+pub(super) fn structure(data: &[u8]) -> String {
+    let Ok(format) = format(data) else {
+        return format!("format=unknown bytes={}", data.len());
+    };
+    let mut detail = format!("format={} bytes={}", extension(format), data.len());
+    let marker: &[u8] = match format {
+        ImageFormat::Jpeg => b"\xff\xd9",
+        ImageFormat::Png => b"IEND\xaeB`\x82",
+        ImageFormat::Gif => b"\x3b",
+        ImageFormat::WebP if data.len() >= 12 => {
+            let declared = u64::from(u32::from_le_bytes(data[4..8].try_into().unwrap())) + 8;
+            return format!("{detail} declared-bytes={declared}");
+        }
+        _ => return detail,
+    };
+    match data.windows(marker.len()).rposition(|part| part == marker) {
+        Some(pos) => detail.push_str(&format!(
+            " end-marker-trailing={}",
+            data.len() - pos - marker.len()
+        )),
+        None => detail.push_str(" end-marker=missing"),
+    }
+    detail
+}
 pub(super) fn validate(data: &[u8], max: u32) -> Result<(ImageFormat, u32, u32)> {
     let format = format(data)?;
-    ensure!(complete(data, format), "图片缓存尚未完整写入");
+    ensure!(complete(data, format), "图片缺少有效结束结构");
     let mut reader = ImageReader::with_format(Cursor::new(data), format);
     reader.limits(limits(max));
     let (width, height) = reader.into_dimensions()?;
