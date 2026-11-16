@@ -230,13 +230,7 @@ impl NativeClient {
         let health = loop {
             match self.request("/health", None) {
                 Ok(health) => {
-                    ensure!(
-                        health["pid"].as_u64() == Some(pid as u64)
-                            && version_matches(&health["version"])
-                            && !health_has_error(&health["error"]),
-                        "本机微信组件进程或版本校验未通过：pid或版本不匹配（检测到 {}）",
-                        health["version"]
-                    );
+                    validate_health(&health, pid)?;
                     break health;
                 }
                 Err(error) => {
@@ -344,13 +338,7 @@ impl NativeClient {
         self.port = port as u16;
         self.pid = Some(pid);
         let health = self.request("/health", None)?;
-        ensure!(
-            health["pid"] == pid
-                && version_matches(&health["version"])
-                && !health_has_error(&health["error"]),
-            "已加载组件身份校验失败（检测到版本 {}）",
-            health["version"]
-        );
+        validate_health(&health, pid)?;
         Ok(true)
     }
 
@@ -471,6 +459,36 @@ fn health_has_error(value: &Value) -> bool {
         Value::Array(value) => !value.is_empty(),
         Value::Object(value) => !value.is_empty(),
     }
+}
+
+fn validate_health(health: &Value, expected_pid: u32) -> Result<()> {
+    let actual_pid = health["pid"].as_u64();
+    ensure!(
+        actual_pid == Some(expected_pid as u64),
+        "本机微信组件进程校验失败：期望 PID {expected_pid}，实际 PID {}",
+        actual_pid.map_or_else(|| "缺失或无效".to_owned(), |pid| pid.to_string())
+    );
+    let diagnostic = |text: &str| {
+        text.chars()
+            .take(512)
+            .map(|ch| if ch.is_control() { ' ' } else { ch })
+            .collect::<String>()
+    };
+    ensure!(
+        version_matches(&health["version"]),
+        "本机微信组件版本校验失败：检测到「{}」，需要 4.1.15.x",
+        diagnostic(health["version"].as_str().unwrap_or("缺失或无效"))
+    );
+    ensure!(
+        !health_has_error(&health["error"]),
+        "本机微信组件初始化失败：{}",
+        match &health["error"] {
+            Value::String(text) => diagnostic(text),
+            Value::Number(code) => format!("错误代码 {code}"),
+            _ => "组件报告错误状态，未提供文字原因".to_owned(),
+        }
+    );
+    Ok(())
 }
 
 fn random_token() -> String {
@@ -1227,6 +1245,37 @@ mod tests {
         for value in [json!(true), json!(1), json!("not ready")] {
             assert!(health_has_error(&value));
         }
+    }
+
+    #[test]
+    fn health_validation_distinguishes_process_version_and_initialization_failures() {
+        let ready = json!({"pid":7,"version":"4.1.15.13","error":""});
+        assert!(validate_health(&ready, 7).is_ok());
+        let error = validate_health(&ready, 8).unwrap_err().to_string();
+        assert!(error.contains("进程校验失败"));
+        assert!(error.contains("期望 PID 8，实际 PID 7"));
+        let mut health = ready.clone();
+        health["version"] = json!("4.2.0.1");
+        let error = validate_health(&health, 7).unwrap_err().to_string();
+        assert!(error.contains("版本校验失败"));
+        assert!(error.contains("4.2.0.1"));
+        health = ready.clone();
+        health["error"] = json!("native download fingerprint mismatch");
+        health["token"] = json!("fixture-secret-must-not-be-printed");
+        let error = validate_health(&health, 7).unwrap_err().to_string();
+        assert!(error.contains("初始化失败：native download fingerprint mismatch"));
+        assert!(!error.contains("版本校验失败"));
+        assert!(!error.contains("fixture-secret"));
+        for flag in [json!(true), json!(1), json!({"token":"fixture-secret"})] {
+            health["error"] = flag;
+            let error = validate_health(&health, 7).unwrap_err().to_string();
+            assert!(error.contains("初始化失败"));
+            assert!(!error.contains("fixture-secret"));
+        }
+        health["error"] = json!(format!("line1\nline2{}", "x".repeat(1024)));
+        let error = validate_health(&health, 7).unwrap_err().to_string();
+        assert!(!error.contains('\n'));
+        assert!(error.chars().count() < 550);
     }
 
     #[test]

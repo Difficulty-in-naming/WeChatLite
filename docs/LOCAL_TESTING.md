@@ -67,6 +67,14 @@ python3 scripts/stage-windows-test.py --check
 
 当前交付同时更新适配器和 relay。原目录里的 Qt 管理端、FFmpeg 和其他依赖保留。若改动涉及其他组件，应按其构建流程准备并交付对应程序。
 
+### 核对 GitHub 包与本机交付的原生组件
+
+GitHub 的 `build-windows.ps1` 用 MSVC 从源码重新构建 `WeChatMedia.dll`，再更新 vendor DLL 及校验文件后嵌入适配器。Mac 交叉构建默认嵌入仓库 vendor 中已有的 DLL；相同 Rust 提交或相同 `image-preview` 标记不代表两者的原生组件相同。2026-11-16 用户提供的 GitHub 包 payload `01d71bfd…` 内嵌 Media SHA-256 为 `b6d743801c72b3a24bf7efa658b23d3cf67f01bce7a574548916682a26a15523`，原共享测试构建为 `e4f29d644be8fda53758420d1f06ce83431441ef8ac582692099b32b7f36196a`。这是已核实的构建差异，不代表已经确认运行失败的根因。
+
+比对用户指定的便携包时，只读解析并验证 payload 和目标条目的 SHA-256，不启动程序，不修改原包或真实解包缓存。需要复用其中媒体 DLL 做对照时，先校验从适配器提取的完整 DLL 哈希与内嵌哈希一致，然后同时指定 `WECHAT_MEDIA_DLL=<已验证 DLL 的绝对路径>` 与 `WECHAT_MEDIA_DLL_SHA256=<完整 SHA-256>` 构建。两者缺一或指纹不符都会拒绝构建；默认构建仍校验 vendor 的固定指纹。无需覆盖仓库中的 DLL。
+
+启动日志新增 `native-health=split-v1 native-media-sha256=<完整 SHA-256>`，交付清单也记录 `native_media_sha256`。比较 GitHub 与共享测试版时必须核对这个值；MSVC 与 GNU 的适配器 EXE 哈希不同本身不能证明功能不同。切换不同媒体 DLL 时，按用户步骤由本人正常完全退出微信后重新登录，避免未知旧钩子链；不得关闭内存指纹检查或由助手操作真实微信。
+
 ## 怎么证明用户拿到本次构建
 
 `--check` 必须成功。启动器按 `测试构建.json` 检查实际文件 SHA-256，随后用户核对服务端日志中 `exe=` 是当前测试目录。

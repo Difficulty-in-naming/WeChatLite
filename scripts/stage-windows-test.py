@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import tempfile
 import uuid
 
@@ -20,7 +21,7 @@ DEFAULT_DIRECTORY = Path(
     "/Volumes/MacData/cal_data/Downloads/WeChatLite-构建产物/WeChatLite-Server-测试版"
 )
 MARKER = "image-preview=cdn-footer-v3 media-wait=delayed-clear-v1"
-ADAPTER_MARKER = MARKER + " inbox-poll=snapshot-v1"
+ADAPTER_MARKER = MARKER + " inbox-poll=snapshot-v1 native-health=split-v1"
 MANIFEST = "测试构建.json"
 
 
@@ -40,6 +41,10 @@ def main():
     binary = adapter.read_bytes()
     if not binary.startswith(b"MZ") or ADAPTER_MARKER.encode() not in binary:
         parser.error("先构建 Windows 适配器；当前产物缺少本次功能标记")
+    media_hashes = set(re.findall(rb"native-media-sha256=([a-f0-9]{64})", binary))
+    if len(media_hashes) != 1:
+        parser.error("适配器必须包含唯一的内嵌后台下载 DLL 指纹")
+    media_hash = media_hashes.pop().decode("ascii")
     relay = (ROOT / "target/x86_64-pc-windows-gnu/release/wechat-relay.exe").read_bytes()
     if not relay.startswith(b"MZ") or MARKER.encode() not in relay:
         parser.error("先构建 Windows relay；缩略图升级需要适配器和 relay 同时更新")
@@ -52,6 +57,7 @@ def main():
     }
     manifest = {
         "feature": ADAPTER_MARKER,
+        "native_media_sha256": media_hash,
         "files": [{"path": name, "sha256": sha256(data)} for name, data in files.items()],
     }
     files[MANIFEST] = (json.dumps(manifest, ensure_ascii=False, indent=2) + "\n").encode()
@@ -100,6 +106,7 @@ def main():
     print("适配器 SHA-256：", sha256(binary))
     print("Relay SHA-256：", sha256(relay))
     print("适配器启动标记：", ADAPTER_MARKER)
+    print("内嵌后台下载 DLL SHA-256：", media_hash)
     print("用户在 Windows 里双击该目录的 启动测试版.bat；本脚本不启动或停止服务。")
 
 

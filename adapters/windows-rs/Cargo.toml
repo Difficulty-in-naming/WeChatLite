@@ -33,6 +33,7 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Securit
 
 [build-dependencies]
 cc = "1"
+sha2 = "0.10"
 
 [dev-dependencies]
 tempfile = "3"

@@ -125,8 +125,8 @@ impl Media {
             last_key_scan: None,
             downloads: NativeClient::with_binary(
                 directory.join("native-downloads"),
-                &include_bytes!("../vendor/WeChatMedia.dll")[..],
-                include_str!("../vendor/WeChatMedia.sha256").trim(),
+                &include_bytes!(env!("WECHAT_MEDIA_BINARY_PATH"))[..],
+                env!("WECHAT_MEDIA_BINARY_SHA256"),
                 json!({"capability":"media_download"}),
             ),
             download_groups: BTreeSet::new(),
