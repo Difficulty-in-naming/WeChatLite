@@ -62,6 +62,44 @@ fn reencoded_record_images_require_the_complete_same_request_cdn_receipt() {
 }
 
 #[test]
+fn completed_picture_receipt_accepts_canonical_alias_only_for_the_expected_private_file() {
+    let temp = tempfile::tempdir().unwrap();
+    let folder = temp.path().join("downloads");
+    fs::create_dir(&folder).unwrap();
+    let partial = folder.join("download.part");
+    let bytes = sample_png();
+    fs::write(&partial, &bytes).unwrap();
+    let resource = DownloadResource {
+        kind: "image",
+        file_id: "a".repeat(194),
+        aes: "b".repeat(32),
+        length: 99,
+        md5: "c".repeat(32),
+    };
+    let id = download_id("g", "alias-image", &resource);
+    // The existing parent component resolves to the same file, but cannot pass
+    // the lexical comparison. This exercises the canonical fallback on every OS.
+    let alias = folder.join("../downloads/download.part");
+    assert_ne!(absolute_comparable(&alias), absolute_comparable(&partial));
+    let receipt = json!({"ret":0,"status":"complete","request_id":id,
+        "path":alias,"size":bytes.len(),"md5":picture::md5(&bytes)});
+    assert_eq!(
+        completed_download(&receipt, &folder, &partial, &id, &resource, true)
+            .unwrap()
+            .unwrap(),
+        partial.canonicalize().unwrap(),
+    );
+    // Identical bytes alone cannot authorize another path, even inside the cache.
+    for other in [folder.join("other.part"), temp.path().join("outside.part")] {
+        fs::write(&other, &bytes).unwrap();
+        let mut receipt = receipt.clone();
+        receipt["path"] = json!(other);
+        assert!(completed_download(&receipt, &folder, &partial, &id, &resource, true).is_err());
+    }
+    assert_eq!(fs::read(&partial).unwrap(), bytes);
+}
+
+#[test]
 fn record_attachment_cache_is_bound_to_resource_and_detects_modified_bytes() {
     let temp = tempfile::tempdir().unwrap();
     let mut media = Media::new(temp.path().join("adapter"));

@@ -120,6 +120,8 @@ python3 scripts/stage-macos-test-client.py --check
 
 ## 代码验证参考
 
+Windows CI 的临时目录可能带 `RUNNER~1` 等短路径，而下载缓存使用规范长路径。回执路径不同文本但指向同一个私有文件时应通过；指向其他文件时仍须拒绝。原先失败的 `ordinary_reencoded_pictures_require_a_complete_resource_bound_receipt_and_decodable_bytes`、`record_picture_footer_is_normalized_after_verifying_the_original_download` 已在 Windows 短临时路径复现；验证这类修正时保留群下载授权检查，不能给夹具授权真实群来绕过错误。新增 `completed_picture_receipt_accepts_canonical_alias_only_for_the_expected_private_file` 覆盖同文件别名与相同字节的其他文件，跨平台运行。
+
 只运行与改动直接相关的验证；这些结果单独标为代码验证。本次图片改动可用：
 
 ```bash

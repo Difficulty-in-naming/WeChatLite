@@ -1217,10 +1217,16 @@ fn completed_download(
         "微信后台下载回执不匹配"
     );
     let returned = PathBuf::from(response["path"].as_str().unwrap_or(""));
-    ensure!(
-        absolute_comparable(&returned) == absolute_comparable(partial),
-        "微信后台下载路径不匹配"
-    );
+    // Windows temp roots may contain an 8.3 alias (RUNNER~1), while owned_dir
+    // returns the expanded canonical path. Accept that alias only when both
+    // paths resolve to this exact file inside the private download directory.
+    let same_path = absolute_comparable(&returned) == absolute_comparable(partial)
+        || (returned.is_absolute()
+            && within(folder, &returned)
+                .ok()
+                .zip(within(folder, partial).ok())
+                .is_some_and(|(returned, expected)| returned == expected));
+    ensure!(same_path, "微信后台下载路径不匹配");
     if response["status"] != "complete" {
         return Ok(None);
     }
