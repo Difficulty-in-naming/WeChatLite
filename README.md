@@ -2,6 +2,8 @@
 
 轻量的 C++ / Qt Widgets 聊天客户端，配合独立的 Qt 管理界面、Rust 转发核心和本机微信适配器。客户端可以运行在另一台电脑，服务端只访问其本机已登录的微信。
 
+文档入口：[使用、构建与测试](docs/README.md)。用户本机 Windows 虚拟机的手工测试流程见 [本机测试步骤](docs/TEST-SERVER-STEPS.md)，助手编译后交付到共享下载目录的流程见 [构建与交付](docs/LOCAL_TESTING.md)。
+
 ## 下载与运行
 
 在 [Releases](https://github.com/Difficulty-in-naming/WeChatLite/releases) 下载对应平台、对应角色的程序。客户端和服务端分开运行、分开分发。
