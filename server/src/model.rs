@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 
 pub const RECALL_UNAVAILABLE: &str = "当前微信版本的后台撤回暂不可用；请在原版微信中撤回";
+pub const LEGACY_IMAGE_PLACEHOLDER_SHA256: &str =
+    "ea1e8edd73b84213a88451e1cbe5eb084851a656b4879d749ac2c56a5ab72760";
+pub const LEGACY_IMAGE_PLACEHOLDER_SIZE: u64 = 691;
 
 pub fn recall_unavailable(status: &serde_json::Value) -> Option<&str> {
     if status["recall_supported"] != false {
@@ -103,6 +106,8 @@ pub struct ChatMessage {
     pub text: String,
     #[serde(default)]
     pub media: Vec<Media>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub media_pending: bool,
     #[serde(default)]
     pub mentions: Vec<Mention>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -127,6 +132,16 @@ pub struct ChatMessage {
     pub recall_attempt: String,
     #[serde(default)]
     pub outgoing: bool,
+}
+
+impl ChatMessage {
+    pub fn has_legacy_image_placeholder(&self) -> bool {
+        self.record.is_none()
+            && self.media.len() == 1
+            && self.media[0].kind == "image"
+            && self.media[0].size == LEGACY_IMAGE_PLACEHOLDER_SIZE
+            && self.media[0].sha256 == LEGACY_IMAGE_PLACEHOLDER_SHA256
+    }
 }
 
 pub fn clean_name(name: &str) -> String {

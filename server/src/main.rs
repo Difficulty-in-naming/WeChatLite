@@ -372,6 +372,7 @@ fn default_config() -> Config {
 
 #[tokio::main(worker_threads = 2)]
 async fn main() -> Result<()> {
+    eprintln!("[media] relay image-preview=cdn-footer-v3 media-wait=delayed-clear-v1");
     // Keep TLS deterministic when Cargo unifies the relay and adapter features.
     let _ = rustls::crypto::ring::default_provider().install_default();
     let args: Vec<String> = std::env::args().collect();
