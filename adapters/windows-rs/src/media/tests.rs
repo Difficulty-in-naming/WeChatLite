@@ -13,23 +13,52 @@ fn sample_png() -> Vec<u8> {
 
 #[test]
 fn reencoded_record_images_require_the_complete_same_request_cdn_receipt() {
-    let temp=tempfile::tempdir().unwrap();
-    let bytes=sample_png();let path=temp.path().join("download.part");fs::write(&path,&bytes).unwrap();
-    let mut resource=DownloadResource {kind:"image",file_id:"a".repeat(194),aes:"b".repeat(32),length:99,md5:"c".repeat(32)};
-    let id=download_id("g","record-image",&resource);
-    let receipt=json!({"ret":0,"status":"complete","request_id":id,"path":path,"size":bytes.len(),"md5":picture::md5(&bytes)});
-    assert!(completed_download(&receipt,temp.path(),&path,&id,&resource,false).is_err());
-    assert_eq!(fs::read(completed_download(&receipt,temp.path(),&path,&id,&resource,true).unwrap().unwrap()).unwrap(),bytes);
-    for (field,value) in [("ret",json!(-1)),("request_id",json!("unrelated")),("md5",json!("d".repeat(32))),("size",json!(bytes.len()+1)),("path",json!(temp.path().join("other.part")))] {
-        let mut bad=receipt.clone();bad[field]=value;
-        assert!(completed_download(&bad,temp.path(),&path,&id,&resource,true).is_err());
+    let temp = tempfile::tempdir().unwrap();
+    let bytes = sample_png();
+    let path = temp.path().join("download.part");
+    fs::write(&path, &bytes).unwrap();
+    let mut resource = DownloadResource {
+        kind: "image",
+        file_id: "a".repeat(194),
+        aes: "b".repeat(32),
+        length: 99,
+        md5: "c".repeat(32),
+    };
+    let id = download_id("g", "record-image", &resource);
+    let receipt = json!({"ret":0,"status":"complete","request_id":id,"path":path,"size":bytes.len(),"md5":picture::md5(&bytes)});
+    assert!(completed_download(&receipt, temp.path(), &path, &id, &resource, false).is_err());
+    assert_eq!(
+        fs::read(
+            completed_download(&receipt, temp.path(), &path, &id, &resource, true)
+                .unwrap()
+                .unwrap()
+        )
+        .unwrap(),
+        bytes
+    );
+    for (field, value) in [
+        ("ret", json!(-1)),
+        ("request_id", json!("unrelated")),
+        ("md5", json!("d".repeat(32))),
+        ("size", json!(bytes.len() + 1)),
+        ("path", json!(temp.path().join("other.part"))),
+    ] {
+        let mut bad = receipt.clone();
+        bad[field] = value;
+        assert!(completed_download(&bad, temp.path(), &path, &id, &resource, true).is_err());
     }
-    let mut unfinished=receipt.clone();unfinished["status"]=json!("downloading");
-    assert!(completed_download(&unfinished,temp.path(),&path,&id,&resource,true).unwrap().is_none());
-    resource.kind="file";
-    assert!(completed_download(&receipt,temp.path(),&path,&id,&resource,true).is_err());
-    resource.kind="image";fs::write(&path,b"tampered").unwrap();
-    assert!(completed_download(&receipt,temp.path(),&path,&id,&resource,true).is_err());
+    let mut unfinished = receipt.clone();
+    unfinished["status"] = json!("downloading");
+    assert!(
+        completed_download(&unfinished, temp.path(), &path, &id, &resource, true)
+            .unwrap()
+            .is_none()
+    );
+    resource.kind = "file";
+    assert!(completed_download(&receipt, temp.path(), &path, &id, &resource, true).is_err());
+    resource.kind = "image";
+    fs::write(&path, b"tampered").unwrap();
+    assert!(completed_download(&receipt, temp.path(), &path, &id, &resource, true).is_err());
 }
 
 #[test]
@@ -353,6 +382,24 @@ fn cdn_allowlist_and_xml_entity_rules_are_preserved() {
     assert!(
         xml_document("sender:\n<msg><emoji md5='0123456789abcdef0123456789abcdef'/></msg>").is_ok()
     );
+}
+
+#[test]
+fn the_placeholder_picture_is_a_valid_decodable_image() {
+    // The placeholder is what a user sees when a picture cannot be produced. It used to be
+    // a truncated PNG: the client decoded it as nothing and showed "图片 · 点击下载", so a
+    // failed decode looked like a picture that had never arrived. Assert the bytes decode,
+    // report the right size, and survive the same validation real pictures go through.
+    let (format, width, height) = picture::validate(PLACEHOLDER_PNG, 12000).unwrap();
+    assert_eq!(format, image::ImageFormat::Png);
+    assert_eq!((width, height), (320, 240));
+    let root = tempfile::tempdir().unwrap();
+    let path = Media::placeholder_picture(root.path()).unwrap();
+    assert_eq!(fs::read(&path).unwrap(), PLACEHOLDER_PNG);
+    assert!(picture::read_and_validate(&path, 12000).is_ok());
+    // It must not be cached as `image.*`: that name is what a later successful decode
+    // consults first, so a placeholder there would keep hiding the real picture.
+    assert!(cached_picture(root.path()).is_none());
 }
 
 #[test]
