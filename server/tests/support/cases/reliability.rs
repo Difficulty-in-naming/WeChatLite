@@ -18,9 +18,18 @@ async fn shutdown_case(tls: bool) -> Result<()> {
         std::fs::read_to_string(relay.dir.path().join("adapter-stopped"))?,
         "stdin-closed"
     );
+    let stderr = std::fs::read_to_string(relay.dir.path().join("server-stderr.log"))?;
+    let diagnostics = stderr
+        .lines()
+        .filter(|line| line.starts_with("offline adapter diagnostics "))
+        .collect::<Vec<_>>();
     assert_eq!(
-        std::fs::read(relay.dir.path().join("server-stderr.log"))?,
-        b"offline adapter diagnostics ready\noffline adapter diagnostics stopped\n"
+        diagnostics,
+        [
+            "offline adapter diagnostics ready",
+            "offline adapter diagnostics stopped"
+        ],
+        "adapter diagnostics must be forwarded exactly once and in order: {stderr}"
     );
     #[cfg(windows)]
     {

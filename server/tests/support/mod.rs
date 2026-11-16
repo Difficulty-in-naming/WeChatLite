@@ -26,7 +26,7 @@ use tokio_tungstenite::{
 };
 
 pub type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
-// Windows CI needs time to durably seed 800 demo rows and import history pages.
+// Windows CI needs time to initialize demo data and import history pages.
 pub const WAIT: Duration = Duration::from_secs(15);
 
 pub fn binary() -> PathBuf {
@@ -376,7 +376,8 @@ impl Relay {
                 self.dir.path().join("server-stderr.log"),
             )?);
         self.child = Some(command.spawn()?);
-        let deadline = Instant::now() + WAIT;
+        let started = Instant::now();
+        let deadline = started + WAIT;
         loop {
             if self.child.as_mut().unwrap().try_wait()?.is_some() {
                 bail!(
@@ -384,15 +385,18 @@ impl Relay {
                     std::fs::read_to_string(self.dir.path().join("server-stderr.log"))?
                 );
             }
-            if let Ok(value) = self.api.get("/api/status").await
-                && value["ready"] == true
-            {
+            let status = self.api.get("/api/status").await;
+            if status.as_ref().is_ok_and(|value| value["ready"] == true) {
                 break;
             }
             ensure!(
                 Instant::now() < deadline,
-                "fixture relay startup timed out (tls={})",
-                self.tls
+                "fixture relay startup timed out (mode={}, tls={}, elapsed={:?}, status={status:?}); stdout:\n{}\nstderr:\n{}",
+                self.mode,
+                self.tls,
+                started.elapsed(),
+                std::fs::read_to_string(self.dir.path().join("server-stdout.log"))?,
+                std::fs::read_to_string(self.dir.path().join("server-stderr.log"))?
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }

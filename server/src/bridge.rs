@@ -732,11 +732,12 @@ async fn demo_seed(app: &Arc<App>) -> Result<()> {
         // Enough rows that Up/PageUp keep scrolling for a long while and every page of
         // history from the server is reachable, not just the first one.
         const DEMO_HISTORY: usize = 800;
+        let mut history=Vec::with_capacity(DEMO_HISTORY);
         for index in 0..DEMO_HISTORY{
             let (sender,sender_id)=people[index%people.len()];
             let text=lines[index%lines.len()];
             let message_id=format!("demo-history-{}",index+1);
-            let mut message:ChatMessage=serde_json::from_value(json!({
+            let message:ChatMessage=serde_json::from_value(json!({
                 "id":message_id.clone(),"group":"demo-design","sender":sender,"sender_id":sender_id,
                 "text":format!("{}（第 {} 条历史消息，用于测试上下键滚动）",text,index+1),
                 "timestamp":now-180_000-(DEMO_HISTORY-index)as i64*45_000,"status":"received","source_id":message_id,
@@ -744,8 +745,11 @@ async fn demo_seed(app: &Arc<App>) -> Result<()> {
             // Seed history is imported, not received live: it must be readable in the
             // conversation without becoming replayable realtime events, otherwise every
             // new connection would first replay all of it before reaching "synced".
-            s.insert_silent_history(&mut message)?;
+            history.push(message);
         }
+        // One durable commit keeps demo startup bounded on slow Windows disks without
+        // weakening synchronous=FULL or changing live-message persistence.
+        s.insert_silent_history(&mut history)?;
         Ok(())
     }).await
 }

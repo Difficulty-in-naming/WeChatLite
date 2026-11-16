@@ -1,6 +1,43 @@
 use super::super::*;
 use sha2::{Digest, Sha256};
 
+pub async fn startup_seeds_history_without_live_replay() -> Result<()> {
+    let mut relay = Relay::new("demo").await?;
+    let config: Value = serde_json::from_slice(&std::fs::read(&relay.config)?)?;
+    assert!(config["bridge_program"].as_str().unwrap_or("").is_empty());
+    assert!(config["bridge_args"].is_null());
+    for restarted in [false, true] {
+        if restarted {
+            relay.stop().await?;
+            relay.start().await?;
+        }
+        let db = Connection::open_with_flags(
+            relay.dir.path().join("state/relay.sqlite"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        let counts: (i64, i64, i64) = db.query_row(
+            "SELECT (SELECT count(*) FROM messages), (SELECT count(*) FROM history_imports), (SELECT count(*) FROM events)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        assert_eq!(counts, (804, 800, 4));
+        let mut socket = relay.api.ws(0, None).await?;
+        let replay = sync(&mut socket).await?;
+        let messages = replay
+            .iter()
+            .filter(|event| event["type"] == "message")
+            .collect::<Vec<_>>();
+        assert_eq!(messages.len(), 4);
+        assert!(messages.iter().all(|event| event["message"]["id"]
+            .as_str()
+            .unwrap()
+            .starts_with("welcome-")));
+        drop(socket);
+    }
+    relay.stop().await?;
+    Ok(())
+}
+
 pub async fn access_key_is_required_for_messages_and_files() -> Result<()> {
     let relay = Relay::new("demo").await?;
     for path in [

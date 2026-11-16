@@ -135,6 +135,10 @@ git diff --check
 
 其他组件按改动范围选用现有套件：Rust 服务端核心使用 `cargo test -p wechat-relay --bin wechat-relay`；Qt UI 使用 `build-macos/client/desktop-tests -platform offscreen` 等对应套件。Qt 在 macOS 的标准路径需要单独的 `CFFIXED_USER_HOME` 和测试 profile；测试目录必须在工作区外的临时目录，避免写入真实配置。不要直接照搬可能创建客户端、发送消息或触发真实适配器的集成命令，先按 `AGENTS.md` 检查隔离条件。
 
+协议 CI 的启动验证可单独运行 `cargo test --locked -p wechat-relay --test protocol startup_seeds_history_without_live_replay`。它只用临时目录、随机回环端口、空 `bridge_program` 的 `--demo` 实例，检查首次启动和重启后仍有 804 条消息、其中 800 条历史不进入实时回放；不发送消息、不连接微信。存储批量导入的持久化、去重与失败回滚用 `cargo test --locked -p wechat-relay --bin wechat-relay store::tests::` 验证。
+
+2026-11-16 Windows CI 的 5 项协议失败包括 3 项演示实例启动超时和 2 项整份 stderr 比较失败。演示历史现改为单事务持久化，保持 `synchronous=FULL`；适配器退出诊断单独按内容、次数和顺序校验，允许 relay 自身输出启动标记。启动超时会附模式、耗时、最后状态及 stdout/stderr，不能只凭超时认定现场微信有故障，也不能把本次演示代码验证当作用户本机测试。
+
 保留的环境注意事项：macOS `/var` 的符号链接会触发媒体目录的链接检查，使用实际的 `/private/tmp`；系统代理能影响 curl 而 Qt WebSocket 行为不同，网络诊断先确认直连范围；生成 DMG 的 `hdiutil` 可能需要沙箱外权限。中文产物标记按 UTF-8 字节核对，不能用 UTF-16 搜不到来判定版本。
 
 真实只读网络和微信库诊断仍需用户明确授权本次范围。`ready: true` 只能说明已报告的状态，不能证明新消息正在推进；无新日志也不足以单独判定失联。不要把早期提交的“尚未验证”列表或历史 handoff 结论照抄为当前事实。
