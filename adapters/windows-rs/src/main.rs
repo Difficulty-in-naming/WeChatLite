@@ -59,8 +59,23 @@ enum Input {
     Warning(String),
     End,
 }
+/// Stamped into the log on every start so the running binary can be identified.
+///
+/// Swapping `adapter/wechat-adapter.exe` is not enough on its own: the tray program rewrites
+/// `bridge_program` to *its own* directory, so a second copy of the server keeps loading the
+/// adapter beside it. Logging the executable path and this build id turns "did the new build
+/// actually run" from a guess into one line of output.
+const BUILD_ID: &str = env!("CARGO_PKG_VERSION");
+fn announce_build() {
+    let exe = std::env::current_exe()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|_| "<不可用>".into());
+    eprintln!("[media] adapter build={BUILD_ID} exe={exe} wxgf=start-code-v2");
+}
+
 fn run() -> Result<()> {
     ensure!(cfg!(windows), "此适配器仅支持本机 Windows 微信");
+    announce_build();
     let data =
         PathBuf::from(std::env::var_os("WECHAT_LITE_DATA").unwrap_or_else(|| ".state".into()));
     std::fs::create_dir_all(&data)?;
