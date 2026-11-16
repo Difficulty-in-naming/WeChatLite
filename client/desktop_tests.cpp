@@ -260,6 +260,69 @@ class DesktopTests : public QObject
         QVERIFY2(failure.isEmpty(), qPrintable(failure));
         QTRY_VERIFY_WITH_TIMEOUT(model->rowCount() >= 4, 8000);
     }
+    void mediaWarningClearsOnlyForMatchingCompletedSource()
+    {
+        auto *transport = window->findChild<Transport *>();
+        auto *banner = window->findChild<QWidget *>("statusBanner");
+        const auto group = window->findChild<MessageModel *>()->rows.first()["group"].toString();
+        const QJsonObject warning{{"type", "warning"}, {"code", "inbound_media"},
+            {"group", group}, {"source_id", "offline-media-source"}, {"text", "附件仍在下载"}};
+        transport->event(warning);
+        QVERIFY(!banner->isHidden());
+        QJsonObject message{{"id", "offline-media-warning-row"}, {"group", group},
+            {"source_id", "another-source"}, {"sender", "Fixture"}, {"text", "[图片]"},
+            {"status", "received"}, {"timestamp", QDateTime::currentMSecsSinceEpoch()}};
+        transport->event({{"type", "message"}, {"message", message}});
+        QVERIFY(!banner->isHidden());
+        message["source_id"] = "offline-media-source";
+        message["group"] = "another-group";
+        transport->event({{"type", "message"}, {"message", message}});
+        QVERIFY(!banner->isHidden());
+        message["group"] = group;
+        message["media_pending"] = true;
+        transport->event({{"type", "message"}, {"message", message}});
+        QVERIFY(!banner->isHidden());
+        message["media_pending"] = false;
+        message["record"] = QJsonObject{{"pending", true}};
+        transport->event({{"type", "message"}, {"message", message}});
+        QVERIFY(!banner->isHidden());
+        message["record"] = QJsonObject{{"pending", false}};
+        message["status"] = "sent";
+        transport->event({{"type", "message"}, {"message", message}});
+        QVERIFY(!banner->isHidden());
+        // A native received message can be outgoing when synced from our phone.
+        message["status"] = "received";
+        message["outgoing"] = true;
+        transport->event({{"type", "message"}, {"message", message}});
+        QVERIFY(banner->isHidden());
+    }
+    void mediaWarningCompletionPreservesReplacementWarnings()
+    {
+        auto *transport = window->findChild<Transport *>();
+        auto *banner = window->findChild<QWidget *>("statusBanner");
+        auto *label = window->findChild<QLabel *>("statusBannerText");
+        const auto group = window->findChild<MessageModel *>()->rows.first()["group"].toString();
+        QJsonObject warning{{"type", "warning"}, {"code", "inbound_media"}, {"group", group},
+            {"source_id", "offline-source-a"}, {"text", "附件仍在下载"}};
+        transport->event(warning);
+        warning["source_id"] = "offline-source-b";
+        transport->event(warning); // Same text, a different pending picture.
+        QJsonObject complete{{"id", "offline-completion-a"}, {"source_id", "offline-source-a"},
+            {"group", group}, {"sender", "Fixture"}, {"text", "[图片]"},
+            {"status", "received"}, {"timestamp", QDateTime::currentMSecsSinceEpoch()}};
+        transport->event({{"type", "message"}, {"message", complete}});
+        QVERIFY(!banner->isHidden());
+        transport->event({{"type", "warning"}, {"text", "附件仍在下载"}}); // Unkeyed replacement.
+        complete["source_id"] = "offline-source-b";
+        transport->event({{"type", "message"}, {"message", complete}});
+        QVERIFY(!banner->isHidden());
+        transport->event(warning);
+        transport->warning("synthetic connection error");
+        transport->event({{"type", "message"}, {"message", complete}});
+        QVERIFY(!banner->isHidden());
+        QCOMPARE(label->text(), "synthetic connection error");
+        window->findChild<QToolButton *>("statusBannerClose")->click();
+    }
     void mergedRecordOpensOrderedDetailsUpdatesAttachmentsAndClosesOnRecall()
     {
         auto *model=window->findChild<MessageModel *>();
