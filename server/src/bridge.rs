@@ -271,7 +271,16 @@ async fn import_message_with_quote_source(
                 app.publish(event);
             }
         }
-        if message.record.is_none()
+        let picture_upgrade = (existing.media_pending && !message.media_pending
+            || existing.has_legacy_image_placeholder())
+            && !message.has_legacy_image_placeholder()
+            && existing.record.is_none()
+            && message.record.is_none()
+            && existing.media.len() == 1
+            && existing.media[0].kind == "image"
+            && message.media.len() == 1
+            && message.media[0].kind == "image";
+        if (message.record.is_none() && !picture_upgrade)
             || existing.status == "recalled"
             || !existing.client_id.is_empty()
             || !existing.recall_status.is_empty()
@@ -317,7 +326,7 @@ async fn import_message_with_quote_source(
             .db(move |s| {
                 if let Some(existing) = existing {
                     message.id = existing.id;
-                    s.enrich_native_record(&message, historical)
+                    s.enrich_native_message(&message, historical)
                 } else if historical {
                     s.insert_historical_message(&mut message)
                 } else {
@@ -410,6 +419,7 @@ async fn run_stream<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     let mut permissions = app.clients_changed.subscribe();
     let mut configure = true;
     let mut record_repairs = std::collections::VecDeque::new();
+    let mut picture_repairs = std::collections::VecDeque::new();
     let mut recovering = app.db(|s| s.pending_recalls()).await?;
     let mut recalling = std::collections::BTreeSet::new();
     let result:Result<()>=async {
@@ -422,9 +432,17 @@ async fn run_stream<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                 write_command(app,input,json!({"op":"configure","groups":*selected})).await?;
                 record_repairs=app.db(|store|store.legacy_record_sources()).await?.into_iter()
                     .filter(|(group,_)|selected.contains(group)).collect();
+                picture_repairs=app.db(|store|store.legacy_picture_sources()).await?.into_iter()
+                    .filter(|(group,_)|selected.contains(group)).collect();
                 configure=false;
             }
             if ready {
+                for _ in 0..8 {
+                    let Some((group,source))=picture_repairs.pop_front() else {break;};
+                    if selected.contains(&group) {
+                        write_command(app,input,json!({"op":"media_refresh","group":group,"source_id":source})).await?;
+                    }
+                }
                 for _ in 0..8 {
                     let Some((group,source))=record_repairs.pop_front() else {break;};
                     if selected.contains(&group) {
@@ -539,7 +557,7 @@ async fn run_stream<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                             }
                             let source_server_id=body["_quote_server_id"].as_str().map(str::to_owned);
                             let message:ChatMessage=serde_json::from_value(body)?;
-                            let incomplete=message.record.as_ref().is_some_and(|record|record.pending);
+                            let incomplete=message.media_pending || message.record.as_ref().is_some_and(|record|record.pending);
                             let group=message.group.clone();let source=message.source_id.clone();
                             match import_message_with_quote_source(app,message,historical,source_server_id).await {
                                 Ok(true)=>{},
@@ -714,11 +732,12 @@ async fn demo_seed(app: &Arc<App>) -> Result<()> {
         // Enough rows that Up/PageUp keep scrolling for a long while and every page of
         // history from the server is reachable, not just the first one.
         const DEMO_HISTORY: usize = 800;
+        let mut history=Vec::with_capacity(DEMO_HISTORY);
         for index in 0..DEMO_HISTORY{
             let (sender,sender_id)=people[index%people.len()];
             let text=lines[index%lines.len()];
             let message_id=format!("demo-history-{}",index+1);
-            let mut message:ChatMessage=serde_json::from_value(json!({
+            let message:ChatMessage=serde_json::from_value(json!({
                 "id":message_id.clone(),"group":"demo-design","sender":sender,"sender_id":sender_id,
                 "text":format!("{}（第 {} 条历史消息，用于测试上下键滚动）",text,index+1),
                 "timestamp":now-180_000-(DEMO_HISTORY-index)as i64*45_000,"status":"received","source_id":message_id,
@@ -726,8 +745,11 @@ async fn demo_seed(app: &Arc<App>) -> Result<()> {
             // Seed history is imported, not received live: it must be readable in the
             // conversation without becoming replayable realtime events, otherwise every
             // new connection would first replay all of it before reaching "synced".
-            s.insert_silent_history(&mut message)?;
+            history.push(message);
         }
+        // One durable commit keeps demo startup bounded on slow Windows disks without
+        // weakening synchronous=FULL or changing live-message persistence.
+        s.insert_silent_history(&mut history)?;
         Ok(())
     }).await
 }
@@ -740,6 +762,150 @@ mod tests {
     fn message(id: &str) -> ChatMessage {
         serde_json::from_value(json!({"id":id,"group":"g","sender":"测试","text":"你好","timestamp":0,"status":"queued","outgoing":true})).unwrap()
     }
+    #[tokio::test]
+    async fn thumbnail_is_visible_without_receipt_then_full_picture_updates_the_same_message() {
+        let temp = tempfile::tempdir().unwrap();
+        let (app, receiver) = crate::test_app(temp.path());
+        let (task, mut output, mut input) = fixture(app.clone(), receiver).await;
+        let mut events = app.events.subscribe();
+        let preview_path = temp.path().join("preview.png");
+        let full_path = temp.path().join("image.png");
+        // This unit exercises import/receipt bookkeeping, not image decoding.
+        std::fs::write(&preview_path, b"fixture-thumbnail").unwrap();
+        std::fs::write(&full_path, b"fixture-full-picture").unwrap();
+        let attachment = |path: &std::path::Path| {
+            json!({"id":"","kind":"image","name":path.file_name().unwrap().to_string_lossy(),
+            "path":path,"size":std::fs::metadata(path).unwrap().len(),"sha256":""})
+        };
+        let mut original = json!(message("picture"));
+        original["source_id"] = json!("native-picture");
+        original["status"] = json!("received");
+        original["outgoing"] = json!(false);
+        original["media_pending"] = json!(true);
+        original["media"] = json!([attachment(&preview_path)]);
+        emit(&mut output, json!({"type":"message","message":original})).await;
+        recall_barrier(&mut output, &mut events).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(40), input.next())
+                .await
+                .is_err()
+        );
+        let preview = app.store.source("g", "native-picture").unwrap().unwrap();
+        assert!(preview.media_pending);
+        assert_eq!(
+            std::fs::read(&preview.media[0].path).unwrap(),
+            b"fixture-thumbnail"
+        );
+        let head = app.store.event_head().unwrap();
+        emit(&mut output, json!({"type":"message","message":original})).await;
+        recall_barrier(&mut output, &mut events).await;
+        assert_eq!(app.store.event_head().unwrap(), head);
+
+        let mut full = original.clone();
+        full["id"] = json!("new-adapter-id");
+        full["media_pending"] = json!(false);
+        full["media"] = json!([attachment(&full_path)]);
+        emit(&mut output, json!({"type":"message","message":full})).await;
+        assert_eq!(
+            next(&mut input).await,
+            json!({"op":"receipt","group":"g","source_id":"native-picture"})
+        );
+        let complete = app.store.source("g", "native-picture").unwrap().unwrap();
+        assert_eq!(
+            (complete.id.clone(), complete.seq),
+            (preview.id, preview.seq)
+        );
+        assert!(!complete.media_pending);
+        assert_eq!(
+            std::fs::read(&complete.media[0].path).unwrap(),
+            b"fixture-full-picture"
+        );
+        let head = app.store.event_head().unwrap();
+        // A late thumbnail cannot downgrade the completed picture or reimport a missing file.
+        original["media"][0]["path"] = json!(temp.path().join("missing-preview.png"));
+        emit(&mut output, json!({"type":"message","message":original})).await;
+        recall_barrier(&mut output, &mut events).await;
+        assert_eq!(app.store.event_head().unwrap(), head);
+        assert_eq!(
+            app.store
+                .source("g", "native-picture")
+                .unwrap()
+                .unwrap()
+                .media[0]
+                .id,
+            complete.media[0].id
+        );
+        emit(&mut output, json!({"type":"message","message":full})).await;
+        next(&mut input).await;
+        assert_eq!(app.store.event_head().unwrap(), head);
+        app.shutdown.send_replace(true);
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn legacy_placeholder_is_requeued_then_replaced_by_preview_and_full_picture() {
+        let temp = tempfile::tempdir().unwrap();
+        let (app, receiver) = crate::test_app(temp.path());
+        let mut old = message("legacy-blank");
+        old.status = "received".into();
+        old.outgoing = false;
+        old.source_id = "wx:g:fixture:3:30".into();
+        old.media=vec![serde_json::from_value(json!({"id":"blank","kind":"image","name":"placeholder.png",
+            "size":crate::model::LEGACY_IMAGE_PLACEHOLDER_SIZE,"sha256":crate::model::LEGACY_IMAGE_PLACEHOLDER_SHA256,"path":""})).unwrap()];
+        app.store.insert_message(&mut old).unwrap();
+        let (task, mut output, mut input) = fixture(app.clone(), receiver).await;
+        emit(&mut output, json!({"type":"status","ready":true})).await;
+        assert_eq!(
+            next(&mut input).await,
+            json!({"op":"media_refresh","group":"g","source_id":old.source_id})
+        );
+        let mut events = app.events.subscribe();
+        let file = temp.path().join("preview.png");
+        std::fs::write(&file, b"fixture-thumbnail").unwrap();
+        let mut fresh = json!(old);
+        fresh["id"] = json!("new-adapter-id");
+        fresh["media_pending"] = json!(true);
+        fresh["media"] =
+            json!([{"id":"","name":"preview.png","kind":"image","size":17,"sha256":"","path":file}]);
+        emit(
+            &mut output,
+            json!({"type":"message","historical":true,"message":fresh}),
+        )
+        .await;
+        recall_barrier(&mut output, &mut events).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(40), input.next())
+                .await
+                .is_err()
+        );
+        let preview = app.store.message(&old.id).unwrap().unwrap();
+        assert!(preview.media_pending && !preview.has_legacy_image_placeholder());
+        assert_eq!(preview.seq, old.seq);
+        assert!(app.store.legacy_picture_sources().unwrap().is_empty());
+        std::fs::write(&file, b"fixture-full-picture").unwrap();
+        fresh["media_pending"] = json!(false);
+        fresh["media"][0]["name"] = json!("image.png");
+        fresh["media"][0]["size"] = json!(20);
+        emit(
+            &mut output,
+            json!({"type":"message","historical":true,"message":fresh}),
+        )
+        .await;
+        assert_eq!(
+            next(&mut input).await,
+            json!({"op":"receipt","group":"g","source_id":old.source_id})
+        );
+        let full = app.store.message(&old.id).unwrap().unwrap();
+        assert!(!full.media_pending && !full.has_legacy_image_placeholder());
+        assert_eq!(full.seq, old.seq);
+        assert_eq!(
+            std::fs::read(&full.media[0].path).unwrap(),
+            b"fixture-full-picture"
+        );
+        app.shutdown.send_replace(true);
+        task.await.unwrap().unwrap();
+    }
+
     #[tokio::test]
     async fn record_upgrade_queue_is_bounded_and_stops_when_the_group_is_revoked() {
         let temp=tempfile::tempdir().unwrap();

@@ -62,6 +62,44 @@ fn reencoded_record_images_require_the_complete_same_request_cdn_receipt() {
 }
 
 #[test]
+fn completed_picture_receipt_accepts_canonical_alias_only_for_the_expected_private_file() {
+    let temp = tempfile::tempdir().unwrap();
+    let folder = temp.path().join("downloads");
+    fs::create_dir(&folder).unwrap();
+    let partial = folder.join("download.part");
+    let bytes = sample_png();
+    fs::write(&partial, &bytes).unwrap();
+    let resource = DownloadResource {
+        kind: "image",
+        file_id: "a".repeat(194),
+        aes: "b".repeat(32),
+        length: 99,
+        md5: "c".repeat(32),
+    };
+    let id = download_id("g", "alias-image", &resource);
+    // The existing parent component resolves to the same file, but cannot pass
+    // the lexical comparison. This exercises the canonical fallback on every OS.
+    let alias = folder.join("../downloads/download.part");
+    assert_ne!(absolute_comparable(&alias), absolute_comparable(&partial));
+    let receipt = json!({"ret":0,"status":"complete","request_id":id,
+        "path":alias,"size":bytes.len(),"md5":picture::md5(&bytes)});
+    assert_eq!(
+        completed_download(&receipt, &folder, &partial, &id, &resource, true)
+            .unwrap()
+            .unwrap(),
+        partial.canonicalize().unwrap(),
+    );
+    // Identical bytes alone cannot authorize another path, even inside the cache.
+    for other in [folder.join("other.part"), temp.path().join("outside.part")] {
+        fs::write(&other, &bytes).unwrap();
+        let mut receipt = receipt.clone();
+        receipt["path"] = json!(other);
+        assert!(completed_download(&receipt, &folder, &partial, &id, &resource, true).is_err());
+    }
+    assert_eq!(fs::read(&partial).unwrap(), bytes);
+}
+
+#[test]
 fn record_attachment_cache_is_bound_to_resource_and_detects_modified_bytes() {
     let temp = tempfile::tempdir().unwrap();
     let mut media = Media::new(temp.path().join("adapter"));
@@ -149,6 +187,440 @@ fn inbound_downloaded_originals_do_not_require_a_wechat_cache_or_image_key() {
         let actual = media.inbound(&mut db, group, &row, kind).unwrap();
         assert_eq!(fs::read(actual["path"].as_str().unwrap()).unwrap(), bytes);
         assert!(media.image_key.is_none() && !media.downloads.is_alive());
+    }
+}
+
+#[test]
+fn received_standard_picture_downloads_without_a_local_wechat_picture_cache() {
+    let root = tempfile::tempdir().unwrap();
+    let mut db = Db::media_fixture(
+        root.path().join("account"),
+        "wxid_offline_self",
+        None,
+        Default::default(),
+    );
+    let mut media = Media::new(root.path().join("adapter"));
+    let bytes = sample_png();
+    let digest = picture::md5(&bytes);
+    let resource = DownloadResource {
+        kind: "image_mid",
+        file_id: "a".repeat(194),
+        aes: "b".repeat(32),
+        length: bytes.len() as u64,
+        md5: digest.clone(),
+    };
+    let group = "123456@chatroom";
+    let row = json!({"local_id":1,"sort_seq":1,"shard":"offline","packed_info":[],
+        "sender_id":7,"sender_username":"wxid_other_member",
+        "content":format!("<msg><img cdnbigimgurl='' hdlength='0' cdnmidimgurl='{}' aeskey='{}' length='{}' md5='{digest}'/></msg>",
+            resource.file_id, resource.aes, bytes.len())});
+    // Seed only the adapter-owned CDN result, never WeChat's local picture cache.
+    let folder = media.directory.join("feishu/media/wechat-download");
+    fs::create_dir_all(&folder).unwrap();
+    let partial = folder.join(format!(
+        "{}.part",
+        download_id(group, &message_key(group, &row), &resource)
+    ));
+    fs::write(&partial, &bytes).unwrap();
+    let actual = media.inbound(&mut db, group, &row, "image").unwrap();
+    assert_eq!(actual["kind"], "image");
+    assert_eq!(fs::read(actual["path"].as_str().unwrap()).unwrap(), bytes);
+    assert!(!db.account_dir.join("msg/attach").exists());
+    assert!(media.image_key.is_none() && !media.downloads.is_alive());
+
+    // Strict mode still requires the declared resource size and digest.
+    let receipt = json!({"ret":0,"status":"complete","request_id":download_id(group,"fixture",&resource),
+        "path":partial,"size":bytes.len(),"md5":digest});
+    assert!(
+        completed_download(
+            &receipt,
+            &folder,
+            &partial,
+            &download_id(group, "fixture", &resource),
+            &resource,
+            false
+        )
+        .unwrap()
+        .is_some()
+    );
+    let mut changed = DownloadResource {
+        length: resource.length + 1,
+        ..resource
+    };
+    let id = download_id(group, "fixture", &changed);
+    let mut wrong_size = receipt.clone();
+    wrong_size["request_id"] = json!(id);
+    assert!(completed_download(&wrong_size, &folder, &partial, &id, &changed, false).is_err());
+    changed.length -= 1;
+    changed.md5 = "c".repeat(32);
+    let id = download_id(group, "fixture", &changed);
+    let mut wrong_digest = receipt;
+    wrong_digest["request_id"] = json!(id);
+    assert!(completed_download(&wrong_digest, &folder, &partial, &id, &changed, false).is_err());
+}
+
+#[test]
+fn ordinary_reencoded_pictures_require_a_complete_resource_bound_receipt_and_decodable_bytes() {
+    for kind in ["image", "image_mid"] {
+        for failure in [
+            "",
+            "no-receipt",
+            "unfinished",
+            "foreign-request",
+            "wrong-checksum",
+            "invalid-image",
+            "footer-png",
+            "footer-jpeg",
+            "truncated-image",
+            "excess-footer",
+            "corrupt-body-with-footer",
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let mut db = Db::media_fixture(
+                root.path().join("account"),
+                "fixture-self",
+                None,
+                Default::default(),
+            );
+            let mut media = Media::new(root.path().join("adapter"));
+            let group = "123456@chatroom";
+            let resource = DownloadResource {
+                kind,
+                file_id: "a".repeat(194),
+                aes: "b".repeat(32),
+                length: 999,
+                md5: "c".repeat(32),
+            };
+            let (url, length) = if kind == "image" {
+                ("cdnbigimgurl", "hdlength")
+            } else {
+                ("cdnmidimgurl", "length")
+            };
+            let row = json!({"local_id":1,"sort_seq":1,"shard":"offline","packed_info":[],
+                "content":format!("<msg><img {url}='{}' {length}='999' aeskey='{}' md5='{}'/></msg>",resource.file_id,resource.aes,resource.md5)});
+            let id = download_id(group, &message_key(group, &row), &resource);
+            let folder = media.directory.join("feishu/media/wechat-download");
+            fs::create_dir_all(&folder).unwrap();
+            let partial = folder.join(format!("{id}.part"));
+            let mut original = sample_png();
+            if failure == "footer-jpeg" {
+                let mut out = Cursor::new(Vec::new());
+                DynamicImage::new_rgb8(16, 12)
+                    .write_to(&mut out, ImageFormat::Jpeg)
+                    .unwrap();
+                original = out.into_inner();
+            }
+            let mut bytes = if failure == "invalid-image" {
+                b"not a decodable picture".to_vec()
+            } else {
+                original.clone()
+            };
+            if failure == "truncated-image" {
+                bytes.truncate(bytes.len() - 4);
+            }
+            if failure == "corrupt-body-with-footer" {
+                let body = bytes.windows(4).position(|part| part == b"IDAT").unwrap() + 4;
+                bytes[body] ^= 0xff;
+            }
+            let footer = match failure {
+                "footer-png" => 24,
+                "footer-jpeg" => 32,
+                "excess-footer" => 33,
+                "truncated-image" => 16,
+                "corrupt-body-with-footer" => 24,
+                _ => 0,
+            };
+            bytes.extend(std::iter::repeat_n(7, footer));
+            fs::write(&partial, &bytes).unwrap();
+            let mut receipt = json!({"ret":0,"status":"complete","request_id":id,"path":partial,"size":bytes.len(),"md5":picture::md5(&bytes)});
+            if failure == "unfinished" {
+                receipt["status"] = json!("downloading");
+            }
+            if failure == "foreign-request" {
+                receipt["request_id"] = json!("unrelated");
+            }
+            if failure == "wrong-checksum" {
+                receipt["md5"] = json!("d".repeat(32));
+            }
+            if failure != "no-receipt" {
+                fs::write(
+                    folder.join(format!("{id}.complete.json")),
+                    serde_json::to_vec(&receipt).unwrap(),
+                )
+                .unwrap();
+            }
+            let result = media.inbound(&mut db, group, &row, "image");
+            if matches!(failure, "" | "footer-png" | "footer-jpeg") {
+                let full = result.unwrap();
+                assert_eq!(full["preview"], false);
+                assert_eq!(
+                    full["name"],
+                    if failure == "footer-jpeg" {
+                        "image.jpg"
+                    } else {
+                        "image.png"
+                    }
+                );
+                assert_eq!(fs::read(full["path"].as_str().unwrap()).unwrap(), original);
+                // Normalize only the delivered copy, after receipt verification.
+                assert_eq!(fs::read(&partial).unwrap(), bytes);
+            } else {
+                let error = result.unwrap_err();
+                assert!(error.is::<MediaPending>(), "{kind}: {failure}");
+                if matches!(
+                    failure,
+                    "truncated-image" | "excess-footer" | "corrupt-body-with-footer"
+                ) {
+                    let diagnostic = error.to_string();
+                    assert!(diagnostic.contains("已校验的微信 CDN 图片无法完整解码"));
+                    assert!(diagnostic.contains("format=png bytes="));
+                    assert!(!diagnostic.contains(&resource.aes));
+                    assert!(!diagnostic.contains(&resource.file_id));
+                    if failure == "excess-footer" {
+                        assert!(diagnostic.contains("end-marker-trailing=33"));
+                    } else if failure == "truncated-image" {
+                        assert!(diagnostic.contains("end-marker=missing"));
+                    }
+                }
+            }
+            assert!(!media.downloads.is_alive());
+            assert!(
+                !media
+                    .cache_dir(&message_key(group, &row))
+                    .unwrap()
+                    .join("placeholder.png")
+                    .exists()
+            );
+        }
+    }
+}
+
+#[test]
+fn record_picture_footer_is_normalized_after_verifying_the_original_download() {
+    let root = tempfile::tempdir().unwrap();
+    let mut media = Media::new(root.path().join("adapter"));
+    let original = sample_png();
+    let mut bytes = original.clone();
+    bytes.extend_from_slice(&[7; 24]);
+    let item = crate::records::Attachment {
+        kind: "image",
+        file_id: "a".repeat(194),
+        aes: "b".repeat(32),
+        length: original.len() as u64,
+        md5: picture::md5(&original),
+        name: "photo.png".into(),
+    };
+    let resource = DownloadResource {
+        kind: item.kind,
+        file_id: item.file_id.clone(),
+        aes: item.aes.clone(),
+        length: item.length,
+        md5: item.md5.clone(),
+    };
+    let id = download_id("g", "record-footer", &resource);
+    let folder = media.directory.join("feishu/media/wechat-download");
+    fs::create_dir_all(&folder).unwrap();
+    let partial = folder.join(format!("{id}.part"));
+    fs::write(&partial, &bytes).unwrap();
+    // The message describes the unpadded image. Only the same-request receipt
+    // can authorize these different download bytes before normalization.
+    assert!(media.record_attachment("g", "record-footer", &item).is_err());
+    let receipt = json!({"ret":0,"status":"complete","request_id":id,"path":partial,
+        "size":bytes.len(),"md5":picture::md5(&bytes)});
+    fs::write(
+        folder.join(format!("{id}.complete.json")),
+        serde_json::to_vec(&receipt).unwrap(),
+    )
+    .unwrap();
+    let full = media.record_attachment("g", "record-footer", &item).unwrap();
+    assert_eq!(fs::read(full["path"].as_str().unwrap()).unwrap(), original);
+    assert_eq!(fs::read(&partial).unwrap(), bytes);
+    assert_eq!(
+        media.record_attachment("g", "record-footer", &item).unwrap(),
+        full
+    );
+    assert!(!media.downloads.is_alive());
+}
+
+#[test]
+fn corrupt_local_picture_and_legacy_blank_cache_remain_pending_instead_of_delivering_gray() {
+    let root = tempfile::tempdir().unwrap();
+    let mut db = Db::media_fixture(
+        root.path().join("account"),
+        "fixture-self",
+        None,
+        Default::default(),
+    );
+    let mut media = Media::new(root.path().join("adapter"));
+    let group = "123456@chatroom";
+    let digest = "d".repeat(32);
+    let row = json!({"local_id":1,"sort_seq":1,"shard":"offline","packed_info":[],"content":format!("<msg><img md5='{digest}'/></msg>")});
+    let folder = db
+        .account_dir
+        .join("msg/attach")
+        .join(picture::md5(group.as_bytes()));
+    fs::create_dir_all(&folder).unwrap();
+    fs::write(folder.join(format!("{digest}.dat")), b"corrupt picture").unwrap();
+    let cache = media.cache_dir(&message_key(group, &row)).unwrap();
+    fs::write(cache.join("image.png"), PLACEHOLDER_PNG).unwrap();
+    assert!(
+        media
+            .inbound(&mut db, group, &row, "image")
+            .unwrap_err()
+            .is::<MediaPending>()
+    );
+    assert!(!cache.join("placeholder.png").exists());
+    assert_eq!(PLACEHOLDER_PNG.len(), 691);
+    assert_eq!(
+        sha256(PLACEHOLDER_PNG),
+        "ea1e8edd73b84213a88451e1cbe5eb084851a656b4879d749ac2c56a5ab72760"
+    );
+}
+
+#[test]
+fn thumbnail_only_picture_is_delivered_then_upgraded_without_caching_it_as_full() {
+    let root = tempfile::tempdir().unwrap();
+    let account = root.path().join("account");
+    let mut db = Db::media_fixture(account.clone(), "wxid_offline", None, Default::default());
+    let mut media = Media::new(root.path().join("adapter"));
+    let group = "123456@chatroom";
+    let bytes = sample_png();
+    assert!(
+        bytes.len() < 512,
+        "small thumbnails must not be filtered by file size"
+    );
+    let digest = picture::md5(&bytes);
+    let folder = account
+        .join("msg/attach")
+        .join(picture::md5(group.as_bytes()))
+        .join("2026-11/Img");
+    fs::create_dir_all(&folder).unwrap();
+    let thumbnail = folder.join(format!("{digest}_t.dat"));
+    fs::write(
+        &thumbnail,
+        bytes.iter().map(|b| b ^ 0x88).collect::<Vec<_>>(),
+    )
+    .unwrap();
+    let row = json!({"local_id":1,"sort_seq":1,"shard":"offline","packed_info":[],
+        "content":format!("<msg><img cdnbigimgurl='{}' aeskey='{}' md5='{digest}'/></msg>", "a".repeat(194), "b".repeat(32))});
+    let preview = media.inbound(&mut db, group, &row, "image").unwrap();
+    assert_eq!(preview["kind"], "image");
+    assert_eq!(preview["preview"], true);
+    assert_eq!(preview["name"], "preview.png");
+    assert_eq!(fs::read(preview["path"].as_str().unwrap()).unwrap(), bytes);
+    assert!(cached_picture(&media.cache_dir(&message_key(group, &row)).unwrap()).is_none());
+    assert!(media.image_key.is_none() && !media.downloads.is_alive());
+
+    // Restarting and the source thumbnail disappearing must not erase the preview.
+    fs::rename(&thumbnail, root.path().join("retained-thumbnail.dat")).unwrap();
+    let mut media = Media::new(root.path().join("adapter"));
+    assert_eq!(
+        media.inbound(&mut db, group, &row, "image").unwrap(),
+        preview
+    );
+    // The complete picture then becomes available and must replace the preview.
+    fs::write(folder.join(format!("{digest}.dat")), &bytes).unwrap();
+    let complete = media.inbound(&mut db, group, &row, "image").unwrap();
+    assert_eq!(complete["preview"], false);
+    assert_eq!(complete["name"], "image.png");
+    assert_eq!(fs::read(complete["path"].as_str().unwrap()).unwrap(), bytes);
+}
+
+#[test]
+fn thumbnail_fallback_survives_a_corrupt_full_image_but_rejects_bad_or_unrelated_previews() {
+    let root = tempfile::tempdir().unwrap();
+    let account = root.path().join("account");
+    let mut db = Db::media_fixture(account.clone(), "wxid_offline", None, Default::default());
+    let group = "123456@chatroom";
+    let bytes = sample_png();
+    let digest = picture::md5(&bytes);
+    let folder = account
+        .join("msg/attach")
+        .join(picture::md5(group.as_bytes()))
+        .join("2026-11/Img");
+    fs::create_dir_all(&folder).unwrap();
+    let row = json!({"local_id":1,"sort_seq":1,"shard":"offline","packed_info":digest.as_bytes(),
+        "content":format!("<msg><img md5='{digest}'/></msg>")});
+    fs::write(folder.join(format!("{digest}.dat")), b"corrupt full image").unwrap();
+    fs::write(folder.join(format!("{digest}_t.dat")), &bytes).unwrap();
+    let mut media = Media::new(root.path().join("adapter-valid"));
+    assert_eq!(
+        media.inbound(&mut db, group, &row, "image").unwrap()["preview"],
+        true
+    );
+
+    // A different message's valid thumbnail cannot be substituted.
+    let missing = "d".repeat(32);
+    let mut other = row;
+    other["packed_info"] = json!(missing.as_bytes());
+    other["content"] = json!(format!("<msg><img md5='{missing}'/></msg>"));
+    fs::write(
+        folder.join(format!("{missing}_t.dat")),
+        &bytes[..bytes.len() / 2],
+    )
+    .unwrap();
+    let mut media = Media::new(root.path().join("adapter-invalid"));
+    assert!(
+        media
+            .inbound(&mut db, group, &other, "image")
+            .unwrap_err()
+            .is::<MediaPending>()
+    );
+    assert!(media.image_key.is_none() && !media.downloads.is_alive());
+}
+
+#[test]
+fn picture_parameter_diagnostics_do_not_expose_xml_keys_or_resource_ids() {
+    let secret = "b".repeat(32);
+    let resource = "a".repeat(194);
+    let xml = format!(
+        "<msg><img cdnbigimgurl='{resource}' aeskey='{secret}' md5='{}' hdlength='0'/></msg>",
+        "c".repeat(32)
+    );
+    let message = format!("{:#}", image_resource(&xml).err().unwrap());
+    assert!(message.contains("原图：资源编号有效=true 大小有效=false AES有效=true MD5有效=true"));
+    for private in [&secret, &resource, &"c".repeat(32)] {
+        assert!(!message.contains(private));
+    }
+    let malformed = format!("<msg {secret}");
+    assert!(!format!("{:#}", image_resource(&malformed).err().unwrap()).contains(&secret));
+}
+
+#[test]
+fn picture_resources_keep_original_and_standard_fields_paired_and_never_use_thumbnails() {
+    let original = "a".repeat(194);
+    let standard = "b".repeat(194);
+    let aes = "c".repeat(32);
+    let digest = "d".repeat(32);
+    let xml = format!(
+        "<msg><img cdnbigimgurl='{original}' hdlength='1000' cdnmidimgurl='{standard}' length='500' aeskey='{aes}' md5='{digest}'/></msg>"
+    );
+    let resource = image_resource(&xml).unwrap();
+    assert_eq!(
+        (resource.kind, resource.file_id.as_str(), resource.length),
+        ("image", original.as_str(), 1000)
+    );
+    let resource = image_resource(&xml.replace("hdlength='1000'", "hdlength='0'")).unwrap();
+    assert_eq!(
+        (resource.kind, resource.file_id.as_str(), resource.length),
+        ("image_mid", standard.as_str(), 500)
+    );
+    for attrs in [
+        format!("cdnbigimgurl='{original}' length='500'"),
+        format!("cdnmidimgurl='{standard}' hdlength='1000'"),
+        format!("cdnthumburl='{standard}' cdnthumblength='500' cdnthumbaeskey='{aes}'"),
+        format!("cdnmidimgurl='{standard}' length='0'"),
+        format!("cdnmidimgurl='invalid' length='500'"),
+    ] {
+        assert!(
+            image_resource(&format!(
+                "<msg><img {attrs} aeskey='{aes}' md5='{digest}'/></msg>"
+            ))
+            .is_err()
+        );
+    }
+    for (from, to) in [(aes.as_str(), "invalid"), (digest.as_str(), "invalid")] {
+        assert!(image_resource(&xml.replace(from, to)).is_err());
     }
 }
 

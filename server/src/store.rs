@@ -494,9 +494,16 @@ impl Store {
 
     /// Seed history that no client should ever receive as a live event. Demo mode writes its
     /// backlog before anyone connects, so notifying would only make every new client replay
-    /// hundreds of rows before it reaches "synced".
-    pub fn insert_silent_history(&self, message: &mut ChatMessage) -> Result<Option<Value>> {
-        self.insert_message_kind(message, true, false)
+    /// hundreds of rows before it reaches "synced". Commit the whole batch atomically so
+    /// startup does not require a separate durable disk flush for every row.
+    pub fn insert_silent_history(&self, messages: &mut [ChatMessage]) -> Result<()> {
+        let mut conn = self.db.lock().unwrap();
+        let tx = conn.transaction()?;
+        for message in messages {
+            Self::insert_message_tx(&tx, message, true, false)?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     fn insert_message_kind(
@@ -507,6 +514,17 @@ impl Store {
     ) -> Result<Option<Value>> {
         let mut conn = self.db.lock().unwrap();
         let tx = conn.transaction()?;
+        let event = Self::insert_message_tx(&tx, message, historical, notify)?;
+        tx.commit()?;
+        Ok(event)
+    }
+
+    fn insert_message_tx(
+        tx: &rusqlite::Transaction<'_>,
+        message: &mut ChatMessage,
+        historical: bool,
+        notify: bool,
+    ) -> Result<Option<Value>> {
         let existing: Option<String> = tx.query_row("SELECT body FROM messages WHERE id=?1 OR (source_id!='' AND group_id=?2 AND source_id=?3)",
             params![message.id, message.group, message.source_id], |r| r.get(0)).optional()?;
         if let Some(body) = existing {
@@ -571,7 +589,7 @@ impl Store {
             )?;
         }
         if notify {
-            let mut created = Self::append_event(&tx, message, true)?;
+            let mut created = Self::append_event(tx, message, true)?;
             if historical {
                 created["historical"] = json!(true);
                 tx.execute(
@@ -587,7 +605,6 @@ impl Store {
                 params![message.group, message.source_id],
             )?;
         }
-        tx.commit()?;
         Ok(event)
     }
 
@@ -667,7 +684,7 @@ impl Store {
         Ok(Some(event))
     }
 
-    pub fn enrich_native_record(
+    pub fn enrich_native_message(
         &self,
         incoming: &ChatMessage,
         historical: bool,
@@ -680,22 +697,33 @@ impl Store {
             |r| r.get(0),
         )?;
         let mut message: ChatMessage = serde_json::from_str(&body)?;
+        let picture_upgrade = (message.media_pending && !incoming.media_pending
+            || message.has_legacy_image_placeholder())
+            && !incoming.has_legacy_image_placeholder()
+            && message.record.is_none()
+            && incoming.record.is_none()
+            && message.media.len() == 1
+            && message.media[0].kind == "image"
+            && incoming.media.len() == 1
+            && incoming.media[0].kind == "image";
         if message.status == "recalled"
             || !message.client_id.is_empty()
             || !message.recall_status.is_empty()
             || message.group != incoming.group
             || message.source_id != incoming.source_id
-            || incoming.record.is_none()
+            || (incoming.record.is_none() && !picture_upgrade)
         {
             return Ok(None);
         }
         if message.record == incoming.record
+            && message.media_pending == incoming.media_pending
             && serde_json::to_value(&message.media)? == serde_json::to_value(&incoming.media)?
         {
             return Ok(None);
         }
         message.record = incoming.record.clone();
         message.media = incoming.media.clone();
+        message.media_pending = incoming.media_pending;
         message.text = incoming.text.clone();
         tx.execute(
             "UPDATE messages SET body=?1 WHERE id=?2",
@@ -860,6 +888,29 @@ impl Store {
              AND coalesce(json_array_length(item.value,'$.media'),0)=0)) ORDER BY seq",
         )?;
         Ok(stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn legacy_picture_sources(&self) -> Result<Vec<(String, String)>> {
+        let conn = self.db.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT group_id,source_id FROM messages WHERE source_id LIKE 'wx:%'
+             AND status='received' AND coalesce(json_extract(body,'$.client_id'),'')=''
+             AND coalesce(json_extract(body,'$.recall_status'),'')=''
+             AND coalesce(json_type(body,'$.record'),'null')='null'
+             AND json_array_length(body,'$.media')=1
+             AND json_extract(body,'$.media[0].kind')='image'
+             AND json_extract(body,'$.media[0].size')=?1
+             AND json_extract(body,'$.media[0].sha256')=?2 ORDER BY seq",
+        )?;
+        Ok(stmt
+            .query_map(
+                params![
+                    crate::model::LEGACY_IMAGE_PLACEHOLDER_SIZE as i64,
+                    crate::model::LEGACY_IMAGE_PLACEHOLDER_SHA256
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?
             .collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
@@ -1186,6 +1237,47 @@ pub fn check_recall(message: &ChatMessage, now: i64) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn silent_history_batch_is_durable_idempotent_and_rolls_back_on_conflict() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("history.sqlite");
+        let store = Store::open(&path).unwrap();
+        let received = |id: &str| -> ChatMessage {
+            serde_json::from_value(json!({"id":id,"group":"g","sender":"fixture",
+                "text":id,"source_id":id,"status":"received","timestamp":1}))
+                .unwrap()
+        };
+        let mut messages = [received("one"), received("two")];
+        store.insert_silent_history(&mut messages).unwrap();
+        let sequences = messages.each_ref().map(|message| message.seq);
+        assert!(sequences[0] > 0 && sequences[1] > sequences[0]);
+        let mut repeated = [received("one"), received("two")];
+        store.insert_silent_history(&mut repeated).unwrap();
+        assert_eq!(repeated.each_ref().map(|message| message.seq), sequences);
+        let mut conflict = received("one");
+        conflict.text = "changed".into();
+        assert!(
+            store
+                .insert_silent_history(&mut [received("rolled-back"), conflict])
+                .is_err()
+        );
+        drop(store);
+
+        let reopened = Store::open(&path).unwrap();
+        assert_eq!(reopened.message("one").unwrap().unwrap().seq, sequences[0]);
+        assert_eq!(reopened.message("two").unwrap().unwrap().seq, sequences[1]);
+        assert!(reopened.message("rolled-back").unwrap().is_none());
+        assert!(reopened.events(0).unwrap().is_empty());
+        let imported: i64 = reopened
+            .db
+            .lock()
+            .unwrap()
+            .query_row("SELECT count(*) FROM history_imports", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(imported, 2);
+    }
+
     fn client(id: &str, token: &str, remember: bool) -> ClientRecord {
         ClientRecord {
             access: crate::access::ClientAccess {
@@ -1347,6 +1439,121 @@ mod tests {
     fn message(id: &str) -> ChatMessage {
         serde_json::from_value(json!({"id":id,"group":"g","sender":"小林","text":"你好","timestamp":0,"status":"queued"})).unwrap()
     }
+    #[test]
+    fn picture_upgrade_preserves_identity_and_rejects_completed_recalled_or_foreign_messages() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(&temp.path().join("fixture.sqlite")).unwrap();
+        for case in [
+            "pending",
+            "same-bytes",
+            "complete",
+            "recalled",
+            "recalling",
+            "client",
+            "group",
+            "source",
+            "kind",
+        ] {
+            let mut original = message(case);
+            original.status = if case == "recalled" {
+                "recalled"
+            } else {
+                "received"
+            }
+            .into();
+            original.source_id = format!("native-{case}");
+            original.media_pending = case != "complete";
+            if case == "recalling" {
+                original.recall_status = "pending".into();
+            }
+            if case == "client" {
+                original.client_id = "fixture-client".into();
+            }
+            original.media = vec![serde_json::from_value(json!({"id":"preview","kind":"image","name":"preview.png","size":1,"sha256":"a","path":""})).unwrap()];
+            store.insert_message(&mut original).unwrap();
+            let mut incoming = original.clone();
+            incoming.media_pending = false;
+            if case != "same-bytes" {
+                incoming.media[0].id = "full".into();
+            }
+            if case == "group" {
+                incoming.group = "other".into();
+            }
+            if case == "source" {
+                incoming.source_id = "other".into();
+            }
+            if case == "kind" {
+                incoming.media[0].kind = "file".into();
+            }
+            let event = store.enrich_native_message(&incoming, true).unwrap();
+            let stored = store.message(case).unwrap().unwrap();
+            assert_eq!(
+                (stored.id.as_str(), stored.seq),
+                (original.id.as_str(), original.seq)
+            );
+            if ["pending", "same-bytes"].contains(&case) {
+                assert_eq!(event.unwrap()["historical"], true);
+                assert!(!stored.media_pending);
+                assert!(
+                    store
+                        .enrich_native_message(&incoming, true)
+                        .unwrap()
+                        .is_none()
+                );
+            } else {
+                assert!(event.is_none(), "{case}");
+                assert_eq!(
+                    serde_json::to_value(stored).unwrap(),
+                    serde_json::to_value(original).unwrap()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_picture_repair_requires_exact_blank_fingerprint_and_unmodified_native_ownership() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(&temp.path().join("fixture.sqlite")).unwrap();
+        for case in [
+            "blank",
+            "wrong-hash",
+            "wrong-size",
+            "recalled",
+            "recalling",
+            "client",
+        ] {
+            let mut old = message(case);
+            old.source_id = format!("wx:g:fixture:{}:1", case);
+            old.status = if case == "recalled" {
+                "recalled"
+            } else {
+                "received"
+            }
+            .into();
+            old.media=vec![serde_json::from_value(json!({"id":"blank","kind":"image","name":"placeholder.png",
+                "size":crate::model::LEGACY_IMAGE_PLACEHOLDER_SIZE,"sha256":crate::model::LEGACY_IMAGE_PLACEHOLDER_SHA256,"path":""})).unwrap()];
+            if case == "wrong-hash" {
+                old.media[0].sha256 = "different".into();
+            }
+            if case == "wrong-size" {
+                old.media[0].size += 1;
+            }
+            if case == "recalling" {
+                old.recall_status = "pending".into();
+            }
+            if case == "client" {
+                old.client_id = "fixture-client".into();
+            }
+            store.insert_message(&mut old).unwrap();
+            let mut fresh = old.clone();
+            fresh.media_pending = true;
+            fresh.media[0].sha256 = "real-preview".into();
+            let upgraded = store.enrich_native_message(&fresh, true).unwrap();
+            assert_eq!(upgraded.is_some(), case == "blank", "{case}");
+        }
+        assert!(store.legacy_picture_sources().unwrap().is_empty());
+    }
+
     #[test]
     fn record_upgrade_candidates_include_failed_attachments_and_exclude_protected_messages() {
         let temp=tempfile::tempdir().unwrap();

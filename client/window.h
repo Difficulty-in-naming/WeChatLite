@@ -189,6 +189,7 @@ class Window : public QMainWindow
     QToolButton *bannerAction = nullptr;
     QToolButton *bannerRetrySettings = nullptr;
     bool bannerError = false;
+    QString bannerMediaGroup, bannerMediaSource;
     bool positioningBanner = false;
     QPushButton *sendButton = nullptr, *historyButton = nullptr, *announcementButton = nullptr,
                 *preferencesButton = nullptr;

@@ -326,6 +326,43 @@ fn group_with_rows(group: &str, rows: &[(i64, i64, i64, &str)]) -> (TempDir, Loc
 }
 
 #[test]
+fn received_thumbnail_sets_message_pending_until_the_full_picture_is_available() {
+    let digest = "d".repeat(32);
+    let content = format!("<msg><img md5='{digest}'/></msg>");
+    let (temp, mut access, _) = group_with_rows(RECALL_GROUP, &[(3, 3, 42, &content)]);
+    let mut png = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::new_rgb8(2, 2)
+        .write_to(&mut png, image::ImageFormat::Png)
+        .unwrap();
+    let png = png.into_inner();
+    let folder = access
+        .db
+        .account_dir
+        .join("msg/attach")
+        .join(format!("{:x}", Md5::digest(RECALL_GROUP.as_bytes())))
+        .join("2026-11/Img");
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::write(folder.join(format!("{digest}_t.dat")), &png).unwrap();
+    let row = access
+        .db
+        .reload(
+            RECALL_GROUP,
+            &json!({"local_id":3,"sort_seq":30,"shard":"message__message_0.db"}),
+        )
+        .unwrap();
+    let preview = access.convert(RECALL_GROUP, &row).unwrap().unwrap();
+    assert_eq!(preview["media_pending"], true);
+    assert_eq!(preview["media"][0]["name"], "preview.png");
+    std::fs::write(folder.join(format!("{digest}.dat")), png).unwrap();
+    let full = access.convert(RECALL_GROUP, &row).unwrap().unwrap();
+    assert_ne!(full["media_pending"], true);
+    assert_eq!(full["media"][0]["name"], "image.png");
+    assert_eq!(full["id"], preview["id"]);
+    assert_eq!(full["source_id"], preview["source_id"]);
+    assert!(access.native.pid.is_none() && !temp.path().join("native").exists());
+}
+
+#[test]
 fn received_image_quote_uses_a_label_and_real_source_even_before_media_is_cached() {
     let (temp, mut access, table) = recall_db_fixture();
     let mut png = std::io::Cursor::new(Vec::new());

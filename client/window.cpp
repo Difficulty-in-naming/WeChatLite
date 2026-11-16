@@ -2492,10 +2492,28 @@ void Window::handleEvent(const QJsonObject &event)
     else if (type == "members" && event["group"] == groupId)
         loadMembers();
     else if (type == "warning")
+    {
         notify(event["text"].toString(), true);
+        if (event["code"] == "inbound_media" && !event["text"].toString().trimmed().isEmpty())
+        {
+            bannerMediaGroup = event["group"].toString();
+            bannerMediaSource = event["source_id"].toString();
+        }
+    }
     else if (type == "message")
     {
         auto message = localFiles->hydrate(event["message"].toObject(), groupId);
+        // A thumbnail or incomplete record is still waiting. Match both source
+        // and group so another picture's success cannot dismiss this warning.
+        if (!bannerMediaSource.isEmpty() && message["group"] == bannerMediaGroup &&
+            message["source_id"] == bannerMediaSource && message["status"] == "received" &&
+            !message["media_pending"].toBool() &&
+            !message["record"].toObject()["pending"].toBool())
+        {
+            if (lastError.left(600) == bannerLabel->text())
+                lastError.clear();
+            hideBanner();
+        }
         if (forwardDialog && message["group"] == groupId && message["id"] == forwardMessage["id"])
         {
             forwardMessage=message;
@@ -3414,6 +3432,9 @@ void Window::showBanner(const QString &text, bool error, const QString &action,
     // of repainting it, and never let a routine notice replace a connection error.
     if (bannerError && !error)
         return;
+    // A replacement (including an identical unkeyed error) owns the banner now.
+    bannerMediaGroup.clear();
+    bannerMediaSource.clear();
     if (banner->isVisible() && bannerLabel->text() == message &&
         bannerAction->property("action").toString() == action)
         return;
@@ -3437,6 +3458,8 @@ void Window::showBanner(const QString &text, bool error, const QString &action,
 
 void Window::hideBanner()
 {
+    bannerMediaGroup.clear();
+    bannerMediaSource.clear();
     if (!banner)
         return;
     banner->hide();

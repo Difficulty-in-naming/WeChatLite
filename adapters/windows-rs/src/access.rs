@@ -345,6 +345,9 @@ impl Backend for Local {
         let timestamp = timestamp(&row["create_time"])?;
         let source_id = source(group, row)?;
         let mut message = json!({"id":Uuid::new_v5(&Uuid::NAMESPACE_URL,source_id.as_bytes()).to_string(),"group":group,"sender":name,"sender_id":actor,"avatar":self.avatar(&actor),"text":body,"media":media,"mentions":mentions,"timestamp":timestamp,"status":"received","source_id":source_id,"outgoing":if actor.is_empty(){row["sender_id"]==2}else{actor==self.db.wxid}});
+        if media.iter().any(|item| item["preview"] == true) {
+            message["media_pending"] = json!(true);
+        }
         if crate::records::is_record(&content) {
             match crate::records::parse(&content, &source_id, timestamp, |key, resource| {
                 self.media.record_attachment(group, key, resource)

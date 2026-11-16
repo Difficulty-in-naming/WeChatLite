@@ -44,6 +44,7 @@ async fn main() -> std::process::ExitCode {
         };
     }
     let cases:Vec<Case>=vec![
+        case!(demo::startup_seeds_history_without_live_replay),
         case!(demo::access_key_is_required_for_messages_and_files),
         case!(demo::two_clients_receive_identical_confirmed_message),
         case!(demo::retry_is_idempotent_but_changed_content_is_rejected),

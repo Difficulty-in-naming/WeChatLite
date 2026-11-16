@@ -414,6 +414,17 @@ fn media_retry_delay(locator: &mut Value, now: f64, error: Option<&anyhow::Error
     }
 }
 
+fn media_warning_due(locator: &Value, now: f64) -> bool {
+    locator["_media_wait_since"]
+        .as_f64()
+        .is_some_and(|since| since.is_finite() && now - since >= 30.0)
+}
+
+fn media_warning(group: &str, key: &str, error: &anyhow::Error) -> Value {
+    json!({"type":"warning","code":"inbound_media","group":group,"source_id":key,
+        "text":format!("微信附件暂未就绪，将保留并重试：{error}")})
+}
+
 fn history_page<A: Backend>(
     access: &mut A,
     store: &Receipts,
@@ -489,8 +500,8 @@ fn history_page<A: Backend>(
         }
         let delay = match access.convert(group, row) {
             Ok(Some(message)) => {
-                let waiting = (message["record"]["pending"] == true).then(|| {
-                    anyhow::Error::new(crate::media::MediaPending("聊天记录附件下载中".into()))
+                let waiting = (message["record"]["pending"] == true || message["media_pending"] == true).then(|| {
+                    anyhow::Error::new(crate::media::MediaPending("完整附件下载中".into()))
                 });
                 events.push(json!({"type":"message","historical":true,"message":message}));
                 media_retry_delay(&mut locator, now, waiting.as_ref())
@@ -580,6 +591,7 @@ fn quote_refresh<A: Backend>(
 fn inbox_stage(raw_locator: &str) -> &'static str {
     match serde_json::from_str::<Value>(raw_locator) {
         Ok(locator) if locator["_record_refresh"] == true => "record-refresh",
+        Ok(locator) if locator["_media_refresh"] == true => "media-refresh",
         Ok(locator) if locator["historical"] == true => "historical",
         Ok(_) => "live",
         Err(_) => "locator-parse",
@@ -601,17 +613,32 @@ fn journal_page<A: Backend>(
         .state(&format!("watch_floor:{group}"))?
         .and_then(|v| v.as_i64());
     let tx = store.db.unchecked_transaction()?;
+    let mut discovered = Vec::new();
     for row in &rows {
         let seq = row["sort_seq"].as_i64().context("消息游标无效")?;
         if baseline.is_none_or(|base| seq >= base)
             && !store.contains("baseline", "source", &source(group, row)?)?
+            && journal(store, group, row)?
         {
-            journal(store, group, row)?;
+            let kind = match text(row, "type") {
+                "图片" => "image",
+                "文本" => "text",
+                _ => "other",
+            };
+            discovered.push((source(group, row)?, kind));
         }
         floor = floor.max(seq);
     }
     store.set(&format!("cursor:{group}"), &json!(floor))?;
     tx.commit()?;
+    for (key, kind) in discovered {
+        // First observation is distinct from downloading/decoding the picture.
+        // Local timestamps avoid attributing sender/server clock differences to polling.
+        eprintln!(
+            "[timing] inbox discovered at_ms={} group={group} source={key} kind={kind}",
+            chrono::Utc::now().timestamp_millis(),
+        );
+    }
     Ok((
         rows.last()
             .map(position)
@@ -1113,8 +1140,10 @@ impl<A: Backend> Engine<A> {
         Ok(())
     }
     pub fn cycle(&mut self, commands: &[Value], now: f64) -> Vec<Value> {
+        let started = std::time::Instant::now();
         let mut events = vec![];
         let result = self.cycle_inner(commands, now, &mut events);
+        let work_ms = started.elapsed().as_millis();
         // Only rebuild snapshots whose shard actually moved. Dropping every one
         // made each cycle re-decrypt the whole database (~0.8 s for 125 MB), which
         // starved the queue while a message waited for native confirmation.
@@ -1124,12 +1153,31 @@ impl<A: Backend> Engine<A> {
         if let Err(error) = result {
             events.push(json!({"type":"warning","text":error.to_string()}));
         }
+        if started.elapsed().as_millis() >= 1000 {
+            eprintln!(
+                "[timing] inbox cycle at_ms={} took={}ms work={work_ms}ms commands={} events={}",
+                chrono::Utc::now().timestamp_millis(),
+                started.elapsed().as_millis(),
+                commands.len(),
+                events.len(),
+            );
+        }
         events
     }
     fn cycle_inner(&mut self, commands: &[Value], now: f64, events: &mut Vec<Value>) -> Result<()> {
         let poll_due = !self.watched.is_empty() && now - self.last_poll >= 1.4;
         let signature = if poll_due {
-            Some(self.access.signatures()?)
+            let started = std::time::Instant::now();
+            let signature = self.access.signatures();
+            if started.elapsed().as_millis() >= 250 {
+                eprintln!(
+                    "[timing] inbox signature at_ms={} took={}ms ok={}",
+                    chrono::Utc::now().timestamp_millis(),
+                    started.elapsed().as_millis(),
+                    signature.is_ok(),
+                );
+            }
+            Some(signature?)
         } else {
             None
         };
@@ -1162,14 +1210,19 @@ impl<A: Backend> Engine<A> {
                         self.jobs.first(),
                     )
                 })(),
-                "record_refresh" => (|| {
+                "record_refresh" | "media_refresh" => (|| {
                     let group = text(command, "group");
                     let key = text(command, "source_id");
                     ensure!(self.watched.contains(group), "该群未获准读取聊天记录");
                     ensure!(key.len() <= 1024, "聊天记录来源无效");
                     let mut locator = history_position(group, key)?.context("聊天记录缺少来源")?;
                     locator["historical"] = json!(true);
-                    locator["_record_refresh"] = json!(true);
+                    let refresh_key = if operation == "media_refresh" {
+                        "_media_refresh"
+                    } else {
+                        "_record_refresh"
+                    };
+                    locator[refresh_key] = json!(true);
                     self.store.db.execute(
                         "INSERT OR IGNORE INTO pending(source,group_id,locator) VALUES(?,?,?)",
                         params![key, group, locator.to_string()],
@@ -1332,6 +1385,7 @@ impl<A: Backend> Engine<A> {
         if poll_due {
             self.last_poll = now;
             if signature != self.signatures {
+                let started = std::time::Instant::now();
                 let mut more = false;
                 for group in &self.watched {
                     let default = json!({"sort_seq":self.store.state(&format!("cursor:{group}"))?.and_then(|v|v.as_i64()).unwrap_or(0)-1,"shard":"","local_id":-1});
@@ -1348,6 +1402,12 @@ impl<A: Backend> Engine<A> {
                     self.signatures = signature;
                     self.pages.clear();
                 }
+                eprintln!(
+                    "[timing] inbox scan at_ms={} groups={} more={more} took={}ms",
+                    chrono::Utc::now().timestamp_millis(),
+                    self.watched.len(),
+                    started.elapsed().as_millis(),
+                );
             }
         }
         if !self.active.is_empty() && now - self.last_members > 60.0 {
@@ -1407,15 +1467,19 @@ impl<A: Backend> Engine<A> {
                         self.store.db.execute("DELETE FROM pending WHERE source=?", [&key])?;
                         return Ok(true);
                     }
+                    if locator["_media_refresh"] == true && text(&row, "type") != "图片" {
+                        self.store.db.execute("DELETE FROM pending WHERE source=?", [&key])?;
+                        return Ok(true);
+                    }
                     if let Some(job) = self.jobs.first() {
                         if job.defers(&mut self.access, &self.store, &group, &row)? {
                             return Ok(false);
                         }
                     }
                     if let Some(message) = self.access.convert(&group, &row)? {
-                        waiting = (message["record"]["pending"] == true).then(|| {
+                        waiting = (message["record"]["pending"] == true || message["media_pending"] == true).then(|| {
                             anyhow::Error::new(crate::media::MediaPending(
-                                "聊天记录附件下载中".into(),
+                                "完整附件下载中".into(),
                             ))
                         });
                         converted += 1;
@@ -1434,6 +1498,11 @@ impl<A: Backend> Engine<A> {
                 let delay = match result {
                     Ok(false) => 2.0,
                     Ok(true) => retry_locator.as_mut().map_or(30.0, |locator| {
+                        if let Some(error) = waiting.as_ref() {
+                            if media_warning_due(locator, now) && self.warned.insert(key.clone()) {
+                                events.push(media_warning(&group, &key, error));
+                            }
+                        }
                         media_retry_delay(locator, now, waiting.as_ref())
                     }),
                     Err(error) => {
@@ -1456,15 +1525,17 @@ impl<A: Backend> Engine<A> {
                                 continue;
                             }
                         }
-                        // Report the stage every time, not once per key: a single warning
-                        // followed by silent retries is how a permanently failing item hid
-                        // itself while every later message stayed blocked behind it.
+                        // Keep the initial asynchronous wait quiet. Longer waits get one
+                        // source-bound warning; the client clears it on full delivery.
                         eprintln!(
-                            "[timing] inbox error group={group} source={key} stage={} error={error}",
+                            "[timing] inbox {} at_ms={} group={group} source={key} stage={} error={error}",
+                            if waiting { "pending" } else { "error" },
+                            chrono::Utc::now().timestamp_millis(),
                             inbox_stage(&raw_locator),
                         );
-                        if self.warned.insert(key.clone()) {
-                            events.push(json!({"type":"warning","group":group,"text":format!("微信附件暂未就绪，将保留并重试：{error}")}));
+                        let warn = !waiting || retry_locator.as_ref().is_some_and(|locator| media_warning_due(locator, now));
+                        if warn && self.warned.insert(key.clone()) {
+                            events.push(media_warning(&group, &key, &error));
                         }
                         retry_locator.as_mut().map_or(30.0, |locator| {
                             media_retry_delay(locator, now, Some(&error))
@@ -1487,14 +1558,16 @@ impl<A: Backend> Engine<A> {
                 let item_ms = item_started.elapsed().as_millis();
                 if item_ms >= 50 {
                     eprintln!(
-                        "[timing] inbox item group={group} outcome={outcome} took={item_ms}ms",
+                        "[timing] inbox item at_ms={} group={group} source={key} outcome={outcome} took={item_ms}ms",
+                        chrono::Utc::now().timestamp_millis(),
                         outcome = if outcome_converted { "converted" } else { "pending" },
                     );
                 }
             }
             if scanned > 0 {
                 eprintln!(
-                    "[timing] inbox poll groups={} due={scanned} converted={converted} took={}ms send_job={}",
+                    "[timing] inbox poll at_ms={} groups={} due={scanned} converted={converted} took={}ms send_job={}",
+                    chrono::Utc::now().timestamp_millis(),
                     self.watched.len(),
                     inbox_started.elapsed().as_millis(),
                     !self.jobs.is_empty(),

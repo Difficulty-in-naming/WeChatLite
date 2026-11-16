@@ -1,438 +1,148 @@
-# 本地测试与验证
+# 助手构建与本机测试交付
 
-这份文档写给「改了代码要验证」的人和 AI 助手。它记录的是**踩过的坑**，不是理想流程。
+文档入口见 [文档目录](README.md)。用户手工操作只维护在 [本机 Windows 测试步骤](TEST-SERVER-STEPS.md)。本文给修改代码和交付测试文件的助手使用。
 
-核心原则：**真实微信群不可操作**。所有自动化验证必须在隔离环境完成；凡是必须碰真实数据的验证，一律由用户本人执行，助手只提供可复现的步骤和判断依据。
+## 先认清环境和用语
 
----
+- 用户的“本地测试”“本机测试”“我的测试”始终指本机 Windows 虚拟机里的真实微信与服务端、配合真实客户端的手工测试。
+- 助手运行的单测、fixture、demo、探测脚本称为“代码验证”，不能冒充用户的测试或解释用户为何没复现。
+- 正式服务端在远处，由他人在其 Windows 电脑运行，连接的是对方微信。本机通过不代表远端通过。
+- 本人手机发图后的同账号同步，与其他群成员发图后的接收须分别记录。2026-11-16 用户追加确认：本机旧版接收其他账号发来的图片也正常，两边微信版本一致。账号来源或微信版本差异不能解释远端故障，远端根因仍未确认。
 
-## 一、先分清「能自动验证」和「必须用户验证」
+## 每次交付必须完成
 
-| 改动位置 | 自动化验证 | 需要真实环境 |
-|---|---|---|
-| 纯函数、序列化、解析 | 单元测试 | 否 |
-| 客户端 UI 逻辑 | `desktop-tests`（mock HTTP） | 否 |
-| 适配器数据库查询 | 内存 SQLite fixture | 否 |
-| 服务端 HTTP 行为 | `wechat-relay` 测试 | 否 |
-| 真实微信库的字段含义 | — | **是** |
-| 真实群的收发 | — | **是** |
-| TLS/证书/局域网连接 | — | **是** |
-| WXGF/SILK 媒体解码 | 需要 FFmpeg 的 fixture | 部分 |
+1. 核对分支和已有改动，阅读当前故障涉及的实现文档。
+2. 完成改动及直接相关的代码验证。
+3. 构建 Windows 适配器和 relay EXE；缩略图先显示、完整图后更新需要两者配合。
+4. 运行交付脚本，更新用户已有的共享测试目录，保留旧文件。
+5. 用 `--check` 核对共享目录与当前构建完全一致。
+6. 回复“共享测试目录已更新”，给用户原来的启动路径、操作和这次应观察的结果。
 
-**判断标准**：如果验证过程会读取真实微信数据库、发消息、或连接用户正在用的服务端，就不能自动化。
+**用户不要 ZIP。** 不交 ZIP，不把 `target/` 中的文件链接当成交付，不让用户自己找 EXE、复制文件。共享目录超出沙箱写范围时，为文件交付申请工具权限；不能省略这一步。
 
----
+## 固定目录与启动入口
 
-## 二、各套件的跑法
+macOS 实际目录：
 
-项目自带的 Rust 工具链在 `.tools/`，不要用系统 cargo（Homebrew 的 1.88 编不了 edition 2024）。
+```text
+/Volumes/MacData/cal_data/Downloads/WeChatLite-构建产物/WeChatLite-Server-测试版
+```
+
+Windows 虚拟机共享目录：
+
+```text
+\\Mac\Home\Downloads\WeChatLite-构建产物\WeChatLite-Server-测试版
+```
+
+用户在上述 Windows 目录双击 **`启动测试版.bat`**。不是 `~/Downloads`，不是仓库的 `target/`，也不是另一个旧便携包。
+
+## 构建与交付命令
+
+工作区使用 `.tools/` 内的 Rust 1.95，不用系统 Cargo。临时文件使用实际的 `/private/tmp`，不写真实 `.state`。
 
 ```bash
 cd /Volumes/MacData/cal_data/projects/WeChatLite
 export RUSTUP_HOME="$PWD/.tools/rustup"
 export CARGO_HOME="$PWD/.tools/cargo"
-export TMPDIR="$PWD/.state/tmp-rs"   # 见下方「TMPDIR 陷阱」
-```
+export PATH="$PWD/.tools/cargo/bin:$PATH"
+export TMPDIR=/private/tmp
 
-### 适配器（Rust）
-
-```bash
-.tools/cargo/bin/cargo test -p wechat-adapter --bin wechat-adapter -- \
-    --skip real_static_hevc_color --skip text_send_builds_stable_id
-```
-
-**两个必须跳过的测试**（环境原因，不是代码问题）：
-
-- `real_static_hevc_color_*` — 需要真实 FFmpeg 二进制
-- `text_send_builds_stable_id_*` — 需要真实微信进程
-
-### 服务端（Rust）
-
-```bash
-.tools/cargo/bin/cargo test -p wechat-relay --bin wechat-relay
-.tools/cargo/bin/cargo test -p wechat-relay --test protocol
-```
-
-### 客户端（Qt/C++）
-
-构建：
-
-```bash
-cmake --build build-macos --target wechat-lite desktop-tests client-tests -j 8
-```
-
-运行（**必须设置隔离的 HOME**，否则测试会写真实配置目录）：
-
-```bash
-export CFFIXED_USER_HOME="$PWD/.state/test-home"
-export HOME="$PWD/.state/test-home"
-export QT_SSL_USE_TEMPORARY_KEYCHAIN=1
-mkdir -p .state/test-home
-
-./build-macos/client/desktop-tests -platform offscreen
-./build-macos/client/client-tests -platform offscreen
-./build-macos/client/transport-tests -platform offscreen
-./build-macos/client/preferences-tests -platform offscreen
-./build-macos/client/notifier-tests -platform offscreen
-```
-
-用 `-platform offscreen` 可以无窗口运行。系统通知在 offscreen 下由 `SystemNotifier` 自动抑制。
-
----
-
-## 三、踩过的坑（照着做能省半小时）
-
-### 1. `TMPDIR` 是符号链接
-
-macOS 的 `$TMPDIR` 指向 `/var/folders/...`，是个符号链接。适配器的媒体测试里有「媒体目录不能是链接」的检查，会因此失败：
-
-```
-媒体目录不能是链接
-```
-
-**解法**：`export TMPDIR="$PWD/.state/tmp-rs"`，用仓库内的真实目录。
-
-### 2. Qt 只认 `CFFIXED_USER_HOME`
-
-macOS 上 `QStandardPaths` **不看 `HOME`**，必须设 `CFFIXED_USER_HOME`。只设 `HOME` 时测试仍然会写 `~/Library/Application Support`，在不允许写入的环境里表现为：
-
-```
-attachments.addImage 返回 false
-```
-
-**解法**：两个都设，并且 `mkdir -p` 目标目录。
-
-### 3. 中文在二进制里是 UTF-8，不是 UTF-16
-
-用 Python 在编译产物里搜字符串时，`QStringLiteral` 的中文是 UTF-8 编码存储的，不是 UTF-16LE。搜不到不代表没有：
-
-```python
-open(binary,'rb').read().find('已定位到原文'.encode())        # 对
-open(binary,'rb').read().find('已定位到原文'.encode('utf-16-le'))  # 错
-```
-
-### 4. `hdiutil` 在沙箱里会被拒
-
-创建和校验 DMG 需要在 workspace-write 之外的权限，否则报：
-
-```
-hdiutil: create failed - 操作不被允许
-```
-
-### 5. `cargo` 的 registry 缓存不能在 `/tmp`
-
-`/tmp` 下的 cargo registry 会被沙箱拦住。用 `.state/cargo-home` 或 `.tools/cargo`。
-
-### 6. 测试 fixture 必须写成真实格式
-
-写引用卡片的 fixture 时**必须带 `<type>57</type>`**：
-
-```xml
-<msg><appmsg><type>57</type><title>…</title><refermsg>…</refermsg></appmsg></msg>
-```
-
-漏了它，`reference()` 直接返回 `None`，测试会表现为「convert 没有认出这是引用」，很容易误判成代码 bug。
-
-### 7. 系统有 `HTTPS_PROXY` 时 curl 会走代理
-
-`curl` 读环境变量里的 `HTTPS_PROXY`，Qt 的 `QWebSocket` **不读**。所以 curl 成功不代表客户端能连上：
-
-```
-* Connected to 127.0.0.1 (127.0.0.1) port 7897   ← 走了代理
-```
-
-验证真实连通性时加 `--noproxy '*'` 强制直连。
-
----
-
-## 四、验证网络连接（只读）
-
-确认服务端可达、TLS 正常、token 有效。**全部是 GET，不写入任何数据**。
-
-```bash
-# 1. 端口是否开放
-nc -zv -w 3 <host> <port>
-
-# 2. 直连（绕过代理）是否返回 200
-curl -sk --noproxy '*' --max-time 8 -o /dev/null -w "%{http_code}\n" https://<host>:<port>/health
-
-# 3. 证书指纹是否和客户端配置一致
-openssl s_client -connect <host>:<port> -servername <host> </dev/null 2>/dev/null \
-  | openssl x509 -fingerprint -sha256 -noout
-
-# 4. 用客户端自己的 token 请求状态
-curl -sk --noproxy '*' -H "Authorization: Bearer <token>" https://<host>:<port>/api/status
-```
-
-第 4 步返回的关键字段：
-
-| 字段 | 含义 | 注意 |
-|---|---|---|
-| `ready` | 服务端认为适配器可用 | **只在启动时设置，之后不更新**，不可作为健康指标 |
-| `self_id` | 适配器读到的微信账号 | 空说明适配器没读到微信 |
-| `text` | 人类可读的状态 | 同样是启动时写的 |
-| `permissions.groups` | 允许读取的群 | 空说明没选群 |
-
-**重要**：`ready: true` 不代表现在能收到新消息。适配器卡死时它仍然是 `true`。判断"能不能收到"要看 `/api/messages` 里最新一条的时间戳是不是在推进。
-
-### WebSocket 握手测试
-
-`curl` 不能测 WebSocket。用 Python 发原始握手：
-
-```python
-import base64, os, socket, ssl
-ctx = ssl.create_default_context(); ctx.check_hostname=False; ctx.verify_mode=ssl.CERT_NONE
-key = base64.b64encode(os.urandom(16)).decode()
-req = (f"GET /api/events?after=0 HTTP/1.1\r\nHost: {host}:{port}\r\n"
-       f"Authorization: Bearer {token}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
-       f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n")
-with socket.create_connection((host, port), timeout=8) as s:
-    with ctx.wrap_socket(s) as t:
-        t.sendall(req.encode())
-        print(t.recv(4096).decode('utf-8','replace').split('\r\n\r\n')[0])
-```
-
-期望 `HTTP/1.1 101 Switching Protocols`。
-
-注意：`urllib` 会把 header 名规范成 `Upgrade` 之外的写法，服务端返回 `400 Connection header did not include 'upgrade'`，这是**测试方法的问题**，不是服务端的问题。
-
----
-
-## 五、隔离测试客户端
-
-不要改动 `~/Applications/微信轻聊.app`。用独立副本：
-
-```bash
-bash scripts/make-test-client.sh          # 复制当前构建
-build-macos/test-client/run.sh            # 隔离启动（默认 --demo）
-```
-
-隔离的三样东西：
-
-1. **Bundle ID** `local.wechatlite.client.test` —— 通知授权、TCC 独立
-2. **`CFFIXED_USER_HOME` / `WECHAT_LITE_PROFILE`** —— 配置、缓存、下载都在 `.state/test-client`
-3. **门禁** —— `xattr -dr com.apple.quarantine` 避免 ad-hoc 签名被拦
-
-**必须用 `run.sh` 启动**，直接双击 app 仍会读正式版配置。
-
-### `--demo` 的局限（重要）
-
-demo 模式提供 800 条历史消息，可以测滚动、翻页、键盘操作。但：
-
-- **没有任何引用消息** —— 无法验证引用定位
-- **不连接真实微信** —— 状态永远是「演示模式 · 未连接真实微信」
-- **数据是假的** —— 不能用它判断「真实群能不能收到」
-
-需要验证引用、媒体解码、真实收发时，**必须用户在自己的服务端上手动执行**。
-
----
-
-## 六、跨平台构建 Windows 产物（在 macOS 上）
-
-```bash
-export RUSTUP_HOME="$PWD/.tools/rustup" CARGO_HOME="$PWD/.tools/cargo"
-cargo build --release --locked -p wechat-relay -p wechat-adapter \
+.tools/cargo/bin/cargo build --release --locked -p wechat-adapter -p wechat-relay \
     --target x86_64-pc-windows-gnu
+python3 scripts/stage-windows-test.py
+python3 scripts/stage-windows-test.py --check
 ```
 
-产物在 `target/x86_64-pc-windows-gnu/release/`。
+交付脚本只更新以下五个文件：
 
-检查依赖只用了系统库（应为空输出）：
-
-```bash
-x86_64-w64-mingw32-objdump -p wechat-adapter.exe | awk '/DLL Name:/{print $3}' \
-  | grep -viE '^(api-ms-win-|ext-ms-)|^(kernel32|ntdll|advapi32|bcrypt|bcryptprimitives|ws2_32|wsock32|combase|crypt32|iphlpapi|ole32|oleaut32|user32|shell32|shlwapi|secur32|wintrust|userenv|version|psapi|dbghelp|powrprof)\.dll$'
-```
-
-### 构建完直接替换到测试目录（不要丢给用户自己复制）
-
-macOS 上编出来的 `.exe` 要落到**用户实际启动的那个目录**里。这个目录是共享目录，
-不在仓库内：
-
-```bash
-TESTDIR="/Volumes/MacData/cal_data/Downloads/WeChatLite-构建产物/WeChatLite-Server-测试版"
-# Windows 侧看到的是 \\Mac\Home\Downloads\WeChatLite-构建产物\WeChatLite-Server-测试版\
-```
-
-**注意不是 `~/Downloads`。** `~` 下面只有一个按日期归档的 `微信轻聊/`；
-共享出去的是 `/Volumes/MacData/cal_data/Downloads/`。找错目录会以为「我明明覆盖了」，
-实际改的是别处——这个坑已经踩过，白测一轮。
-
-替换（保留一份旧版用于回滚）：
-
-```bash
-cp "$TESTDIR/adapter/wechat-adapter.exe" "$TESTDIR/adapter/wechat-adapter.exe.bak-old"
-cp target/x86_64-pc-windows-gnu/release/wechat-adapter.exe "$TESTDIR/adapter/wechat-adapter.exe"
-```
-
-替换后**必须**验证落地的是不是新二进制，而不是靠时间戳猜：
-
-```bash
-python3 - "$TESTDIR/adapter/wechat-adapter.exe" <<'EOF'
-import pathlib, sys
-d = pathlib.Path(sys.argv[1]).read_bytes()
-print("size", len(d))
-for name, needle in {
-    "旧 using thumbnail": "using thumbnail",
-    "旧 分片超出数据范围": "WXGF 分片超出数据范围",
-    "新 码流未以参数集开始": "WXGF 码流未以参数集开始",
-    "新 placeholder.png": "placeholder.png",
-    "新 启动戳": "wxgf=start-code-v2",
-}.items():
-    print(f"  {name:24}", "有" if needle.encode() in d else "无")
-EOF
-```
-
-预期：`旧 *` 两项都是「无」，`新 *` 三项都是「有」。
-
-### 换完文件 ≠ 跑的是新文件
-
-`server_gui/server_window.cpp` 每次启动都会**改写 `bridge_program`**：
-
-```cpp
-config["bridge_program"] = QCoreApplication::applicationDirPath() + "/adapter/wechat-adapter.exe";
-```
-
-也就是说加载哪个适配器，取决于**你双击的那个 `wechat-server.exe` 在哪个目录**，
-而不是你把新 exe 覆盖到了哪里。从旧便携包启动就会拉起旧便携包旁边的适配器。
-
-所以适配器启动第一行会打印身份（`main.rs::announce_build`）：
-
-```
-[media] adapter build=0.2.0 exe=<完整路径> wxgf=start-code-v2
-```
-
-用户报「换了没变化」时，先要这一行。`exe=` 指向别处就说明启动错服务端了。
-
-### 便携 EXE 不能手工替换内部文件
-
-`WeChatLite-Server-Windows-x64-*.exe` 是自校验的便携包（格式见 `packaging/windows-portable/FORMAT.md`）：
-
-```
-[启动器 PE] [WLPKG01\n] [u64 清单长度] [JSON 清单] [各文件字节...] [WLPEND1\n] [u64 offset] [u64 size]
-```
-
-启动器把**整个 payload 的 SHA-256 编译在自己里面**。改动包内任何文件都会导致哈希不匹配、拒绝启动。
-
-**所以更新适配器有两条路**：
-
-1. **在 Windows 上重新打包**（推荐）：`scripts/package-portable-windows.ps1`
-2. **解压后直接替换**（快速验证）：先 `unpack_portable.py unpack`，替换 `adapter/wechat-adapter.exe` 和 `wechat-relay.exe`，直接运行解压目录里的 `wechat-server.exe`
-
-只读查看包内容：
-
-```bash
-python3 scripts/unpack_portable.py list <portable.exe>
-```
-
----
-
-## 七、必须由用户完成的验证
-
-以下操作助手**一律不能代做**，只能给出步骤：
-
-| 操作 | 为什么 |
+| 目标 | 来源 |
 |---|---|
-| 在真实群发任何内容 | 不可撤回、影响他人 |
-| 点「定位原文」验证引用 | 会读真实微信库对应行 |
-| 替换 Windows 服务端文件 | 影响用户正在用的环境 |
-| 重启真实服务端 | 会中断用户使用 |
-| 修改真实配置文件 | 可能丢失凭据 |
+| `adapter/wechat-adapter.exe` | 当前 Windows release 构建 |
+| `wechat-relay.exe` | 当前 Windows release 构建，支持缩略图消息保留重试并更新原消息 |
+| `启动测试版.bat` | `scripts/windows-test-launcher.bat` |
+| `使用说明.md` | `docs/TEST-SERVER-STEPS.md` 的原样副本 |
+| `测试构建.json` | 上述文件的 SHA-256 和功能标记 |
 
-给用户写步骤时，必须包含：
+旧文件移动到测试目录的 `测试文件备份/<时间-编号>/`，附归档清单；重复交付相同内容不会再建备份。脚本不读取配置，不接触数据或凭据，不连接、启动、停止微信或服务端。启动器由用户执行，检查哈希和已有服务进程；发现已有进程时提示用户正常退出，不强制结束。
 
-1. **前置检查**：先确认什么状态（例如 `/api/status` 返回什么）
-2. **具体命令或点击位置**
-3. **预期结果**：正常时看到什么
-4. **失败时看什么**：哪个日志、哪个字段、什么错误文案
-5. **回滚方式**：旧文件在哪、怎么恢复
+当前交付同时更新适配器和 relay。原目录里的 Qt 管理端、FFmpeg 和其他依赖保留。若改动涉及其他组件，应按其构建流程准备并交付对应程序。
 
----
+## 怎么证明用户拿到本次构建
 
-## 八、诊断日志现状
+`--check` 必须成功。启动器按 `测试构建.json` 检查实际文件 SHA-256，随后用户核对服务端日志中 `exe=` 是当前测试目录。
 
-**客户端目前没有通用日志。** 连接失败、WebSocket 断开、pin 校验失败都只能从界面看到一句话。
-
-已有的只有一个：引用定位会写 `quote-locate.log` 到 `QStandardPaths::AppDataLocation`，内容是匹配过程（点了几条、有没有近似候选、最终命中哪条）。
-
-适配器有 `[timing] poll/submit/confirmed` 输出到控制台（`59d4685` 加入），只在有控制台时可见。
-
-**这是当前最大的可观测性缺口**：适配器卡死时，服务端 `ready` 仍然是 `true`，客户端显示已连接，界面上没有任何提示。
-
----
-
-## 九、已知未验证项
-
-截至 `dd4ebb3`：
-
-| 项目 | 状态 | 原因 |
-|---|---|---|
-| 引用按 `svrid` 定位 | 仅内存 SQLite 验证 | 真实微信库的 `svrid` 语义未在真机确认 |
-| WXGF 图片解码 | 单测覆盖 + 真机曾验证 | fixture 走真实 FFmpeg；真机布局见下节 |
-| 连接圆点的四态 | mock HTTP 验证 | 真实断线恢复未验证 |
-| 适配器快照复用 | **存在回归风险** | `release_changed()` 在文件被锁时静默跳过，可能永久卡在旧快照 |
-| Windows 便携包重打包 | 未验证 | 需要 Windows + MSVC |
-
-最后一项的细节：`db.rs` 里 `release_changed()` 对 `crypto::version()` 的错误是 `continue`（跳过），而微信写入时会对数据库持锁，可能导致这个分片的快照永不失效，表现为「服务端说连上了，但收不到新消息」。
-
----
-
-## 十、WXGF 图片：已知布局与判断依据
-
-### 容器布局
-
-真实 1080x2400 照片的头部（`wxgf` 之后）：
+当前图片兼容改动的启动标记是：
 
 ```text
-33..38   00 00 01 3a 31        记录标记（NAL type 29，分区号 '1'）
-38..42   00 01 3a 24           长度 0x13a24 = 80420
-42..46   00 00 00 01           四字节起始码
-46..     40 01 ...             VPS，之后 SPS / PPS / slice
+wxgf=start-code-v2 image-download=full-and-mid-v1 image-preview=cdn-footer-v3 media-wait=delayed-clear-v1 inbox-poll=snapshot-v1
 ```
 
-长度写在**起始码之前**。读错位置就会把头部字节当成长度：线上日志出现过
-`声明 386096384 字节，剩余 88838 字节，偏移 12`，而 `0x17035d00` 是 `wxgf` 文件头，
-不是任何长度。这类数字**不能**当成「图片还在下载」的证据。
+前三个标记分别表示 WXGF 解码版本、原图与标准图下载字段兼容、图片预览与恢复流程版本。`cdn-footer-v3` 补齐 CDN 图片的短尾部处理，用户已用两张带 24 字节尾部的 JPEG 确认本机前台、后台接收成功。`media-wait=delayed-clear-v1` 表示媒体等待超过 30 秒才告警一次，客户端根据同群、同来源的完整消息自动清除；缩略图不算完成。relay 也输出 `image-preview=cdn-footer-v3 media-wait=delayed-clear-v1`。功能标记不能替代文件哈希。没有现场证据时，不得因为对方失败就断言启动了旧版。
 
-### 现行解析策略
+`inbox-poll=snapshot-v1` 是本轮适配器的扫描修正：读取本轮消息分片版本时，同时失效与该版本不符的旧快照。隔离的加密数据库/WAL 夹具已复现旧代码“检测到新版本却扫描旧快照”的问题，修正后无需下一条消息或重启即可读到新图片；不变分片仍复用快照。用户反馈的约 10 秒指从另一账号发图到服务端首条图片日志，且第二次可能很快；文字是否也延迟尚不确定。代码缺陷已复现，现场延迟是否由它造成仍待用户手测，不能提前归因微信后台或宣布已修好。
 
-`media/wxgf.rs::partitions` 不遍历头部：
+新增 `[timing] inbox discovered`（首次入队）、`scan`、慢 `snapshot`/`signature`/`cycle` 和原图片处理日志中的本机 `at_ms`。只记阶段、来源定位、数量与耗时，不记消息正文或下载凭据。用同一来源的日志区分扫描前与图片处理后的等待；`at_ms` 是服务端本机时间，不能直接与另一台设备的时间相减。用户步骤仍只维护在 [本机测试步骤](TEST-SERVER-STEPS.md)。本轮未改客户端，无需重新交付客户端；上轮清除警告所需的客户端继续使用。
 
-1. 扫描所有起始码；
-2. 取起始码前 4 字节为长度，必须落在数据范围内；
-3. 覆盖的字节必须「以参数集开头 + 只含一帧静图」（`picture_stream` 校验）；
-4. 不合格就跳过、继续找下一个起始码，**不整张判死**；
-5. 全部不合格且容器无长度前缀时，回退为扫 annex-B 码流。
+## 媒体警告所需客户端
 
-颜色分片和透明遮罩分片都能拿到（`parts.len() == 2` 时按 chroma 区分）。
+自动清除提示需要已交付的新版客户端配合；仅修改服务端扫描逻辑时不必重复构建客户端。涉及客户端改动时，沿用原 Mac 测试客户端和启动入口，不另建测试配置：
 
-### 回退顺序
+```text
+/Volumes/MacData/cal_data/Downloads/WeChatLite-构建产物/微信轻聊-测试版.app
+/Volumes/MacData/cal_data/Downloads/WeChatLite-构建产物/启动测试版客户端.command
+```
 
-| 顺序 | 来源 | 失败后 |
-|---|---|---|
-| 1 | 完整 WXGF 解码 | → 2 |
-| 2 | 同目录 `<md5>.dat` 缩略图（跳过刚失败的那个文件） | → 3 |
-| 3 | 内置占位图 `placeholder.png`（写盘前自校验） | 结束 |
-
-**只有「原消息已保留、会自动重试」才重试**；解码彻底失败给占位图，不会卡队列。
-
-### 占位图必须本身可解码
-
-`PLACEHOLDER_PNG` 曾经是 585 字节的截断 PNG（IDAT 声明 634 字节、CRC 错、zlib 空流），
-于是占位图自己也被 `picture::validate` 拒掉，客户端只画「图片 · 点击下载」。
-现在它是真 PNG，并且：
-
-- 走 `Media::placeholder_picture()`，写盘前 `picture::validate` 一次；
-- 文件名 `placeholder.png`，**不占用 `image.*`**——那个名字是后续成功解码的首查位置，
-  放占位图会把真图永久挡住。
-
-### 单元测试（FFmpeg fixture）
+构建、封装和交付命令：
 
 ```bash
-export TMPDIR="$PWD/.state/tmp-rs"
-.tools/cargo/bin/cargo test -p wechat-adapter --bin wechat-adapter -- media::wxgf
+cmake --build build-macos --target wechat-lite desktop-tests --parallel 3
+python3 scripts/stage-macos-test-client.py --package-only
+# 使用上一条输出的已封装 app 路径；封装、签名校验完成后才交付。
+python3 scripts/stage-macos-test-client.py --app '<已封装 app 的绝对路径>'
+python3 scripts/stage-macos-test-client.py --check
 ```
 
-包含：真实布局重放、颜色+遮罩合成、截断码流判为「仍在下载」、占位图可解码且不进 `image.*`。
-`real_static_hevc_color_*` 需要系统里有 `ffmpeg`；没有时按第二节跳过。
+封装补齐 Qt 与现有辅助程序，保留测试应用的 Bundle ID，使用临时签名。程序包和 `测试客户端构建.json` 放回原构建产物目录，旧应用移入同目录的 `测试文件备份/`；原 `.command` 启动器保持不变。脚本只处理应用程序，不读取配置、媒体或消息数据，也不启动或退出客户端。交付到沙箱外目录须申请工具权限。
 
+管理端会把适配器路径设置为自身目录的 `adapter/wechat-adapter.exe`，所以实际启动的 `wechat-server.exe` 所在目录决定加载哪份适配器。
+
+## 助手能做什么，用户要做什么
+
+| 动作 | 执行者 |
+|---|---|
+| 改代码、构建、隔离的代码验证 | 助手 |
+| 更新上述共享测试目录的程序、说明与哈希清单 | 助手，保留备份 |
+| 停止旧服务、双击启动器、操作真实微信、观察手测结果 | 用户亲自完成 |
+| 更新远处他人的正式服务端 | 对方亲自完成 |
+| 读取真实服务端或微信数据 | 先取得本次明确的只读范围授权 |
+
+不能把“用户亲自停服和启动”误解成“助手不能把编译产物放进共享测试目录”。不改真实 `server.json`、`.state`、data、TLS、密钥、草稿、数据库或媒体。真实微信操作遵循根目录 `AGENTS.md`。
+
+## 代码验证参考
+
+Windows CI 的临时目录可能带 `RUNNER~1` 等短路径，而下载缓存使用规范长路径。回执路径不同文本但指向同一个私有文件时应通过；指向其他文件时仍须拒绝。原先失败的 `ordinary_reencoded_pictures_require_a_complete_resource_bound_receipt_and_decodable_bytes`、`record_picture_footer_is_normalized_after_verifying_the_original_download` 已在 Windows 短临时路径复现；验证这类修正时保留群下载授权检查，不能给夹具授权真实群来绕过错误。新增 `completed_picture_receipt_accepts_canonical_alias_only_for_the_expected_private_file` 覆盖同文件别名与相同字节的其他文件，跨平台运行。
+
+只运行与改动直接相关的验证；这些结果单独标为代码验证。本次图片改动可用：
+
+```bash
+.tools/cargo/bin/cargo test --locked -p wechat-adapter --bin wechat-adapter media::tests::
+.tools/cargo/bin/cargo test --locked -p wechat-adapter -p wechat-relay --bins thumbnail
+.tools/cargo/bin/cargo test --locked -p wechat-relay --bin wechat-relay picture_upgrade_preserves
+git diff --check
+```
+
+媒体和解析测试使用临时夹具，不连接真实微信；不要运行 live probe 或依赖真实微信的测试。需要验证真实 Windows 行为时，用用户手工流程，不能用 demo 的假数据替代。
+
+其他组件按改动范围选用现有套件：Rust 服务端核心使用 `cargo test -p wechat-relay --bin wechat-relay`；Qt UI 使用 `build-macos/client/desktop-tests -platform offscreen` 等对应套件。Qt 在 macOS 的标准路径需要单独的 `CFFIXED_USER_HOME` 和测试 profile；测试目录必须在工作区外的临时目录，避免写入真实配置。不要直接照搬可能创建客户端、发送消息或触发真实适配器的集成命令，先按 `AGENTS.md` 检查隔离条件。
+
+协议 CI 的启动验证可单独运行 `cargo test --locked -p wechat-relay --test protocol startup_seeds_history_without_live_replay`。它只用临时目录、随机回环端口、空 `bridge_program` 的 `--demo` 实例，检查首次启动和重启后仍有 804 条消息、其中 800 条历史不进入实时回放；不发送消息、不连接微信。存储批量导入的持久化、去重与失败回滚用 `cargo test --locked -p wechat-relay --bin wechat-relay store::tests::` 验证。
+
+2026-11-16 Windows CI 的 5 项协议失败包括 3 项演示实例启动超时和 2 项整份 stderr 比较失败。演示历史现改为单事务持久化，保持 `synchronous=FULL`；适配器退出诊断单独按内容、次数和顺序校验，允许 relay 自身输出启动标记。启动超时会附模式、耗时、最后状态及 stdout/stderr，不能只凭超时认定现场微信有故障，也不能把本次演示代码验证当作用户本机测试。
+
+保留的环境注意事项：macOS `/var` 的符号链接会触发媒体目录的链接检查，使用实际的 `/private/tmp`；系统代理能影响 curl 而 Qt WebSocket 行为不同，网络诊断先确认直连范围；生成 DMG 的 `hdiutil` 可能需要沙箱外权限。中文产物标记按 UTF-8 字节核对，不能用 UTF-16 搜不到来判定版本。
+
+真实只读网络和微信库诊断仍需用户明确授权本次范围。`ready: true` 只能说明已报告的状态，不能证明新消息正在推进；无新日志也不足以单独判定失联。不要把早期提交的“尚未验证”列表或历史 handoff 结论照抄为当前事实。
+
+## 正式便携 EXE
+
+正式便携 EXE 对内部文件有整体校验，不能直接改其内部适配器。正式打包见 [发布](RELEASE.md) 和 [便携包格式](../packaging/windows-portable/FORMAT.md)。用户本机测试使用既有的展开目录，助手直接更新其中的 EXE，不能把“正式包需要重打包”作为交 ZIP 的理由。

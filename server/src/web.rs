@@ -1116,6 +1116,7 @@ async fn send(
         recall_client: String::new(),
         text: request.text,
         media,
+        media_pending: false,
         mentions: request.mentions,
         quote,
         record: None,
