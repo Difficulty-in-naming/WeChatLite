@@ -244,6 +244,66 @@ x86_64-w64-mingw32-objdump -p wechat-adapter.exe | awk '/DLL Name:/{print $3}' \
   | grep -viE '^(api-ms-win-|ext-ms-)|^(kernel32|ntdll|advapi32|bcrypt|bcryptprimitives|ws2_32|wsock32|combase|crypt32|iphlpapi|ole32|oleaut32|user32|shell32|shlwapi|secur32|wintrust|userenv|version|psapi|dbghelp|powrprof)\.dll$'
 ```
 
+### 构建完直接替换到测试目录（不要丢给用户自己复制）
+
+macOS 上编出来的 `.exe` 要落到**用户实际启动的那个目录**里。这个目录是共享目录，
+不在仓库内：
+
+```bash
+TESTDIR="/Volumes/MacData/cal_data/Downloads/WeChatLite-构建产物/WeChatLite-Server-测试版"
+# Windows 侧看到的是 \\Mac\Home\Downloads\WeChatLite-构建产物\WeChatLite-Server-测试版\
+```
+
+**注意不是 `~/Downloads`。** `~` 下面只有一个按日期归档的 `微信轻聊/`；
+共享出去的是 `/Volumes/MacData/cal_data/Downloads/`。找错目录会以为「我明明覆盖了」，
+实际改的是别处——这个坑已经踩过，白测一轮。
+
+替换（保留一份旧版用于回滚）：
+
+```bash
+cp "$TESTDIR/adapter/wechat-adapter.exe" "$TESTDIR/adapter/wechat-adapter.exe.bak-old"
+cp target/x86_64-pc-windows-gnu/release/wechat-adapter.exe "$TESTDIR/adapter/wechat-adapter.exe"
+```
+
+替换后**必须**验证落地的是不是新二进制，而不是靠时间戳猜：
+
+```bash
+python3 - "$TESTDIR/adapter/wechat-adapter.exe" <<'EOF'
+import pathlib, sys
+d = pathlib.Path(sys.argv[1]).read_bytes()
+print("size", len(d))
+for name, needle in {
+    "旧 using thumbnail": "using thumbnail",
+    "旧 分片超出数据范围": "WXGF 分片超出数据范围",
+    "新 码流未以参数集开始": "WXGF 码流未以参数集开始",
+    "新 placeholder.png": "placeholder.png",
+    "新 启动戳": "wxgf=start-code-v2",
+}.items():
+    print(f"  {name:24}", "有" if needle.encode() in d else "无")
+EOF
+```
+
+预期：`旧 *` 两项都是「无」，`新 *` 三项都是「有」。
+
+### 换完文件 ≠ 跑的是新文件
+
+`server_gui/server_window.cpp` 每次启动都会**改写 `bridge_program`**：
+
+```cpp
+config["bridge_program"] = QCoreApplication::applicationDirPath() + "/adapter/wechat-adapter.exe";
+```
+
+也就是说加载哪个适配器，取决于**你双击的那个 `wechat-server.exe` 在哪个目录**，
+而不是你把新 exe 覆盖到了哪里。从旧便携包启动就会拉起旧便携包旁边的适配器。
+
+所以适配器启动第一行会打印身份（`main.rs::announce_build`）：
+
+```
+[media] adapter build=0.2.0 exe=<完整路径> wxgf=start-code-v2
+```
+
+用户报「换了没变化」时，先要这一行。`exe=` 指向别处就说明启动错服务端了。
+
 ### 便携 EXE 不能手工替换内部文件
 
 `WeChatLite-Server-Windows-x64-*.exe` 是自校验的便携包（格式见 `packaging/windows-portable/FORMAT.md`）：
@@ -308,9 +368,71 @@ python3 scripts/unpack_portable.py list <portable.exe>
 | 项目 | 状态 | 原因 |
 |---|---|---|
 | 引用按 `svrid` 定位 | 仅内存 SQLite 验证 | 真实微信库的 `svrid` 语义未在真机确认 |
-| WXGF 图片解码 | 未验证 | 需要真实 FFmpeg + 真实 WXGF 样本 |
+| WXGF 图片解码 | 单测覆盖 + 真机曾验证 | fixture 走真实 FFmpeg；真机布局见下节 |
 | 连接圆点的四态 | mock HTTP 验证 | 真实断线恢复未验证 |
 | 适配器快照复用 | **存在回归风险** | `release_changed()` 在文件被锁时静默跳过，可能永久卡在旧快照 |
 | Windows 便携包重打包 | 未验证 | 需要 Windows + MSVC |
 
 最后一项的细节：`db.rs` 里 `release_changed()` 对 `crypto::version()` 的错误是 `continue`（跳过），而微信写入时会对数据库持锁，可能导致这个分片的快照永不失效，表现为「服务端说连上了，但收不到新消息」。
+
+---
+
+## 十、WXGF 图片：已知布局与判断依据
+
+### 容器布局
+
+真实 1080x2400 照片的头部（`wxgf` 之后）：
+
+```text
+33..38   00 00 01 3a 31        记录标记（NAL type 29，分区号 '1'）
+38..42   00 01 3a 24           长度 0x13a24 = 80420
+42..46   00 00 00 01           四字节起始码
+46..     40 01 ...             VPS，之后 SPS / PPS / slice
+```
+
+长度写在**起始码之前**。读错位置就会把头部字节当成长度：线上日志出现过
+`声明 386096384 字节，剩余 88838 字节，偏移 12`，而 `0x17035d00` 是 `wxgf` 文件头，
+不是任何长度。这类数字**不能**当成「图片还在下载」的证据。
+
+### 现行解析策略
+
+`media/wxgf.rs::partitions` 不遍历头部：
+
+1. 扫描所有起始码；
+2. 取起始码前 4 字节为长度，必须落在数据范围内；
+3. 覆盖的字节必须「以参数集开头 + 只含一帧静图」（`picture_stream` 校验）；
+4. 不合格就跳过、继续找下一个起始码，**不整张判死**；
+5. 全部不合格且容器无长度前缀时，回退为扫 annex-B 码流。
+
+颜色分片和透明遮罩分片都能拿到（`parts.len() == 2` 时按 chroma 区分）。
+
+### 回退顺序
+
+| 顺序 | 来源 | 失败后 |
+|---|---|---|
+| 1 | 完整 WXGF 解码 | → 2 |
+| 2 | 同目录 `<md5>.dat` 缩略图（跳过刚失败的那个文件） | → 3 |
+| 3 | 内置占位图 `placeholder.png`（写盘前自校验） | 结束 |
+
+**只有「原消息已保留、会自动重试」才重试**；解码彻底失败给占位图，不会卡队列。
+
+### 占位图必须本身可解码
+
+`PLACEHOLDER_PNG` 曾经是 585 字节的截断 PNG（IDAT 声明 634 字节、CRC 错、zlib 空流），
+于是占位图自己也被 `picture::validate` 拒掉，客户端只画「图片 · 点击下载」。
+现在它是真 PNG，并且：
+
+- 走 `Media::placeholder_picture()`，写盘前 `picture::validate` 一次；
+- 文件名 `placeholder.png`，**不占用 `image.*`**——那个名字是后续成功解码的首查位置，
+  放占位图会把真图永久挡住。
+
+### 单元测试（FFmpeg fixture）
+
+```bash
+export TMPDIR="$PWD/.state/tmp-rs"
+.tools/cargo/bin/cargo test -p wechat-adapter --bin wechat-adapter -- media::wxgf
+```
+
+包含：真实布局重放、颜色+遮罩合成、截断码流判为「仍在下载」、占位图可解码且不进 `image.*`。
+`real_static_hevc_color_*` 需要系统里有 `ffmpeg`；没有时按第二节跳过。
+
